@@ -1,0 +1,37 @@
+name: C++ DirectX 11 Automated x64 Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Code Repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSVC & Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: Configure CMake Project
+      run: |
+        cmake -B build -S . -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+
+    - name: Compile Executable (Release x64)
+      run: |
+        cmake --build build --config Release --parallel
+
+    - name: Package Build Artifacts
+      run: |
+        mkdir release_pack
+        xcopy /E /Y build\Release\* release_pack\
+        
+    - name: Upload x64 EXE to GitHub Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: MotionGraphicsEditor-x64-Windows
+        path: release_pack/
