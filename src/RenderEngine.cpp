@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <vector>
 
 // =============================================================================
 // Lifecycle
@@ -58,6 +59,9 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
         ball->fillColor = 0xFF00B4FF;
     }
     applySlingshotToSelected = true;
+
+    // Seed the 3D camera with a sensible default framing (Task 4).
+    camera.ResetToDefault();
 
     lastTime = SDL_GetPerformanceCounter();
     return true;
@@ -199,6 +203,7 @@ void RenderEngine::BeginFrame() {
 
     animEngine.Update(deltaTime);
     layerManager.BeginFrame(); // reset per-frame world-matrix cache
+    SyncCameraFromLayerIfAny(); // Task 4: let a Camera layer drive the view
 
     // Apply the slingshot Bezier as a live scale multiplier on the selected
     // layer, purely so the Task 2 demo still visibly works. Task 5 will replace
@@ -277,6 +282,14 @@ void RenderEngine::RenderAEDockingLayout() {
         if (ImGui::BeginMenu("Layer")) {
             if (ImGui::MenuItem("New Rectangle")) layerManager.AddLayer(ShapeType::Rectangle);
             if (ImGui::MenuItem("New Ellipse"))   layerManager.AddLayer(ShapeType::Ellipse);
+            if (ImGui::MenuItem("New Camera")) {
+                const int newId = layerManager.AddLayer(ShapeType::Camera, "Camera");
+                if (Layer* cam = layerManager.GetLayerById(newId)) {
+                    cam->is3D = true;
+                    cam->transform.position   = camera.position;
+                    cam->transform.sizePixels = { 60.0f, 40.0f }; // small icon box
+                }
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Delete Selected", "Del")) {
                 if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
@@ -318,6 +331,15 @@ void RenderEngine::DrawTimelinePanel() {
     if (ImGui::Button("+ Rect"))    layerManager.AddLayer(ShapeType::Rectangle);
     ImGui::SameLine();
     if (ImGui::Button("+ Ellipse")) layerManager.AddLayer(ShapeType::Ellipse);
+    ImGui::SameLine();
+    if (ImGui::Button("+ Camera")) {
+        const int newId = layerManager.AddLayer(ShapeType::Camera, "Camera");
+        if (Layer* cam = layerManager.GetLayerById(newId)) {
+            cam->is3D = true;
+            cam->transform.position   = camera.position;
+            cam->transform.sizePixels = { 60.0f, 40.0f };
+        }
+    }
     ImGui::SameLine();
     if (ImGui::Button("Delete Selected")) {
         if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
@@ -366,6 +388,7 @@ void RenderEngine::DrawTimelinePanel() {
                 case ShapeType::Rectangle:  typeName = "Rectangle"; break;
                 case ShapeType::Ellipse:    typeName = "Ellipse";   break;
                 case ShapeType::CustomPath: typeName = "Path";      break;
+                case ShapeType::Camera:     typeName = "Camera";    break;
             }
             ImGui::TextUnformatted(typeName);
 
@@ -456,6 +479,33 @@ void RenderEngine::DrawInspectorPanel() {
         ImGui::DragFloat2("P2 (control)", &animEngine.currentCurve.P2.x, 0.01f, -2.0f, 2.0f);
         ImGui::TextWrapped("P1.y and P2.y are intentionally unclamped so you can push above 1.0 for slingshot overshoot or below 0.0 for rebound.");
     }
+
+    // -----------------------------------------------------------------------
+    // Camera Properties (Task 4). Shown when the selected layer is the Camera,
+    // or unconditionally at the bottom so users can always tweak the view.
+    // -----------------------------------------------------------------------
+    const bool cameraSelected = (sel->type == ShapeType::Camera);
+    if (ImGui::CollapsingHeader(cameraSelected ? "Camera Properties (Active)" : "Camera Properties",
+                                cameraSelected ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+        const int camLayerId = layerManager.FindActiveCameraLayerId();
+        if (camLayerId >= 0) {
+            ImGui::TextDisabled("Driven by Camera layer #%d", camLayerId);
+        } else {
+            ImGui::TextDisabled("(No Camera layer — using global camera)");
+        }
+        ImGui::DragFloat3("Cam Position",   &camera.position.x, 1.0f);
+        ImGui::DragFloat3("Cam Target",     &camera.target.x,   1.0f);
+        ImGui::Checkbox("Use LookAt Target", &camera.useTargetMode);
+        if (!camera.useTargetMode) {
+            ImGui::DragFloat3("Cam Rotation (deg)", &camera.rotation.x, 0.5f);
+        }
+        ImGui::SliderFloat("FOV (vertical, deg)", &camera.fov, 5.0f, 120.0f);
+        ImGui::DragFloatRange2("Near / Far Z", &camera.nearZ, &camera.farZ,
+                               1.0f, 0.1f, 100000.0f);
+        if (ImGui::Button("Reset Camera")) {
+            camera.ResetToDefault();
+        }
+    }
 }
 
 // =============================================================================
@@ -521,6 +571,10 @@ void RenderEngine::DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                                 IM_COL32(200, 200, 200, alpha), 24, 1.5f);
             break;
         }
+        case ShapeType::Camera:
+            // Camera has its own dedicated gizmo drawn by DrawCameraGizmos —
+            // no fill in the 2D pass.
+            break;
     }
 }
 
@@ -707,30 +761,113 @@ void RenderEngine::DrawViewportCanvas() {
                canvas_p0.y + std::min(canvas_sz.y - 20, 20.0f + 720.0f)),
         IM_COL32(60, 60, 70, 255));
 
-    // Render every visible layer bottom-up.
+    // -------------------------------------------------------------------
+    // Two-pass rendering (Task 4):
+    //   Pass A: all 2D layers in timeline order (like Task 3)
+    //   Pass B: all 3D layers, depth-sorted by camera-space Z (far -> near)
+    // Camera-type layers themselves are skipped in the visual pass; only
+    // their gizmo is drawn when selected.
+    // -------------------------------------------------------------------
     auto& L = layerManager.Layers();
+
+    // Pass A: 2D
     for (auto& layer : L) {
-        if (!layer.isVisible) continue;
-        const Mat3 wm = layerManager.GetWorldMatrix(layer.id);
+        if (!layer.isVisible)                    continue;
+        if (layer.is3D)                          continue;
+        if (layer.type == ShapeType::Camera)     continue;
+        const Mat3 wm  = layerManager.GetWorldMatrix(layer.id);
         const float op = layerManager.GetWorldOpacity(layer.id);
         DrawLayerShape(layer, wm, op, canvas_p0, draw_list);
     }
 
-    // Selected-layer overlay + interaction
+    // Pass B: 3D — collect visible IDs, sort by view-space Z (descending)
+    struct ThreeDEntry { int id; float depth; };
+    static thread_local std::vector<ThreeDEntry> depthList;
+    depthList.clear();
+
+    Mat4 viewMat = camera.GetViewMatrix();
+    for (auto& layer : L) {
+        if (!layer.isVisible)                    continue;
+        if (!layer.is3D)                         continue;
+        if (layer.type == ShapeType::Camera)     continue;
+        Mat4 wm4 = layerManager.GetWorldMatrix4(layer.id);
+        // Sample the layer's anchor point in view space for a stable depth key.
+        const float ax = layer.transform.anchorPoint.x * layer.transform.sizePixels.x;
+        const float ay = layer.transform.anchorPoint.y * layer.transform.sizePixels.y;
+        Vec4 centerWorld = wm4.TransformVec4(Vec4(ax, ay, 0.0f, 1.0f));
+        Vec4 centerView  = viewMat.TransformVec4(centerWorld);
+        depthList.push_back({ layer.id, centerView.z });
+    }
+    // Sort far -> near so the nearest layer is drawn last (on top).
+    std::sort(depthList.begin(), depthList.end(),
+              [](const ThreeDEntry& a, const ThreeDEntry& b) { return a.depth > b.depth; });
+
+    for (const auto& e : depthList) {
+        Layer* layer = layerManager.GetLayerById(e.id);
+        if (!layer) continue;
+        const Mat4 wm4 = layerManager.GetWorldMatrix4(layer->id);
+        const float op = layerManager.GetWorldOpacity(layer->id);
+        DrawLayerShape3D(*layer, wm4, op, canvas_p0, canvas_sz, draw_list);
+    }
+
+    // -------------------------------------------------------------------
+    // Selection gizmos + interaction
+    // -------------------------------------------------------------------
     Layer* sel = layerManager.GetSelectedLayer();
     if (sel && sel->isVisible) {
-        const Mat3 wm = layerManager.GetWorldMatrix(sel->id);
-        DrawSelectionGizmos(*sel, wm, canvas_p0, draw_list);
-        HandleGizmoInteraction(*sel, wm, canvas_p0, canvas_sz);
-    } else {
-        // Still need an invisible click-catch so unselected clicks can select a layer.
+        if (sel->type == ShapeType::Camera) {
+            // Camera has its own wireframe gizmo (frustum + look-at line).
+            DrawCameraGizmos(*sel, canvas_p0, canvas_sz, draw_list);
+        } else if (!sel->is3D) {
+            const Mat3 wm = layerManager.GetWorldMatrix(sel->id);
+            DrawSelectionGizmos(*sel, wm, canvas_p0, draw_list);
+            HandleGizmoInteraction(*sel, wm, canvas_p0, canvas_sz);
+        } else {
+            // 3D selection: draw a simple projected bounding quad. On-canvas
+            // scale gizmos in perspective space are their own milestone, so
+            // we leave 3D transform editing to the Inspector for now.
+            const Mat4 wm4 = layerManager.GetWorldMatrix4(sel->id);
+            const float w = sel->transform.sizePixels.x;
+            const float h = sel->transform.sizePixels.y;
+            const Vec4 corners_local[4] = {
+                Vec4(0.0f, 0.0f, 0.0f, 1.0f),
+                Vec4(w,    0.0f, 0.0f, 1.0f),
+                Vec4(w,    h,    0.0f, 1.0f),
+                Vec4(0.0f, h,    0.0f, 1.0f),
+            };
+            Vec4 projected[4];
+            bool allInFront = true;
+            for (int i = 0; i < 4; ++i) {
+                Vec4 world = wm4.TransformVec4(corners_local[i]);
+                projected[i] = camera.ProjectPoint(
+                    Vec3(world.x, world.y, world.z), canvas_sz.x, canvas_sz.y);
+                if (projected[i].w <= 0.0f) { allInFront = false; break; }
+            }
+            if (allInFront) {
+                ImVec2 q[4] = {
+                    ImVec2(canvas_p0.x + projected[0].x, canvas_p0.y + projected[0].y),
+                    ImVec2(canvas_p0.x + projected[1].x, canvas_p0.y + projected[1].y),
+                    ImVec2(canvas_p0.x + projected[2].x, canvas_p0.y + projected[2].y),
+                    ImVec2(canvas_p0.x + projected[3].x, canvas_p0.y + projected[3].y),
+                };
+                draw_list->AddPolyline(q, 4, IM_COL32(0, 255, 200, 255),
+                                       ImDrawFlags_Closed, 1.5f);
+            }
+        }
+    }
+
+    // Empty-canvas click-to-select (works both when nothing selected and
+    // when the current selection is a Camera layer with no bounding box).
+    if (!sel || sel->type == ShapeType::Camera || sel->is3D) {
         ImGui::SetCursorScreenPos(canvas_p0);
         ImGui::InvisibleButton("ViewportHitTestEmpty", canvas_sz);
         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             const Vec2 mw = ScreenToWorld(ImGui::GetIO().MousePos, canvas_p0);
+            // Only 2D-space hit-test here (3D hit-testing is out of Task 4 scope).
             auto& Ls = layerManager.Layers();
             for (auto it = Ls.rbegin(); it != Ls.rend(); ++it) {
-                if (!it->isVisible) continue;
+                if (!it->isVisible)                   continue;
+                if (it->is3D || it->type == ShapeType::Camera) continue;
                 const Mat3 wm2 = layerManager.GetWorldMatrix(it->id);
                 const Mat3 inv = wm2.InverseAffine();
                 const Vec2 local = inv.TransformPoint(mw);
@@ -743,9 +880,264 @@ void RenderEngine::DrawViewportCanvas() {
         }
     }
 
+    // Camera navigation (orbit / pan / zoom) — always active over the viewport.
+    HandleCameraControls(canvas_p0, canvas_sz);
+
+    // HUD
+    const int camLayer = layerManager.FindActiveCameraLayerId();
+    char hud[128];
+    std::snprintf(hud, sizeof(hud),
+        "Active Camera [3D View]  FOV=%.1f  Pos=(%.0f, %.0f, %.0f)%s",
+        camera.fov, camera.position.x, camera.position.y, camera.position.z,
+        (camLayer >= 0) ? "  (from Camera layer)" : "");
     draw_list->AddText(ImVec2(canvas_p0.x + 10, canvas_p0.y + 10),
-        IM_COL32(200, 200, 200, 255),
-        "Composition Canvas (Layers + Gizmos)");
+        IM_COL32(200, 220, 255, 255), hud);
+    draw_list->AddText(ImVec2(canvas_p0.x + 10, canvas_p0.y + 26),
+        IM_COL32(160, 160, 170, 255),
+        "RMB/Alt+RMB: Orbit   MMB/Alt+MMB: Pan   Wheel: Zoom");
+}
+
+// =============================================================================
+// 3D layer rendering + camera gizmos + camera navigation (Task 4)
+// =============================================================================
+
+void RenderEngine::DrawLayerShape3D(const Layer& layer, const Mat4& worldMatrix4,
+                                    float worldOpacity, ImVec2 canvasOrigin,
+                                    ImVec2 canvasSize, ImDrawList* drawList) {
+    if (!drawList) return;
+
+    const float w = layer.transform.sizePixels.x;
+    const float h = layer.transform.sizePixels.y;
+
+    // Transform the four corners through World -> Clip -> NDC -> Pixels.
+    Vec4 wc0 = worldMatrix4.TransformVec4(Vec4(0.0f, 0.0f, 0.0f, 1.0f));
+    Vec4 wc1 = worldMatrix4.TransformVec4(Vec4(w,    0.0f, 0.0f, 1.0f));
+    Vec4 wc2 = worldMatrix4.TransformVec4(Vec4(w,    h,    0.0f, 1.0f));
+    Vec4 wc3 = worldMatrix4.TransformVec4(Vec4(0.0f, h,    0.0f, 1.0f));
+
+    Vec4 s0 = camera.ProjectPoint(Vec3(wc0.x, wc0.y, wc0.z), canvasSize.x, canvasSize.y);
+    Vec4 s1 = camera.ProjectPoint(Vec3(wc1.x, wc1.y, wc1.z), canvasSize.x, canvasSize.y);
+    Vec4 s2 = camera.ProjectPoint(Vec3(wc2.x, wc2.y, wc2.z), canvasSize.x, canvasSize.y);
+    Vec4 s3 = camera.ProjectPoint(Vec3(wc3.x, wc3.y, wc3.z), canvasSize.x, canvasSize.y);
+
+    // If ANY vertex is behind the camera, skip drawing this frame — proper
+    // clip-space polygon clipping is Task 5+ territory.
+    if (s0.w <= 0.0f || s1.w <= 0.0f || s2.w <= 0.0f || s3.w <= 0.0f) return;
+
+    const ImVec2 p0(canvasOrigin.x + s0.x, canvasOrigin.y + s0.y);
+    const ImVec2 p1(canvasOrigin.x + s1.x, canvasOrigin.y + s1.y);
+    const ImVec2 p2(canvasOrigin.x + s2.x, canvasOrigin.y + s2.y);
+    const ImVec2 p3(canvasOrigin.x + s3.x, canvasOrigin.y + s3.y);
+
+    unsigned int c = layer.fillColor;
+    unsigned int alpha = (c >> 24) & 0xFFu;
+    alpha = (unsigned int)std::clamp((int)(alpha * worldOpacity), 0, 255);
+    unsigned int fill = (c & 0x00FFFFFFu) | (alpha << 24);
+
+    switch (layer.type) {
+        case ShapeType::Rectangle: {
+            const ImVec2 quad[4] = { p0, p1, p2, p3 };
+            drawList->AddConvexPolyFilled(quad, 4, fill);
+            drawList->AddPolyline(quad, 4, IM_COL32(255, 255, 255, alpha),
+                                  ImDrawFlags_Closed, 1.0f);
+            break;
+        }
+        case ShapeType::Ellipse: {
+            // 3D ellipse: project 48 samples of the parametric ellipse and
+            // draw as a polyline. Foreshortening comes out naturally.
+            constexpr int kSegs = 48;
+            ImVec2 pts[kSegs];
+            bool anyBehind = false;
+            const float rx = w * 0.5f;
+            const float ry = h * 0.5f;
+            for (int i = 0; i < kSegs; ++i) {
+                const float t = (float)i / (float)kSegs * 2.0f * POTATO_PI;
+                Vec4 world = worldMatrix4.TransformVec4(
+                    Vec4(rx + rx * std::cos(t),
+                         ry + ry * std::sin(t),
+                         0.0f, 1.0f));
+                Vec4 sp = camera.ProjectPoint(Vec3(world.x, world.y, world.z),
+                                              canvasSize.x, canvasSize.y);
+                if (sp.w <= 0.0f) { anyBehind = true; break; }
+                pts[i] = ImVec2(canvasOrigin.x + sp.x, canvasOrigin.y + sp.y);
+            }
+            if (!anyBehind) {
+                drawList->AddConvexPolyFilled(pts, kSegs, fill);
+                drawList->AddPolyline(pts, kSegs, IM_COL32(255, 255, 255, alpha),
+                                      ImDrawFlags_Closed, 1.0f);
+            }
+            break;
+        }
+        default: {
+            // CustomPath / Camera fall through: draw the projected quad outline
+            // so the layer still shows up as *something* in 3D.
+            const ImVec2 quad[4] = { p0, p1, p2, p3 };
+            drawList->AddPolyline(quad, 4, IM_COL32(180, 180, 180, alpha),
+                                  ImDrawFlags_Closed, 1.0f);
+            break;
+        }
+    }
+}
+
+void RenderEngine::DrawCameraGizmos(const Layer& cameraLayer, ImVec2 canvasOrigin,
+                                    ImVec2 canvasSize, ImDrawList* drawList) {
+    if (!drawList) return;
+    (void)cameraLayer; // Camera layer's transform is already synced into `camera`
+
+    // Frustum corners at near and far planes (in view space), then transform
+    // back to world via the inverse view. For visualisation we just project
+    // them right back through the same camera — the result is a stable
+    // frustum outline the user can see in the 2D viewport composite.
+    // (Since we don't render from the camera's POV, the frustum wireframe
+    // here is only really meaningful when the user is orbiting AROUND the
+    // camera in an external editor camera, which is a future enhancement.
+    // For now we draw a look-at line and a small camera icon.)
+
+    // Camera icon: a triangle at eye pointing toward target.
+    Vec4 eyePx    = camera.ProjectPoint(camera.position, canvasSize.x, canvasSize.y);
+    Vec4 targetPx = camera.ProjectPoint(camera.target,   canvasSize.x, canvasSize.y);
+    if (eyePx.w > 0.0f) {
+        ImVec2 eye(canvasOrigin.x + eyePx.x, canvasOrigin.y + eyePx.y);
+        drawList->AddCircleFilled(eye, 6.0f, IM_COL32(255, 200, 60, 255));
+        drawList->AddText(ImVec2(eye.x + 8, eye.y - 8),
+                          IM_COL32(255, 220, 120, 255), "Camera");
+    }
+    if (eyePx.w > 0.0f && targetPx.w > 0.0f) {
+        drawList->AddLine(ImVec2(canvasOrigin.x + eyePx.x,    canvasOrigin.y + eyePx.y),
+                          ImVec2(canvasOrigin.x + targetPx.x, canvasOrigin.y + targetPx.y),
+                          IM_COL32(255, 200, 60, 180), 1.0f);
+        ImVec2 tgt(canvasOrigin.x + targetPx.x, canvasOrigin.y + targetPx.y);
+        drawList->AddCircle(tgt, 5.0f, IM_COL32(255, 120, 60, 255), 12, 1.5f);
+    }
+}
+
+void RenderEngine::HandleCameraControls(ImVec2 canvasOrigin, ImVec2 canvasSize) {
+    const ImGuiIO& io = ImGui::GetIO();
+
+    // Only accept camera drags when the mouse is inside the viewport rect AND
+    // no other ImGui item is claiming it. We use a "hover rect" check rather
+    // than InvisibleButton because we don't want to steal clicks from the
+    // layer selection code above.
+    const ImVec2 mp = io.MousePos;
+    const bool insideViewport =
+        (mp.x >= canvasOrigin.x && mp.x <= canvasOrigin.x + canvasSize.x &&
+         mp.y >= canvasOrigin.y && mp.y <= canvasOrigin.y + canvasSize.y);
+
+    // Wheel zoom: dolly the camera along its forward vector.
+    if (insideViewport && std::fabs(io.MouseWheel) > 0.0f) {
+        Vec3 forward = Vec3Normalize(camera.target - camera.position);
+        const float step = io.MouseWheel * 40.0f; // pixels per notch
+        camera.position = camera.position + forward * step;
+    }
+
+    // Start drag on RMB or MMB inside viewport.
+    if (!cameraDragActive && insideViewport) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            cameraDragActive   = true;
+            cameraDragButton   = ImGuiMouseButton_Right;
+            cameraDragIsPan    = io.KeyShift; // Shift+RMB = pan alt
+            cameraDragLastMouse = mp;
+        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+            cameraDragActive   = true;
+            cameraDragButton   = ImGuiMouseButton_Middle;
+            cameraDragIsPan    = true;
+            cameraDragLastMouse = mp;
+        }
+    }
+
+    // Continue drag
+    if (cameraDragActive && ImGui::IsMouseDown((ImGuiMouseButton)cameraDragButton)) {
+        const ImVec2 delta(mp.x - cameraDragLastMouse.x,
+                           mp.y - cameraDragLastMouse.y);
+        cameraDragLastMouse = mp;
+
+        if (cameraDragIsPan) {
+            // Pan: move eye AND target together along camera-space X/Y.
+            Vec3 forward = Vec3Normalize(camera.target - camera.position);
+            Vec3 right   = Vec3Normalize(Vec3Cross(camera.up, forward));
+            Vec3 upAxis  = Vec3Cross(forward, right);
+            const float panSpeed = 1.0f;
+            Vec3 shift = right  * (-delta.x * panSpeed)
+                       + upAxis * ( delta.y * panSpeed);
+            camera.position = camera.position + shift;
+            camera.target   = camera.target   + shift;
+        } else {
+            // Orbit: rotate the eye around the target on the world Y axis
+            // (horizontal drag) and around the local X axis (vertical drag).
+            Vec3 toEye = camera.position - camera.target;
+            const float yawDeg   = -delta.x * 0.3f;
+            const float pitchDeg = -delta.y * 0.3f;
+
+            // Yaw around world up.
+            {
+                const float rad = yawDeg * (POTATO_PI / 180.0f);
+                const float c = std::cos(rad), s = std::sin(rad);
+                const float x = toEye.x * c + toEye.z * s;
+                const float z = -toEye.x * s + toEye.z * c;
+                toEye.x = x; toEye.z = z;
+            }
+            // Pitch around the camera's right vector (approximated by cross of world up with view).
+            {
+                Vec3 forward = Vec3Normalize(Vec3(0,0,0) - toEye);
+                Vec3 right   = Vec3Normalize(Vec3Cross(camera.up, forward));
+                (void)right;
+                const float rad = pitchDeg * (POTATO_PI / 180.0f);
+                const float c = std::cos(rad), s = std::sin(rad);
+                // Rotate toEye around the right vector — simplified as a plane
+                // rotation on the YZ plane of the current basis.
+                const float len = Vec3Length(toEye);
+                Vec3 dir = (len > 1e-4f) ? toEye * (1.0f / len) : Vec3(0, 0, -1);
+                // Convert to spherical-ish: rotate the Y component vs horizontal length.
+                const float horiz = std::sqrt(dir.x * dir.x + dir.z * dir.z);
+                const float newY = dir.y * c - horiz * s;
+                const float newH = dir.y * s + horiz * c;
+                if (horiz > 1e-4f) {
+                    const float hx = dir.x / horiz;
+                    const float hz = dir.z / horiz;
+                    dir.x = hx * newH;
+                    dir.z = hz * newH;
+                    dir.y = newY;
+                } else {
+                    dir.y = newY;
+                }
+                toEye = dir * len;
+            }
+            camera.position = camera.target + toEye;
+            camera.useTargetMode = true; // orbit implies LookAt behavior
+        }
+
+        // If a Camera layer is driving the view, write our edits back so they
+        // are captured when the user goes to keyframe (Task 5).
+        const int camLayerId = layerManager.FindActiveCameraLayerId();
+        if (camLayerId >= 0) {
+            if (Layer* cl = layerManager.GetLayerById(camLayerId)) {
+                cl->transform.position = camera.position;
+            }
+        }
+    }
+
+    // End drag
+    if (cameraDragActive && !ImGui::IsMouseDown((ImGuiMouseButton)cameraDragButton)) {
+        cameraDragActive = false;
+        cameraDragButton = -1;
+    }
+}
+
+void RenderEngine::SyncCameraFromLayerIfAny() {
+    const int camLayerId = layerManager.FindActiveCameraLayerId();
+    if (camLayerId < 0) return;
+    const Layer* cl = layerManager.GetLayerById(camLayerId);
+    if (!cl) return;
+
+    // The Camera layer's transform.position becomes the eye. Rotation is
+    // interpreted as pitch/yaw/roll. If the layer is currently being edited
+    // via keyframes, this is the point where the animated value takes effect.
+    camera.position = cl->transform.position;
+    // If user has toggled off LookAt mode in the inspector, use the layer's
+    // rotation directly; otherwise keep the existing target.
+    if (!camera.useTargetMode) {
+        camera.rotation = cl->transform.rotation;
+    }
 }
 
 // =============================================================================

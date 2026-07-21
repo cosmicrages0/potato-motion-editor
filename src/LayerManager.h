@@ -52,8 +52,12 @@ public:
     // costs O(depth) once and O(1) on subsequent queries within the same frame.
     // Call BeginFrame() at the start of each frame to reset the cache.
     void BeginFrame();
-    Mat3 GetWorldMatrix(int layerId);
+    Mat3 GetWorldMatrix(int layerId);            // 2D affine (Task 3 path)
+    Mat4 GetWorldMatrix4(int layerId);           // Full 3D (Task 4 path)
     float GetWorldOpacity(int layerId);
+
+    // Find the first Camera-type layer, if any (returns -1 if none exist).
+    int FindActiveCameraLayerId() const;
 
     // Cycle test used by SetParent. Also exposed so UI can gray out invalid
     // parent choices in the Inspector dropdown.
@@ -69,5 +73,6 @@ private:
 
     // Per-frame memoization for world-matrix / opacity chain.
     std::unordered_map<int, Mat3>   frameMatrixCache;
+    std::unordered_map<int, Mat4>   frameMatrix4Cache;
     std::unordered_map<int, float>  frameOpacityCache;
 };

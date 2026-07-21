@@ -13,7 +13,8 @@
 enum class ShapeType : int {
     Rectangle = 0,
     Ellipse   = 1,
-    CustomPath = 2
+    CustomPath = 2,
+    Camera    = 3  // Task 4: layer whose transform drives the active 3D camera
 };
 
 // -----------------------------------------------------------------------------
@@ -38,6 +39,7 @@ struct Transform {
     // Build the local 2D affine matrix that takes a point in the layer's
     // *pre-anchor* local space (origin at top-left of sizePixels) into
     // parent space. Order: translate-by-position * rotate * scale * translate-by-(-anchor)
+    // Used by the 2D (is3D == false) rendering path.
     Mat3 ToLocalMatrix() const {
         const float ax = anchorPoint.x * sizePixels.x;
         const float ay = anchorPoint.y * sizePixels.y;
@@ -47,6 +49,23 @@ struct Transform {
                * Mat3::Scale(scale.x, scale.y)
                * Mat3::Translation(-ax, -ay);
         return M;
+    }
+
+    // Full 3D local matrix for the is3D == true rendering path (Task 4).
+    // Same TRS layout as ToLocalMatrix() but honoring all three axes.
+    // Rotation order: Y (yaw) * X (pitch) * Z (roll) — aircraft convention.
+    Mat4 ToLocalMatrix4() const {
+        const float ax = anchorPoint.x * sizePixels.x;
+        const float ay = anchorPoint.y * sizePixels.y;
+        // Note: anchor is 2D-only; on the Z axis the layer's origin is 0.
+        Mat4 T  = Mat4::Translation(position.x, position.y, position.z);
+        Mat4 Ry = Mat4::RotationYDegrees(rotation.y);
+        Mat4 Rx = Mat4::RotationXDegrees(rotation.x);
+        Mat4 Rz = Mat4::RotationZDegrees(rotation.z);
+        Mat4 S  = Mat4::Scale(scale.x, scale.y, scale.z);
+        Mat4 A  = Mat4::Translation(-ax, -ay, 0.0f);
+        // v_parent = T * (Ry * Rx * Rz) * S * A * v_local
+        return T * Ry * Rx * Rz * S * A;
     }
 };
 

@@ -49,6 +49,7 @@ int LayerManager::AddLayer(ShapeType type, const std::string& nameHint) {
             case ShapeType::Rectangle:  L.name = "Rectangle " + std::to_string(L.id); break;
             case ShapeType::Ellipse:    L.name = "Ellipse "   + std::to_string(L.id); break;
             case ShapeType::CustomPath: L.name = "Path "      + std::to_string(L.id); break;
+            case ShapeType::Camera:     L.name = "Camera "    + std::to_string(L.id); break;
         }
     }
 
@@ -131,7 +132,17 @@ bool LayerManager::SetParent(int childId, int parentId) {
 
 void LayerManager::BeginFrame() {
     frameMatrixCache.clear();
+    frameMatrix4Cache.clear();
     frameOpacityCache.clear();
+}
+
+int LayerManager::FindActiveCameraLayerId() const {
+    // Convention: the FIRST Camera-type layer in the timeline is the active
+    // camera. AE has richer semantics but this keeps Task 4 predictable.
+    for (const auto& L : layers) {
+        if (L.type == ShapeType::Camera) return L.id;
+    }
+    return -1;
 }
 
 Mat3 LayerManager::GetWorldMatrix(int layerId) {
@@ -155,6 +166,26 @@ Mat3 LayerManager::GetWorldMatrix(int layerId) {
     }
 
     frameMatrixCache[layerId] = world;
+    return world;
+}
+
+Mat4 LayerManager::GetWorldMatrix4(int layerId) {
+    if (layerId < 0) return Mat4::Identity();
+
+    auto cached = frameMatrix4Cache.find(layerId);
+    if (cached != frameMatrix4Cache.end()) return cached->second;
+
+    const Layer* L = GetLayerById(layerId);
+    if (!L) return Mat4::Identity();
+
+    Mat4 local = L->transform.ToLocalMatrix4();
+    Mat4 world;
+    if (L->parentId >= 0 && L->parentId != L->id) {
+        world = GetWorldMatrix4(L->parentId) * local;
+    } else {
+        world = local;
+    }
+    frameMatrix4Cache[layerId] = world;
     return world;
 }
 

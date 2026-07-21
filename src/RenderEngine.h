@@ -19,6 +19,7 @@
 
 #include "AnimationEngine.h"
 #include "LayerManager.h"
+#include "Camera.h"
 
 class RenderEngine {
 public:
@@ -44,10 +45,17 @@ private:
     void DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                         float worldOpacity, ImVec2 canvasOrigin,
                         ImDrawList* drawList);
+    void DrawLayerShape3D(const Layer& layer, const Mat4& worldMatrix4,
+                          float worldOpacity, ImVec2 canvasOrigin,
+                          ImVec2 canvasSize, ImDrawList* drawList);
     void DrawSelectionGizmos(Layer& layer, const Mat3& worldMatrix,
                              ImVec2 canvasOrigin, ImDrawList* drawList);
+    void DrawCameraGizmos(const Layer& cameraLayer, ImVec2 canvasOrigin,
+                          ImVec2 canvasSize, ImDrawList* drawList);
     void HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
                                 ImVec2 canvasOrigin, ImVec2 canvasSize);
+    void HandleCameraControls(ImVec2 canvasOrigin, ImVec2 canvasSize);
+    void SyncCameraFromLayerIfAny();
     void CreateRenderTarget();
     void CleanupRenderTarget();
 
@@ -72,6 +80,13 @@ private:
     bool applySlingshotToSelected = false;
 
     LayerManager layerManager;
+    Camera       camera;
+
+    // Camera interaction state (orbit/pan/zoom drag tracking)
+    bool  cameraDragActive     = false;
+    int   cameraDragButton     = -1;   // 0=LMB, 1=RMB, 2=MMB (SDL numbering via ImGui)
+    bool  cameraDragIsPan      = false;
+    ImVec2 cameraDragLastMouse = ImVec2(0, 0);
 
     // Gizmo interaction state — sticky across frames while dragging.
     enum class GizmoMode { None, Move, ScaleNW, ScaleNE, ScaleSW, ScaleSE };
