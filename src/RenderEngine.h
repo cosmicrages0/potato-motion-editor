@@ -21,6 +21,8 @@
 #include "LayerManager.h"
 #include "Camera.h"
 #include "EffectManager.h"
+#include "ExportEngine.h"
+#include "AlightXmlImporter.h"
 
 class RenderEngine {
 public:
@@ -46,6 +48,8 @@ private:
     void DrawProjectAssetsPanel();
     void DrawEffectsPalettePanel(); // Task 5: available effects to add
     void DrawEffectControlsPanel(); // Task 5: active effects on selected layer
+    void DrawRenderQueuePanel();    // Task 6: FFmpeg export UI
+    void PumpExportOneFrameIfActive(); // Task 6: called each frame during export
     void DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                         float worldOpacity, ImVec2 canvasOrigin,
                         ImDrawList* drawList);
@@ -86,6 +90,14 @@ private:
     LayerManager   layerManager;
     Camera         camera;
     EffectManager  effectManager;   // Task 5: HLSL shader stack owner
+    ExportEngine   exportEngine;    // Task 6: FFmpeg direct-stream exporter
+    AlightXmlImporter xmlImporter;  // Task 6: Alight Motion .xml curve parser
+
+    // Task 6: Render Queue panel state (settings edited in UI live here)
+    ExportEngine::Settings pendingExport;
+    float                  pendingExportSeconds = 5.0f;
+    bool                   showRenderQueue = false;
+    bool                   showFfmpegMissingPopup = false;
 
     // Task 5: composition resolution. Fixed centered canvas uses this in the
     // deferred Task 5.0 usability pass. For now it drives the size of the

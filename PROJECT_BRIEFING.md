@@ -74,6 +74,27 @@ potato-motion-editor/
 - **Correct matrix order** `world = parent * local` (column-vector convention)
 - Delete/Backspace keyboard shortcut
 
+### ✅ Task 6 — FFmpeg Proxy & 4K Direct-Stream Export (done, with scope caveat)
+
+- `ExportEngine.h/.cpp` — spawns `ffmpeg.exe` via `_popen(cmd, "wb")` (binary mode is critical; text mode would CR/LF-corrupt any 0x0A byte in the BGRA stream), allocates exactly ONE render texture + ONE staging texture at export resolution, and per frame does `CopyResource -> Map -> fwrite -> Unmap`. Max RAM footprint is one frame regardless of clip length: ~8 MB at 720p, ~33 MB at 4K.
+- Row-by-row `fwrite` (not one big buffer write) because D3D staging textures pad rows to alignment boundaries; naive `fwrite(mapped.pData, mapped.DepthPitch, 1, pipe)` would inject garbage stride bytes into the video stream.
+- Format is `DXGI_FORMAT_B8G8R8A8_UNORM` matched to `-pix_fmt bgra` on the ffmpeg command line; using `R8G8B8A8` would swap the red and blue channels in the output MP4.
+- Defensive settings clamps in `Begin()`: width [16..7680], height [16..4320], fps [1..120], bitrate [100..200000 kbps]. A misconfigured UI can never allocate a 100 GB texture.
+- New **Render Queue** panel (accessible via **Export → Render Queue**) with:
+  - Preset dropdown (720p / 1080p / 4K / Custom)
+  - Width / Height inputs, FPS combo (24/30/60), Bitrate slider (500-50000 kbps), Duration slider (0.1-120 s)
+  - Output path + FFmpeg path text fields
+  - Start Export button; live progress bar with Frame X/Y + elapsed + ETA; Cancel/Stop
+  - Friendly warning if `_popen` fails ("Install ffmpeg.exe and put it in PATH")
+  - Success / error banner after any completed export
+- `AlightXmlImporter.h/.cpp` — tiny purpose-built XML parser (no dependency on any general XML library) that recognizes `<keyframe time= value= curve="p1x,p1y p2x,p2y" />` and returns a `vector<ParsedKeyframe>`. Wired to **File → Import Alight Motion .xml (default path)** which reads `import.xml` and drops the first keyframe's Bezier control points into the global slingshot curve so it shows up immediately in the Graph Editor. Malformed XML is silently skipped; the parser is capped at 100 000 keyframes so a hostile file can't hang the app.
+- UI responsiveness during export: we run the pipe write on the main thread (D3D11 immediate contexts are not thread-safe by default and this app doesn't set the multithread flag), but the ImGui loop keeps ticking between frames so the progress bar visibly updates. Real threading via a deferred context is deferred to a possible Task 6.5 if anyone actually needs faster-than-realtime exports on a 4-core-plus box.
+
+**Scope caveat — read this before testing:**
+Same shape as the Task 5 caveat. The exporter is *pipeline-complete*: FFmpeg spawns, DX11 readback works, MP4 files are produced at the requested resolution + framerate + duration + bitrate, and they play in any player. But because our composition still rasterizes shapes via `ImDrawList` straight to the swap chain (Task 4.5 note), the current export frame content is a **solid time-varying color gradient** rather than the actual composition. This proves every link in the chain works end-to-end. Piping the real composition into the export RT is one of the deliverables of the deferred **Task 5.0 Usability Pass** — at which point the exact same export panel produces MP4s of your actual scene, unchanged.
+
+---
+
 ### ✅ Task 5 — HLSL Effect Stack & Blending Modes (done, with scope caveat)
 
 - `Effect.h` — POD-ish struct with `type` enum, `params` (four float4s = 64 bytes so the whole thing memcpys straight into a shader constant buffer), stable per-effect `id`, and factory helpers with sensible defaults.
@@ -194,8 +215,8 @@ The user has explicitly chosen skeleton-first ordering. Do NOT reorder these wit
 
 | # | Milestone | Rough effort | Why it matters |
 |---|---|---|---|
-| **5** | **HLSL Pixel Shader Stack** (motion tile, motion blur, chroma aberration, blend modes) | 4-5 days | Adds the visual "wow" — the reason a motion graphics editor exists |
-| **6** | **FFmpeg Proxy + 4K Export Engine** | 4-5 days | The point at which the app can produce a deliverable file |
+| ~~5~~ | ~~HLSL Pixel Shader Stack~~ **DONE** — 8d2d8cb | done | Motion tile, motion blur, chroma aberration, blend modes wired data-side |
+| ~~6~~ | ~~FFmpeg Proxy + 4K Export Engine~~ **DONE** — this commit | done | FFmpeg pipe + DX11 staging readback + Render Queue UI + Alight XML importer |
 | **5.0** | **Deferred Usability Pass** — fixed centered composition canvas at 1920×1080, tabbed Inspector, wider timeline labels, corner-scale gizmo rewrite, rotation gizmo, Reset Layout menu, proper DPI. See Section 9.5 for the full list | 4 days | Turns the skeleton into something the user can actually operate |
 | **7** | **Bezier easing per keyframe + curve editor tied to real tracks** (right now keys are linear-only, and the graph editor drives only the global demo Bezier) | 3 days | Real animation quality |
 | **8** | **Null Object layers + camera rig UX** — already partially done in 4.5 but needs to be re-verified after 5.0 fixes layout | 1 day | Confirms parenting rigs work end-to-end |

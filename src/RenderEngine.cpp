@@ -313,7 +313,27 @@ void RenderEngine::RenderAEDockingLayout() {
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
 
     if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("File")) { ImGui::MenuItem("New Composition"); ImGui::MenuItem("Open..."); ImGui::MenuItem("Save"); ImGui::EndMenu(); }
+        if (ImGui::BeginMenu("File")) {
+            ImGui::MenuItem("New Composition");
+            ImGui::MenuItem("Open...");
+            ImGui::MenuItem("Save");
+            ImGui::Separator();
+            // Task 6: Alight Motion XML curve import. Reads the FIRST curve's
+            // (p1, p2) segment and drops it into the global slingshot Bezier
+            // so the imported easing shows up immediately in the Graph Editor.
+            if (ImGui::MenuItem("Import Alight Motion .xml (default path)")) {
+                auto keys = xmlImporter.ImportKeyframesFromFile("import.xml");
+                if (!keys.empty() && keys[0].hasCurve) {
+                    animEngine.currentCurve.P1 = keys[0].p1;
+                    animEngine.currentCurve.P2 = keys[0].p2;
+                    std::cerr << "[Import] Loaded " << keys.size()
+                              << " keys from import.xml" << std::endl;
+                } else {
+                    std::cerr << "[Import] " << xmlImporter.LastError() << std::endl;
+                }
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Edit")) { ImGui::MenuItem("Undo"); ImGui::MenuItem("Redo"); ImGui::EndMenu(); }
         if (ImGui::BeginMenu("Layer")) {
             if (ImGui::MenuItem("New Rectangle")) SpawnShapeAtViewportCenter(ShapeType::Rectangle);
@@ -360,7 +380,10 @@ void RenderEngine::RenderAEDockingLayout() {
             if (!haveSel) ImGui::EndDisabled();
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Export"))      { ImGui::MenuItem("Render Queue..."); ImGui::EndMenu(); }
+        if (ImGui::BeginMenu("Export")) {
+            if (ImGui::MenuItem("Render Queue...")) showRenderQueue = true;
+            ImGui::EndMenu();
+        }
         ImGui::EndMenuBar();
     }
     ImGui::End();
@@ -373,6 +396,11 @@ void RenderEngine::RenderAEDockingLayout() {
     ImGui::Begin("Effect Controls");       DrawEffectControlsPanel();    ImGui::End();
     ImGui::Begin("Timeline");              DrawTimelinePanel();          ImGui::End();
     ImGui::Begin("Graph Editor");          DrawGraphEditor();            ImGui::End();
+
+    // Task 6: Render Queue window (only shown after Export -> Render Queue).
+    if (showRenderQueue) {
+        DrawRenderQueuePanel();
+    }
 }
 
 // =============================================================================
@@ -1611,8 +1639,176 @@ void RenderEngine::DrawGraphEditor() {
 // =============================================================================
 // End of frame / present
 // =============================================================================
+// =============================================================================
+// Render Queue panel (Task 6): FFmpeg export UI
+// =============================================================================
+void RenderEngine::DrawRenderQueuePanel() {
+    ImGui::SetNextWindowSize(ImVec2(520, 400), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Render Queue", &showRenderQueue)) {
+        ImGui::End();
+        return;
+    }
+
+    const auto& status = exportEngine.GetStatus();
+
+    if (status.active) {
+        // Live progress mode — show progress + Cancel only.
+        ImGui::Text("Rendering %d x %d @ %d fps",
+                    exportEngine.Width(), exportEngine.Height(),
+                    exportEngine.GetSettings().fps);
+        const float frac = (status.totalFrames > 0)
+                               ? (float)status.frameIndex / (float)status.totalFrames
+                               : 0.0f;
+        ImGui::ProgressBar(frac, ImVec2(-1, 0));
+        ImGui::Text("Frame %d / %d", status.frameIndex, status.totalFrames);
+
+        // Simple ETA: elapsed / frac - elapsed
+        double eta = 0.0;
+        if (frac > 1e-4 && status.secondsElapsed > 0.01) {
+            eta = (status.secondsElapsed / frac) - status.secondsElapsed;
+        }
+        ImGui::Text("Elapsed: %.1fs   ETA: %.1fs", status.secondsElapsed, eta);
+
+        ImGui::Separator();
+        if (ImGui::Button("Cancel / Stop", ImVec2(-1, 0))) {
+            exportEngine.End(true);
+        }
+    } else {
+        // Idle mode — full settings UI.
+        // Preset dropdown
+        static const char* kPresets[] = { "720p HD (1280x720)",
+                                          "1080p Full HD (1920x1080)",
+                                          "4K Ultra HD (3840x2160)",
+                                          "Custom" };
+        static int kPresetSizes[][2] = { {1280, 720}, {1920, 1080},
+                                         {3840, 2160}, {0, 0} };
+        int presetIdx = 3; // Custom by default; snap if size matches a preset
+        for (int i = 0; i < 3; ++i) {
+            if (pendingExport.width == kPresetSizes[i][0] &&
+                pendingExport.height == kPresetSizes[i][1]) {
+                presetIdx = i; break;
+            }
+        }
+        if (ImGui::Combo("Preset", &presetIdx, kPresets, 4)) {
+            if (presetIdx < 3) {
+                pendingExport.width  = kPresetSizes[presetIdx][0];
+                pendingExport.height = kPresetSizes[presetIdx][1];
+            }
+        }
+        ImGui::InputInt("Width",  &pendingExport.width);
+        ImGui::InputInt("Height", &pendingExport.height);
+
+        // FPS
+        static const char* kFpsLabels[] = { "24", "30", "60" };
+        static const int   kFpsValues[] = { 24,   30,   60   };
+        int fpsIdx = 1;
+        for (int i = 0; i < 3; ++i) if (pendingExport.fps == kFpsValues[i]) fpsIdx = i;
+        if (ImGui::Combo("Framerate", &fpsIdx, kFpsLabels, 3)) {
+            pendingExport.fps = kFpsValues[fpsIdx];
+        }
+
+        ImGui::SliderInt("Bitrate (kbps)", &pendingExport.bitrateKbps, 500, 50000);
+        ImGui::SliderFloat("Duration (s)", &pendingExportSeconds, 0.1f, 120.0f);
+
+        char pathBuf[512];
+        std::snprintf(pathBuf, sizeof(pathBuf), "%s", pendingExport.outputPath.c_str());
+        if (ImGui::InputText("Output path", pathBuf, sizeof(pathBuf))) {
+            pendingExport.outputPath = pathBuf;
+        }
+        char ffmpegBuf[256];
+        std::snprintf(ffmpegBuf, sizeof(ffmpegBuf), "%s", pendingExport.ffmpegPath.c_str());
+        if (ImGui::InputText("FFmpeg path", ffmpegBuf, sizeof(ffmpegBuf))) {
+            pendingExport.ffmpegPath = ffmpegBuf;
+        }
+
+        ImGui::Separator();
+
+        // Show the last error (if any) so the user knows what happened.
+        if (status.error) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                               "Last export failed: %s", status.errorMsg.c_str());
+        } else if (status.finished) {
+            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.6f, 1.0f),
+                               "Last export finished OK (%d frames).", status.frameIndex);
+        }
+        if (showFfmpegMissingPopup) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                "FFmpeg not found. Install ffmpeg.exe and put it in PATH, "
+                "or set the FFmpeg path above.");
+        }
+
+        if (ImGui::Button("Start Export", ImVec2(-1, 32))) {
+            pendingExport.totalFrames = (int)(pendingExportSeconds *
+                                              (float)pendingExport.fps);
+            showFfmpegMissingPopup = false;
+            if (!exportEngine.Begin(device, context, pendingExport)) {
+                showFfmpegMissingPopup = true;
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Task 6 caveat: the current frame content is a");
+        ImGui::TextDisabled("solid time-varying color at the export resolution");
+        ImGui::TextDisabled("(proves the DX11 -> pipe -> MP4 path end to end).");
+        ImGui::TextDisabled("Real composition rendering into the export RT ships");
+        ImGui::TextDisabled("with the Task 5.0 Usability Pass.");
+    }
+
+    ImGui::End();
+}
+
+// -----------------------------------------------------------------------------
+// PumpExportOneFrameIfActive (Task 6)
+//
+// Called every frame from the top of EndFrame(). Renders one frame at the
+// export resolution into the export RT, then hands the pixels to the
+// ExportEngine which pipes them to FFmpeg. This runs on the main thread on
+// purpose (see ExportEngine.h header comment for why) but is cheap enough
+// that the ImGui UI keeps ticking between frames.
+// -----------------------------------------------------------------------------
+void RenderEngine::PumpExportOneFrameIfActive() {
+    if (!context) return;
+    const auto& st = exportEngine.GetStatus();
+    if (!st.active) return;
+
+    ID3D11RenderTargetView* rtv = exportEngine.GetRenderTargetView();
+    if (!rtv) return;
+
+    // Placeholder frame content: a moving diagonal color gradient in the
+    // requested (width x height) buffer. This produces a real playable MP4
+    // that clearly shows FPS/resolution/duration are all wired up correctly.
+    // Real per-frame composition rendering into this RT ships with 5.0.
+    const float t = (float)st.frameIndex / (float)std::max(1, st.totalFrames);
+    const float r = 0.30f + 0.30f * std::sin(t * 6.2831853f);
+    const float g = 0.30f + 0.30f * std::sin(t * 6.2831853f + 2.0f);
+    const float b = 0.30f + 0.30f * std::sin(t * 6.2831853f + 4.0f);
+    const float clear[4] = { r, g, b, 1.0f };
+
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f,
+                          (float)exportEngine.Width(),
+                          (float)exportEngine.Height(),
+                          0.0f, 1.0f };
+    context->RSSetViewports(1, &vp);
+    context->OMSetRenderTargets(1, &rtv, nullptr);
+    context->ClearRenderTargetView(rtv, clear);
+
+    // Hand this GPU frame off to the exporter (CopyResource + Map + fwrite).
+    exportEngine.WriteCurrentFrame();
+
+    // Rebind the swap chain's back buffer so the rest of the frame (ImGui)
+    // draws where it expects to.
+    if (mainRenderTargetView) {
+        context->OMSetRenderTargets(1, &mainRenderTargetView, nullptr);
+    }
+}
+
 void RenderEngine::EndFrame() {
     if (!context || !swapChain) return;
+
+    // Task 6: if a Render Queue export is active, produce and pipe one frame
+    // BEFORE we render ImGui to the swap chain, so the export RT rebind
+    // doesn't leave a stale RT bound when ImGui goes to draw.
+    PumpExportOneFrameIfActive();
 
     ImGui::Render();
 
@@ -1672,6 +1868,10 @@ void RenderEngine::SpawnShapeAtViewportCenter(ShapeType type, const char* nameHi
 void RenderEngine::Shutdown() {
     if (shutdownCalled) return;
     shutdownCalled = true;
+
+    // Task 6: close any live ffmpeg pipe + release export textures BEFORE
+    // the device/context go away.
+    exportEngine.End(true);
 
     // Task 5: release GPU resources owned by the effect stack BEFORE the
     // device/context go away.
