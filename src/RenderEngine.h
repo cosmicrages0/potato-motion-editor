@@ -5,38 +5,49 @@
 #include <dxgi.h>
 #include <SDL.h>
 #include <SDL_syswm.h>
-#include <string>
-#include <iostream>
+#include 
+#include 
 
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_dx11.h"
 
+#include "AnimationEngine.h"
+
 class RenderEngine {
 public:
-    RenderEngine();
-    ~RenderEngine();
+RenderEngine();
+~RenderEngine();
 
-    bool Initialize(const char* title, int width, int height);
-    void HandleEvents(bool& running);
-    void BeginFrame();
-    void RenderUI();
-    void EndFrame();
-    void Shutdown();
+bool Initialize(const char* title, int width, int height);
+void HandleEvents(bool& running);
+void BeginFrame();
+void RenderUI();
+void EndFrame();
+void Shutdown();
+
 
 private:
-    bool InitDirectX();
-    bool InitImGui();
-    void RenderAEDockingLayout();
+bool InitDirectX();
+bool InitImGui();
+void RenderAEDockingLayout();
+void DrawViewportCanvas();
+void DrawGraphEditor();
 
-    SDL_Window* window = nullptr;
-    HWND hwnd = nullptr;
+SDL_Window* window = nullptr;
+HWND hwnd = nullptr;
 
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    IDXGISwapChain* swapChain = nullptr;
-    ID3D11RenderTargetView* mainRenderTargetView = nullptr;
+ID3D11Device* device = nullptr;
+ID3D11DeviceContext* context = nullptr;
+IDXGISwapChain* swapChain = nullptr;
+ID3D11RenderTargetView* mainRenderTargetView = nullptr;
 
-    int windowWidth = 1280;
-    int windowHeight = 720;
+int windowWidth = 1600;
+int windowHeight = 900;
+
+AnimationEngine animEngine;
+Uint64 lastTime = 0;
+
+
 };
