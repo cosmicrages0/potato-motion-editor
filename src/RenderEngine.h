@@ -9,7 +9,7 @@
 #include <iostream>
 #include <cmath>
 
-#include a"imgui.h"
+#include "imgui.h"
 #include "imgui_internal.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_dx11.h"
@@ -34,6 +34,8 @@ private:
     void RenderAEDockingLayout();
     void DrawViewportCanvas();
     void DrawGraphEditor();
+    void CreateRenderTarget();
+    void CleanupRenderTarget();
 
     SDL_Window* window = nullptr;
     HWND hwnd = nullptr;
@@ -45,6 +47,9 @@ private:
 
     int windowWidth = 1600;
     int windowHeight = 900;
+
+    bool imguiInitialized = false;
+    bool shutdownCalled = false;
 
     AnimationEngine animEngine;
     Uint64 lastTime = 0;
