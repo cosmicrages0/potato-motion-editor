@@ -40,6 +40,7 @@ private:
     void DrawViewportCanvas();
     void DrawGraphEditor();
     void DrawTimelinePanel();
+    void DrawTimelineStrip();       // Task 4.5: time ruler + playhead + kf diamonds
     void DrawInspectorPanel();
     void DrawProjectAssetsPanel();
     void DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
@@ -81,6 +82,22 @@ private:
 
     LayerManager layerManager;
     Camera       camera;
+
+    // Task 4.5: composition-wide setting for how the camera relates to layers.
+    // AE mode = camera is a normal layer, parented freely (default).
+    // Alight mode = layers with stickToCamera=true render as HUD attached to camera.
+    enum class CameraStyle : int { AfterEffects = 0, AlightMotion = 1 };
+    CameraStyle cameraStyle = CameraStyle::AfterEffects;
+
+    // Task 4.5: last viewport panel geometry (updated every frame) so that
+    // "New Rectangle / Ellipse / etc." buttons can spawn the layer at the
+    // center of what the user is actually looking at, not the world origin.
+    Vec2 lastViewportCenterWorld = { 640.0f, 360.0f };
+    ImVec2 lastViewportSize      = ImVec2(1280.0f, 720.0f);
+
+    // Helper used by all "add layer" callsites so spawn positioning stays
+    // consistent whether the user clicks a menu, a button, or a shortcut.
+    void SpawnShapeAtViewportCenter(ShapeType type, const char* nameHint = nullptr);
 
     // Camera interaction state (orbit/pan/zoom drag tracking)
     bool  cameraDragActive     = false;

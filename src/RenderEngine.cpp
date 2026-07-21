@@ -24,7 +24,16 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
         return false;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    // Task 4.5: size the initial window to ~90% of the primary display so it
+    // never launches larger than the user's screen, and immediately maximize.
+    SDL_Rect displayBounds{ 0, 0, windowWidth, windowHeight };
+    if (SDL_GetDisplayUsableBounds(0, &displayBounds) == 0) {
+        windowWidth  = std::max(800, (int)(displayBounds.w * 0.9f));
+        windowHeight = std::max(600, (int)(displayBounds.h * 0.9f));
+    }
+
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_MAXIMIZED);
     window = SDL_CreateWindow(
         title ? title : "Potato Motion Editor",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -34,6 +43,10 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
         std::cerr << "Error creating SDL Window: " << SDL_GetError() << std::endl;
         return false;
     }
+
+    // Belt-and-braces: some window managers ignore the MAXIMIZED flag at
+    // creation; explicitly maximize after the window exists.
+    SDL_MaximizeWindow(window);
 
     SDL_SysWMinfo wmInfo;
     SDL_VERSION(&wmInfo.version);
@@ -47,9 +60,12 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
     if (!InitImGui())   return false;
 
     // Seed a couple of demo layers so the app is immediately editable.
+    // Positions are set explicitly here (SpawnShapeAtViewportCenter uses the
+    // last-seen viewport center, which isn't populated yet on first init).
     layerManager.AddLayer(ShapeType::Rectangle, "Background Rect");
     if (Layer* bg = layerManager.GetSelectedLayer()) {
         bg->transform.sizePixels = { 400.0f, 240.0f };
+        bg->transform.position   = { 640.0f, 360.0f, 0.0f };
         bg->fillColor = 0xFF3A3A55; // dark violet-ish (ABGR)
     }
     layerManager.AddLayer(ShapeType::Ellipse, "Bouncing Ball");
@@ -203,22 +219,29 @@ void RenderEngine::BeginFrame() {
 
     animEngine.Update(deltaTime);
     layerManager.BeginFrame(); // reset per-frame world-matrix cache
+
+    // Task 4.5: bake keyframe tracks into live transforms BEFORE anything
+    // else reads them (camera sync, matrix build, gizmos, hit-test).
+    for (auto& layer : layerManager.Layers()) {
+        layer.SampleTracks(animEngine.currentTime);
+    }
+
     SyncCameraFromLayerIfAny(); // Task 4: let a Camera layer drive the view
 
-    // Apply the slingshot Bezier as a live scale multiplier on the selected
-    // layer, purely so the Task 2 demo still visibly works. Task 5 will replace
-    // this with per-property PropertyTracks.
+    // Legacy Task 2 demo: apply the global slingshot curve as a scale
+    // multiplier on the selected layer. Only kicks in for layers that don't
+    // already have a real scale track — keyframes win.
     if (applySlingshotToSelected) {
         if (Layer* sel = layerManager.GetSelectedLayer()) {
-            const float safeDur = (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f;
-            const float t = std::clamp(animEngine.currentTime / safeDur, 0.0f, 1.0f);
-            const float k = animEngine.currentCurve.Evaluate(t);
-            // Non-destructive: we don't overwrite the authored scale, we just
-            // multiply it. Reset the scale slider in the inspector to see this
-            // clearly. Clamp low end so a negative Bezier value doesn't flip.
-            const float mul = std::max(k, 0.0f);
-            sel->transform.scale.x = mul;
-            sel->transform.scale.y = mul;
+            const bool hasScaleTrack = sel->scaleTrack && !sel->scaleTrack->empty();
+            if (!hasScaleTrack) {
+                const float safeDur = (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f;
+                const float t = std::clamp(animEngine.currentTime / safeDur, 0.0f, 1.0f);
+                const float k = animEngine.currentCurve.Evaluate(t);
+                const float mul = std::max(k, 0.0f);
+                sel->transform.scale.x = mul;
+                sel->transform.scale.y = mul;
+            }
         }
     }
 
@@ -276,23 +299,30 @@ void RenderEngine::RenderAEDockingLayout() {
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
 
     if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("File"))        { ImGui::MenuItem("New Composition"); ImGui::MenuItem("Open..."); ImGui::MenuItem("Save"); ImGui::EndMenu(); }
-        if (ImGui::BeginMenu("Edit"))        { ImGui::MenuItem("Undo"); ImGui::MenuItem("Redo"); ImGui::EndMenu(); }
-        if (ImGui::BeginMenu("Composition")) { ImGui::MenuItem("Composition Settings..."); ImGui::EndMenu(); }
+        if (ImGui::BeginMenu("File")) { ImGui::MenuItem("New Composition"); ImGui::MenuItem("Open..."); ImGui::MenuItem("Save"); ImGui::EndMenu(); }
+        if (ImGui::BeginMenu("Edit")) { ImGui::MenuItem("Undo"); ImGui::MenuItem("Redo"); ImGui::EndMenu(); }
         if (ImGui::BeginMenu("Layer")) {
-            if (ImGui::MenuItem("New Rectangle")) layerManager.AddLayer(ShapeType::Rectangle);
-            if (ImGui::MenuItem("New Ellipse"))   layerManager.AddLayer(ShapeType::Ellipse);
-            if (ImGui::MenuItem("New Camera")) {
-                const int newId = layerManager.AddLayer(ShapeType::Camera, "Camera");
-                if (Layer* cam = layerManager.GetLayerById(newId)) {
-                    cam->is3D = true;
-                    cam->transform.position   = camera.position;
-                    cam->transform.sizePixels = { 60.0f, 40.0f }; // small icon box
-                }
-            }
+            if (ImGui::MenuItem("New Rectangle")) SpawnShapeAtViewportCenter(ShapeType::Rectangle);
+            if (ImGui::MenuItem("New Ellipse"))   SpawnShapeAtViewportCenter(ShapeType::Ellipse);
+            if (ImGui::MenuItem("New Null Object")) SpawnShapeAtViewportCenter(ShapeType::Null, "Null");
+            if (ImGui::MenuItem("New Camera"))    SpawnShapeAtViewportCenter(ShapeType::Camera,  "Camera");
             ImGui::Separator();
             if (ImGui::MenuItem("Delete Selected", "Del")) {
                 if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Composition")) {
+            ImGui::MenuItem("Composition Settings...");
+            ImGui::Separator();
+            ImGui::TextDisabled("Camera Style");
+            bool ae     = (cameraStyle == CameraStyle::AfterEffects);
+            bool alight = (cameraStyle == CameraStyle::AlightMotion);
+            if (ImGui::MenuItem("After Effects (free parenting)", nullptr, ae)) {
+                cameraStyle = CameraStyle::AfterEffects;
+            }
+            if (ImGui::MenuItem("Alight Motion (layers attach to camera)", nullptr, alight)) {
+                cameraStyle = CameraStyle::AlightMotion;
             }
             ImGui::EndMenu();
         }
@@ -328,24 +358,24 @@ void RenderEngine::DrawProjectAssetsPanel() {
 // Panel: Timeline (layer list with visibility + selection)
 // =============================================================================
 void RenderEngine::DrawTimelinePanel() {
-    if (ImGui::Button("+ Rect"))    layerManager.AddLayer(ShapeType::Rectangle);
+    if (ImGui::Button("+ Rect"))    SpawnShapeAtViewportCenter(ShapeType::Rectangle);
     ImGui::SameLine();
-    if (ImGui::Button("+ Ellipse")) layerManager.AddLayer(ShapeType::Ellipse);
+    if (ImGui::Button("+ Ellipse")) SpawnShapeAtViewportCenter(ShapeType::Ellipse);
     ImGui::SameLine();
-    if (ImGui::Button("+ Camera")) {
-        const int newId = layerManager.AddLayer(ShapeType::Camera, "Camera");
-        if (Layer* cam = layerManager.GetLayerById(newId)) {
-            cam->is3D = true;
-            cam->transform.position   = camera.position;
-            cam->transform.sizePixels = { 60.0f, 40.0f };
-        }
-    }
+    if (ImGui::Button("+ Null"))    SpawnShapeAtViewportCenter(ShapeType::Null,   "Null");
+    ImGui::SameLine();
+    if (ImGui::Button("+ Camera"))  SpawnShapeAtViewportCenter(ShapeType::Camera, "Camera");
     ImGui::SameLine();
     if (ImGui::Button("Delete Selected")) {
         if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
     }
     ImGui::SameLine();
     ImGui::Checkbox("Slingshot -> Selected Scale", &applySlingshotToSelected);
+
+    ImGui::Separator();
+
+    // Task 4.5: real timeline strip with playhead + keyframe diamonds.
+    DrawTimelineStrip();
 
     ImGui::Separator();
 
@@ -389,6 +419,7 @@ void RenderEngine::DrawTimelinePanel() {
                 case ShapeType::Ellipse:    typeName = "Ellipse";   break;
                 case ShapeType::CustomPath: typeName = "Path";      break;
                 case ShapeType::Camera:     typeName = "Camera";    break;
+                case ShapeType::Null:       typeName = "Null";      break;
             }
             ImGui::TextUnformatted(typeName);
 
@@ -421,6 +452,129 @@ void RenderEngine::DrawTimelinePanel() {
 // =============================================================================
 // Panel: Inspector (transform + Bezier handles + comp-clock playback)
 // =============================================================================
+// =============================================================================
+// Timeline strip (Task 4.5): time ruler, draggable playhead, per-layer rows
+// with keyframe diamonds. Kept simple — one horizontal band per layer showing
+// all four track types combined (position/scale/rotation/opacity keys).
+// =============================================================================
+void RenderEngine::DrawTimelineStrip() {
+    const float duration = (animEngine.duration > 0.001f) ? animEngine.duration : 1.0f;
+
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImVec2 avail  = ImGui::GetContentRegionAvail();
+    const float stripW = std::max(200.0f, avail.x);
+    const float labelW = 140.0f;       // reserved column for layer names on the left
+    const float rulerH = 22.0f;
+    const float rowH   = 18.0f;
+    const auto& layers = layerManager.Layers();
+    const float bodyH  = rowH * std::max<int>(1, (int)layers.size());
+    const float totalH = rulerH + bodyH + 4.0f;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (!dl) { ImGui::Dummy(ImVec2(stripW, totalH)); return; }
+
+    // Backdrop
+    dl->AddRectFilled(origin, ImVec2(origin.x + stripW, origin.y + totalH),
+                      IM_COL32(24, 24, 30, 255));
+    dl->AddLine(ImVec2(origin.x + labelW, origin.y),
+                ImVec2(origin.x + labelW, origin.y + totalH),
+                IM_COL32(60, 60, 70, 255), 1.0f);
+
+    const float trackX0 = origin.x + labelW + 4.0f;
+    const float trackX1 = origin.x + stripW - 6.0f;
+    const float trackW  = std::max(10.0f, trackX1 - trackX0);
+    auto TimeToX = [&](float t) {
+        const float u = std::clamp(t / duration, 0.0f, 1.0f);
+        return trackX0 + u * trackW;
+    };
+    auto XToTime = [&](float x) {
+        const float u = std::clamp((x - trackX0) / trackW, 0.0f, 1.0f);
+        return u * duration;
+    };
+
+    // Ruler ticks (10 divisions)
+    for (int i = 0; i <= 10; ++i) {
+        const float u = (float)i / 10.0f;
+        const float x = trackX0 + u * trackW;
+        const bool major = (i % 5 == 0);
+        dl->AddLine(ImVec2(x, origin.y + rulerH - (major ? 10.0f : 6.0f)),
+                    ImVec2(x, origin.y + rulerH),
+                    IM_COL32(120, 120, 130, 255), 1.0f);
+        if (major) {
+            char buf[32]; std::snprintf(buf, sizeof(buf), "%.2fs", u * duration);
+            dl->AddText(ImVec2(x + 2.0f, origin.y + 2.0f),
+                        IM_COL32(200, 200, 210, 255), buf);
+        }
+    }
+
+    // Per-layer rows with keyframe diamonds
+    const int selectedId = layerManager.GetSelectedId();
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const Layer& layer = layers[i];
+        const float rowY0 = origin.y + rulerH + rowH * (float)i;
+        const float rowYc = rowY0 + rowH * 0.5f;
+
+        // Row background: highlight selected
+        if (layer.id == selectedId) {
+            dl->AddRectFilled(ImVec2(origin.x, rowY0),
+                              ImVec2(origin.x + stripW, rowY0 + rowH),
+                              IM_COL32(50, 50, 80, 200));
+        }
+        // Label column
+        dl->AddText(ImVec2(origin.x + 6.0f, rowY0 + 2.0f),
+                    IM_COL32(220, 220, 230, 255), layer.name.c_str());
+
+        // Track baseline
+        dl->AddLine(ImVec2(trackX0, rowYc), ImVec2(trackX1, rowYc),
+                    IM_COL32(60, 60, 70, 255), 1.0f);
+
+        // Draw diamonds for each track type this layer owns
+        auto drawKeys = [&](const std::optional<PropertyTrack>& tr, ImU32 col) {
+            if (!tr || tr->empty()) return;
+            for (const auto& k : tr->keys) {
+                const float x = TimeToX(k.time);
+                const ImVec2 p(x, rowYc);
+                const float r = 4.5f;
+                const ImVec2 tri[4] = {
+                    ImVec2(p.x,     p.y - r),
+                    ImVec2(p.x + r, p.y),
+                    ImVec2(p.x,     p.y + r),
+                    ImVec2(p.x - r, p.y),
+                };
+                dl->AddConvexPolyFilled(tri, 4, col);
+            }
+        };
+        drawKeys(layer.positionTrack, IM_COL32(120, 200, 255, 255));
+        drawKeys(layer.scaleTrack,    IM_COL32(255, 200, 120, 255));
+        drawKeys(layer.rotationTrack, IM_COL32(200, 255, 120, 255));
+        drawKeys(layer.opacityTrack,  IM_COL32(255, 120, 200, 255));
+    }
+
+    // Playhead
+    const float phX = TimeToX(animEngine.currentTime);
+    dl->AddLine(ImVec2(phX, origin.y),
+                ImVec2(phX, origin.y + totalH),
+                IM_COL32(255, 60, 60, 255), 2.0f);
+    dl->AddTriangleFilled(
+        ImVec2(phX - 5.0f, origin.y),
+        ImVec2(phX + 5.0f, origin.y),
+        ImVec2(phX,        origin.y + 8.0f),
+        IM_COL32(255, 60, 60, 255));
+
+    // Interaction: click / drag anywhere in the strip below the ruler to
+    // scrub, click in the ruler to also scrub. Selecting a layer via the
+    // strip is handled by the layer table below — one thing per widget.
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::InvisibleButton("TimelineStripHit", ImVec2(stripW, totalH));
+    if (ImGui::IsItemActive()) {
+        const ImVec2 mp = ImGui::GetIO().MousePos;
+        if (mp.x >= trackX0 && mp.x <= trackX1) {
+            animEngine.currentTime = XToTime(mp.x);
+            animEngine.isPlaying   = false; // scrubbing pauses playback
+        }
+    }
+}
+
 void RenderEngine::DrawInspectorPanel() {
     Layer* sel = layerManager.GetSelectedLayer();
     if (!sel) {
@@ -437,12 +591,44 @@ void RenderEngine::DrawInspectorPanel() {
     ImGui::Text("Layer ID: %d   Parent ID: %d", sel->id, sel->parentId);
 
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Task 4.5: a diamond button beside each property sets a keyframe at
+        // the current comp time. A subtle color hint shows whether the
+        // property already has any keys.
+        const float t = animEngine.currentTime;
+        auto kfButton = [&](const char* id, bool has) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                has ? IM_COL32(200, 150, 30, 255) : IM_COL32(60, 60, 70, 255));
+            const bool clicked = ImGui::Button(id);
+            ImGui::PopStyleColor();
+            return clicked;
+        };
+
+        if (kfButton("K##pos", sel->positionTrack && !sel->positionTrack->empty())) sel->KeyPosition(t);
+        ImGui::SameLine();
         ImGui::DragFloat3("Position (x,y,z)", &sel->transform.position.x, 1.0f);
+
+        if (kfButton("K##rot", sel->rotationTrack && !sel->rotationTrack->empty())) sel->KeyRotation(t);
+        ImGui::SameLine();
         ImGui::DragFloat3("Rotation (deg)",   &sel->transform.rotation.x, 0.5f);
+
+        if (kfButton("K##scl", sel->scaleTrack && !sel->scaleTrack->empty())) sel->KeyScale(t);
+        ImGui::SameLine();
         ImGui::DragFloat3("Scale",            &sel->transform.scale.x,    0.01f, -10.0f, 10.0f);
+
         ImGui::DragFloat2("Anchor (0..1)",    &sel->transform.anchorPoint.x, 0.01f, 0.0f, 1.0f);
         ImGui::DragFloat2("Size (px)",        &sel->transform.sizePixels.x,  1.0f, 1.0f, 4096.0f);
-        ImGui::SliderFloat("Opacity",         &sel->transform.opacity, 0.0f, 1.0f);
+        ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
+
+        if (kfButton("K##op", sel->opacityTrack && !sel->opacityTrack->empty())) sel->KeyOpacity(t);
+        ImGui::SameLine();
+        ImGui::SliderFloat("Opacity", &sel->transform.opacity, 0.0f, 1.0f);
+
+        // Task 4.5: quick "Alight-style HUD attachment" toggle when using
+        // the Alight camera style. Grayed out under AE style.
+        const bool alightMode = (cameraStyle == CameraStyle::AlightMotion);
+        if (!alightMode) ImGui::BeginDisabled();
+        ImGui::Checkbox("Stick to Camera (Alight HUD)", &sel->stickToCamera);
+        if (!alightMode) ImGui::EndDisabled();
     }
 
     if (ImGui::CollapsingHeader("Fill", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -575,6 +761,17 @@ void RenderEngine::DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
             // Camera has its own dedicated gizmo drawn by DrawCameraGizmos —
             // no fill in the 2D pass.
             break;
+        case ShapeType::Null: {
+            // Invisible transform-only layer: draw a small X + label so the
+            // user can see and click it, but never a fill.
+            const ImVec2 c = ToScreen(worldMatrix.TransformPoint(Vec2(w*0.5f, h*0.5f)), canvasOrigin);
+            const float r = std::min(w, h) * 0.35f;
+            const ImU32 col = IM_COL32(180, 180, 180, alpha);
+            drawList->AddLine(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), col, 1.5f);
+            drawList->AddLine(ImVec2(c.x - r, c.y + r), ImVec2(c.x + r, c.y - r), col, 1.5f);
+            drawList->AddText(ImVec2(c.x + r + 4, c.y - 6), col, layer.name.c_str());
+            break;
+        }
     }
 }
 
@@ -748,6 +945,12 @@ void RenderEngine::DrawViewportCanvas() {
     if (canvas_sz.x < 50.0f) canvas_sz.x = 50.0f;
     if (canvas_sz.y < 50.0f) canvas_sz.y = 50.0f;
 
+    // Task 4.5: remember viewport geometry so "Add Shape" spawns in view.
+    // Viewport is a 1:1 window on composition space (no zoom yet), so the
+    // world-space center of the viewport is simply half the canvas size.
+    lastViewportSize         = canvas_sz;
+    lastViewportCenterWorld  = { canvas_sz.x * 0.5f, canvas_sz.y * 0.5f };
+
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     if (!draw_list) return;
 
@@ -770,12 +973,22 @@ void RenderEngine::DrawViewportCanvas() {
     // -------------------------------------------------------------------
     auto& L = layerManager.Layers();
 
-    // Pass A: 2D
+    // Pass A: 2D. Under Alight camera style, layers flagged stickToCamera
+    // get an extra pre-translate matching the camera XY offset so they float
+    // as a HUD overlay that follows the camera. Under AE style the flag is
+    // ignored (real AE achieves this via parenting to a Null attached to the
+    // camera; we support both patterns).
+    const bool alightMode = (cameraStyle == CameraStyle::AlightMotion);
+    const Vec2 camScreenOffset = { camera.position.x - 640.0f,
+                                   camera.position.y - 360.0f };
     for (auto& layer : L) {
         if (!layer.isVisible)                    continue;
         if (layer.is3D)                          continue;
         if (layer.type == ShapeType::Camera)     continue;
-        const Mat3 wm  = layerManager.GetWorldMatrix(layer.id);
+        Mat3 wm  = layerManager.GetWorldMatrix(layer.id);
+        if (alightMode && layer.stickToCamera) {
+            wm = Mat3::Translation(camScreenOffset.x, camScreenOffset.y) * wm;
+        }
         const float op = layerManager.GetWorldOpacity(layer.id);
         DrawLayerShape(layer, wm, op, canvas_p0, draw_list);
     }
@@ -1240,6 +1453,42 @@ void RenderEngine::EndFrame() {
     }
 
     swapChain->Present(1, 0);
+}
+
+// Task 4.5: single source of truth for "give me a new shape".
+// Places the shape at whatever the user currently sees as the middle of the
+// composition viewport (not the fixed world origin), so on any window size
+// or after camera panning the new shape appears right where the user expects.
+void RenderEngine::SpawnShapeAtViewportCenter(ShapeType type, const char* nameHint) {
+    const int newId = layerManager.AddLayer(type, nameHint ? std::string(nameHint) : std::string());
+    Layer* layer = layerManager.GetLayerById(newId);
+    if (!layer) return;
+
+    layer->transform.position.x = lastViewportCenterWorld.x;
+    layer->transform.position.y = lastViewportCenterWorld.y;
+    layer->transform.position.z = 0.0f;
+
+    // Sensible per-type defaults so the shape is visible immediately.
+    switch (type) {
+        case ShapeType::Rectangle:
+            layer->transform.sizePixels = { 200.0f, 120.0f };
+            break;
+        case ShapeType::Ellipse:
+            layer->transform.sizePixels = { 120.0f, 120.0f };
+            break;
+        case ShapeType::CustomPath:
+            layer->transform.sizePixels = { 160.0f, 160.0f };
+            break;
+        case ShapeType::Camera:
+            layer->is3D = true;
+            layer->transform.sizePixels = { 60.0f, 40.0f };
+            layer->transform.position   = camera.position; // camera lives in 3D
+            break;
+        case ShapeType::Null:
+            layer->transform.sizePixels = { 60.0f, 60.0f };
+            layer->fillColor            = 0xFFAAAAAA; // gray marker
+            break;
+    }
 }
 
 void RenderEngine::Shutdown() {

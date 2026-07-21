@@ -50,6 +50,7 @@ int LayerManager::AddLayer(ShapeType type, const std::string& nameHint) {
             case ShapeType::Ellipse:    L.name = "Ellipse "   + std::to_string(L.id); break;
             case ShapeType::CustomPath: L.name = "Path "      + std::to_string(L.id); break;
             case ShapeType::Camera:     L.name = "Camera "    + std::to_string(L.id); break;
+            case ShapeType::Null:       L.name = "Null "      + std::to_string(L.id); break;
         }
     }
 
