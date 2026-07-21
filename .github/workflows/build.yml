@@ -31,11 +31,7 @@ jobs:
       shell: cmd
       run: |
         mkdir release_pack
-        if exist build\Release (
-          xcopy /E /Y build\Release\* release_pack\
-        ) else (
-          xcopy /E /Y build\* release_pack\
-        )
+        for /R build %%f in (*.exe *.dll) do copy "%%f" release_pack\
         
     - name: Upload x64 EXE to GitHub Artifacts
       uses: actions/upload-artifact@v4
