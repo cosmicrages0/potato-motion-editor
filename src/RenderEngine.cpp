@@ -74,7 +74,11 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
         ball->transform.position   = { 640.0f, 360.0f, 0.0f };
         ball->fillColor = 0xFF00B4FF;
     }
-    applySlingshotToSelected = true;
+    // User feedback from Task 4.5 screenshot review: the slingshot demo was
+    // silently overwriting whatever the artist typed into the Scale field,
+    // making it look broken. Default OFF; the checkbox in the Timeline still
+    // exists as a debug/demo toggle for showing the Bezier curve in action.
+    applySlingshotToSelected = false;
 
     // Seed the 3D camera with a sensible default framing (Task 4).
     camera.ResetToDefault();

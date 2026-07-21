@@ -165,12 +165,17 @@ Grouped so it's clear what is achievable on a potato PC and what would need real
 - **Cinema 4D Lite integration**
 - **Live real-time preview at 4K** (we can only *export* 4K per the design)
 
-### 5.4 Post-Task-6 roadmap (a rough ordering, subject to your call)
+### 5.4 Roadmap after user's screenshot review (locked ordering)
+
+The user has explicitly chosen skeleton-first ordering. Do NOT reorder these without asking.
 
 | # | Milestone | Rough effort | Why it matters |
 |---|---|---|---|
-| **7** | **Timeline strip + per-property keyframes + curve editor overhaul** | 5 days | Turns the "one Bezier drives selected scale" hack into a real animation editor |
-| **8** | **Null Object layers + camera rig UX + AE-style vs Alight-style parenting toggle** | 2 days | Directly addresses the concern you raised about camera parenting |
+| **5** | **HLSL Pixel Shader Stack** (motion tile, motion blur, chroma aberration, blend modes) | 4-5 days | Adds the visual "wow" — the reason a motion graphics editor exists |
+| **6** | **FFmpeg Proxy + 4K Export Engine** | 4-5 days | The point at which the app can produce a deliverable file |
+| **5.0** | **Deferred Usability Pass** — fixed centered composition canvas at 1920×1080, tabbed Inspector, wider timeline labels, corner-scale gizmo rewrite, rotation gizmo, Reset Layout menu, proper DPI. See Section 9.5 for the full list | 4 days | Turns the skeleton into something the user can actually operate |
+| **7** | **Bezier easing per keyframe + curve editor tied to real tracks** (right now keys are linear-only, and the graph editor drives only the global demo Bezier) | 3 days | Real animation quality |
+| **8** | **Null Object layers + camera rig UX** — already partially done in 4.5 but needs to be re-verified after 5.0 fixes layout | 1 day | Confirms parenting rigs work end-to-end |
 | **9** | **Undo/redo + project save/load (JSON `.pmge` file)** | 4 days | Without these it's not a real tool |
 | **10** | **Text layers + shape strokes + rounded corners** | 4 days | The minimum content variety needed for a real motion graphic |
 | **11** | **Sub-compositions (pre-comp / nesting)** | 4 days | Lets users build complex scenes from smaller pieces |
@@ -246,6 +251,42 @@ Before Task 5 (shaders), fix these specific issues the user has flagged:
 After 4.5 lands, proceed to Task 5 shaders.
 
 ---
+
+## 9.5 State After Task 4.5 (post user screenshot review)
+
+The user tested the 4.5 build and shipped a screenshot. Ship succeeded but the review was blunt and correct: **"4.5 polished is only look not functional."**
+
+### What's cosmetically present but functionally broken
+- **Composition Viewport is not centered.** Confirmed: the panel uses panel-pixel coordinates as world coordinates directly, so the 1280×720 composition guide rectangle floats wherever the panel size happens to place it (in the user's screenshot it's in the bottom-right of a mostly-empty black panel). Every shape spawns relative to the panel's top-left corner, not the composition center. LAYOUT_MAP.md Section 3 has the diagrams.
+- **Inspector `Scale` field is fighting the Slingshot demo.** The "Slingshot -> Selected Scale" checkbox is on by default, and the global Bezier silently overwrites `transform.scale.x/y` every frame in `BeginFrame()`. So the user types a number into the Scale field and it gets stomped on the next frame. Confusing.
+- **Inspector labels clip.** Panel width isn't reserved for the K button + label combo, so `Position` → `Positi`, `Rotation` → `Rotati`, `Opacity` → `Opacit`, `Scale` → `Scal`.
+- **Keyframe diamonds don't appear in the timeline strip** after clicking the K button. Either the K click doesn't reach the code path or the diamond drawing is off-row.
+- **"Slingshot Bezier Handles" and "Composition Clock" sections show in the per-layer Inspector**, even though they are global-clock properties. Belongs in a separate "Global" tab or the Comp menu.
+- **Timeline strip label column is 140px fixed**, which truncates layer names.
+
+### User's decision (locked in, don't re-litigate)
+
+The user chose **skeleton-first**: proceed with Task 5 shaders and Task 6 export before any usability rewrite. Rationale: the underlying data model is right; the UX wiring can be fixed in one clean pass once the whole feature surface is present. Attempting to polish before all the pieces are there wastes work when Task 5/6 will add more properties that need the same UX pattern anyway.
+
+**Concrete calls from the user:**
+- **Composition default resolution:** 1920×1080 (not 1280×720). Fixed centered canvas becomes part of the post-Task-6 usability pass, not now.
+- **Slingshot demo checkbox:** keep it for backwards compatibility, but **default OFF** and move out of the main Timeline strip into a debug/demo submenu so it stops fighting the Scale field.
+- **Ordering:** Task 5 → Task 6 → Task 5.0 Usability Pass (deferred) → Task 7 Real Keyframe Easing → Task 8 Undo/Save.
+
+### Task 5.0 Usability Pass — deferred but scheduled
+
+To be executed AFTER Task 6, in one pass, fixing:
+1. Centered composition canvas at fixed resolution with letterbox bars
+2. Proper world↔screen transform (one function, one direction)
+3. Corner-scale gizmo redone with linear mouse-delta math (current version is non-linear near anchor)
+4. Rotation gizmo on canvas
+5. Inspector layout with tabs (Transform / Effects / Global) so per-layer and global properties don't mix
+6. Timeline strip: zoom, scroll, wider label column, keyframe context menu (right-click row to add key at playhead)
+7. "Reset Layout" menu item so users can escape a broken imgui.ini
+8. Real DPI awareness
+
+---
+
 
 ## 10. Task 5 Preview (for planning only, do not start yet)
 
