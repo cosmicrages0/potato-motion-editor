@@ -74,6 +74,29 @@ potato-motion-editor/
 - **Correct matrix order** `world = parent * local` (column-vector convention)
 - Delete/Backspace keyboard shortcut
 
+### ✅ Task 5 — HLSL Effect Stack & Blending Modes (done, with scope caveat)
+
+- `Effect.h` — POD-ish struct with `type` enum, `params` (four float4s = 64 bytes so the whole thing memcpys straight into a shader constant buffer), stable per-effect `id`, and factory helpers with sensible defaults.
+- `EffectManager.h/.cpp` — owns:
+  - Compiled VS + one PS per effect type + a passthrough PS fallback (used automatically if a shader compile fails, so a bad HLSL edit never crashes the app)
+  - **Exactly TWO ping-pong render targets** at composition resolution (not one per layer) — 16 MB @ 1080p regardless of layer count, vs the 250 MB the naive design would burn on 30 layers
+  - Shared fullscreen-triangle VB, linear-clamp sampler, standard alpha blend state
+  - `ApplyChain(srcSRV, dstRTV, effects)` runs the enabled effects in order, ping-ponging between the two internal RTs, with `srcSRV` bound to slot t0 and the current `Effect::params` uploaded into cbuffer b0.
+- 4 HLSL pixel shaders embedded as string literals inside `EffectManager.cpp` (single-file per module rule):
+  - **Motion Tile / Mirror Edge:** `uv * N + phase`, then `lerp(frac(uv), abs(frac(uv)*2-1), mirror)`
+  - **Directional Motion Blur:** 1–16 samples along `float2(cos(angle), sin(angle))`, triangular window weighting, sample count clamped in the shader
+  - **Chromatic Aberration:** radial OR directional R/G/B offset; radial mode uses `max(length, 1e-4)` to avoid div-by-zero at image center
+  - **Blend Modes:** Normal / Additive / Multiply / Screen / Overlay / Color Dodge; Color Dodge uses `min(1.0, d / max(1-s, 1e-4))` to survive `s=1.0`
+- Layer gains `std::vector<Effect> effects` with `AddEffect / RemoveEffectById / MoveEffect / FindEffectById / HasAnyEnabledEffect`. All effect references use stable `id`, never vector index.
+- New dockable panels: **Effects Palette** (tabbed under Project Assets by default) and **Effect Controls** (tabbed under Inspector). Effect Controls shows an ordered stack with enable checkbox, up/down/delete buttons, and type-specific parameter sliders. `[fx]` badge lights up on Timeline layer rows that have any enabled effect.
+- Top-bar Effect menu populates real Add-Effect menu items instead of stubs.
+- ImGui-style Blend Mode combo in Effect Controls; Blend Mode entries can be added by any of three paths (Effect menu, Effects Palette, or dedicated blend-mode buttons).
+
+**Scope caveat — read this before testing:**
+The Task 5 pipeline is *data-complete* — you can add, reorder, toggle, and tweak effects, the [fx] badge lights up, the shaders compile at startup, and the ping-pong RTs allocate. But because our current viewport renders shapes via `ImDrawList` directly to the swap-chain back buffer (not to a per-layer texture), **the effects don't yet visually filter the shapes on screen**. Wiring them into a real per-layer texture pass is one of the items scheduled for the deferred Task 5.0 Usability Pass (see Section 9.5 and 5.4). Under Task 5 alone, the Effect Controls panel is authoring-only.
+
+---
+
 ### ✅ Task 4 — 3D Camera & Perspective Pipeline (done)
 - `Mat4` with `LookAtLH`, `PerspectiveFovLH` (vertical FOV), defensive clamps on every input
 - `Camera` class: `position`, `target`, `rotation`, `up`, `fov`, `nearZ`, `farZ`, `useTargetMode`

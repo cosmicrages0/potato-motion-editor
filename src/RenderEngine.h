@@ -20,6 +20,7 @@
 #include "AnimationEngine.h"
 #include "LayerManager.h"
 #include "Camera.h"
+#include "EffectManager.h"
 
 class RenderEngine {
 public:
@@ -43,6 +44,8 @@ private:
     void DrawTimelineStrip();       // Task 4.5: time ruler + playhead + kf diamonds
     void DrawInspectorPanel();
     void DrawProjectAssetsPanel();
+    void DrawEffectsPalettePanel(); // Task 5: available effects to add
+    void DrawEffectControlsPanel(); // Task 5: active effects on selected layer
     void DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                         float worldOpacity, ImVec2 canvasOrigin,
                         ImDrawList* drawList);
@@ -80,8 +83,15 @@ private:
     AnimationEngine animEngine;
     bool applySlingshotToSelected = false;
 
-    LayerManager layerManager;
-    Camera       camera;
+    LayerManager   layerManager;
+    Camera         camera;
+    EffectManager  effectManager;   // Task 5: HLSL shader stack owner
+
+    // Task 5: composition resolution. Fixed centered canvas uses this in the
+    // deferred Task 5.0 usability pass. For now it drives the size of the
+    // EffectManager's ping-pong render targets.
+    int   compositionWidth  = 1920;
+    int   compositionHeight = 1080;
 
     // Task 4.5: composition-wide setting for how the camera relates to layers.
     // AE mode = camera is a normal layer, parented freely (default).

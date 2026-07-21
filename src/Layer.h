@@ -7,6 +7,7 @@
 
 #include "MathTypes.h"
 #include "AnimationEngine.h"
+#include "Effect.h"
 
 // -----------------------------------------------------------------------------
 // Shape type: extensible enum. CustomPath is stubbed for Task 3 and will be
@@ -152,6 +153,50 @@ struct Layer {
     std::optional<PropertyTrack> scaleTrack;
     std::optional<PropertyTrack> rotationTrack;
     std::optional<PropertyTrack> opacityTrack;
+
+    // Task 5: ordered stack of post-processing effects. Reserved so add/remove
+    // never allocates inside the frame loop for typical projects.
+    std::vector<Effect> effects;
+    int nextEffectId = 1;
+
+    Effect* AddEffect(const Effect& proto) {
+        Effect e   = proto;
+        e.id       = nextEffectId++;
+        effects.push_back(std::move(e));
+        return &effects.back();
+    }
+    bool RemoveEffectById(int effectId) {
+        auto it = std::find_if(effects.begin(), effects.end(),
+            [&](const Effect& x){ return x.id == effectId; });
+        if (it == effects.end()) return false;
+        effects.erase(it);
+        return true;
+    }
+    Effect* FindEffectById(int effectId) {
+        auto it = std::find_if(effects.begin(), effects.end(),
+            [&](const Effect& x){ return x.id == effectId; });
+        return (it == effects.end()) ? nullptr : &*it;
+    }
+    bool MoveEffect(int effectId, int delta) {
+        auto it = std::find_if(effects.begin(), effects.end(),
+            [&](const Effect& x){ return x.id == effectId; });
+        if (it == effects.end()) return false;
+        const size_t idx = (size_t)std::distance(effects.begin(), it);
+        const size_t targetIdx = (size_t)std::clamp<int>((int)idx + delta, 0, (int)effects.size() - 1);
+        if (targetIdx == idx) return false;
+        // Simple two-swap move that preserves the rest of the order.
+        if (delta > 0) std::rotate(effects.begin() + idx,
+                                    effects.begin() + idx + 1,
+                                    effects.begin() + targetIdx + 1);
+        else           std::rotate(effects.begin() + targetIdx,
+                                    effects.begin() + idx,
+                                    effects.begin() + idx + 1);
+        return true;
+    }
+    bool HasAnyEnabledEffect() const {
+        for (const auto& e : effects) if (e.enabled) return true;
+        return false;
+    }
 
     // Convenience: set a keyframe on a property at the given comp time,
     // sampling the current transform value if the track doesn't exist yet.

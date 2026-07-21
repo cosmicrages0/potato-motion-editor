@@ -59,6 +59,14 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
     if (!InitDirectX()) return false;
     if (!InitImGui())   return false;
 
+    // Task 5: initialise the HLSL effect pipeline. Failure is logged but
+    // NON-FATAL — the editor still runs; effects panels just show "not ready".
+    if (!effectManager.Initialize(device, context,
+                                   (UINT)compositionWidth,
+                                   (UINT)compositionHeight)) {
+        std::cerr << "[RenderEngine] EffectManager init failed; effects disabled" << std::endl;
+    }
+
     // Seed a couple of demo layers so the app is immediately editable.
     // Positions are set explicitly here (SpawnShapeAtViewportCenter uses the
     // last-seen viewport center, which isn't populated yet on first init).
@@ -292,8 +300,10 @@ void RenderEngine::RenderAEDockingLayout() {
         ImGuiID dock_bottom_right_id = ImGui::DockBuilderSplitNode(dock_bottom_id, ImGuiDir_Right, 0.50f, nullptr, &dock_bottom_id);
 
         ImGui::DockBuilderDockWindow("Project Assets",        dock_left_id);
+        ImGui::DockBuilderDockWindow("Effects Palette",       dock_left_id);   // tabbed under Project Assets
         ImGui::DockBuilderDockWindow("Composition Viewport",  dock_main_id);
         ImGui::DockBuilderDockWindow("Inspector & Effects",   dock_right_id);
+        ImGui::DockBuilderDockWindow("Effect Controls",       dock_right_id);  // tabbed under Inspector
         ImGui::DockBuilderDockWindow("Timeline",              dock_bottom_id);
         ImGui::DockBuilderDockWindow("Graph Editor",          dock_bottom_right_id);
 
@@ -330,18 +340,39 @@ void RenderEngine::RenderAEDockingLayout() {
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Effect"))      { ImGui::MenuItem("Motion Blur"); ImGui::MenuItem("Chromatic Aberration"); ImGui::EndMenu(); }
+        if (ImGui::BeginMenu("Effect")) {
+            Layer* selForFx = layerManager.GetSelectedLayer();
+            const bool haveSel = (selForFx != nullptr);
+            if (!haveSel) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Add Motion Tile"))         { if (selForFx) selForFx->AddEffect(Effect::MakeMotionTile()); }
+            if (ImGui::MenuItem("Add Directional Motion Blur")) { if (selForFx) selForFx->AddEffect(Effect::MakeMotionBlur()); }
+            if (ImGui::MenuItem("Add Chromatic Aberration")) { if (selForFx) selForFx->AddEffect(Effect::MakeChromaticAberration()); }
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Add Blend Mode")) {
+                if (ImGui::MenuItem("Normal"))     { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Normal)); }
+                if (ImGui::MenuItem("Additive"))   { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Additive)); }
+                if (ImGui::MenuItem("Multiply"))   { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Multiply)); }
+                if (ImGui::MenuItem("Screen"))     { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Screen)); }
+                if (ImGui::MenuItem("Overlay"))    { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Overlay)); }
+                if (ImGui::MenuItem("Color Dodge")){ if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::ColorDodge)); }
+                ImGui::EndMenu();
+            }
+            if (!haveSel) ImGui::EndDisabled();
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Export"))      { ImGui::MenuItem("Render Queue..."); ImGui::EndMenu(); }
         ImGui::EndMenuBar();
     }
     ImGui::End();
 
     // Panels
-    ImGui::Begin("Project Assets");        DrawProjectAssetsPanel();  ImGui::End();
-    ImGui::Begin("Composition Viewport");  DrawViewportCanvas();      ImGui::End();
-    ImGui::Begin("Inspector & Effects");   DrawInspectorPanel();      ImGui::End();
-    ImGui::Begin("Timeline");              DrawTimelinePanel();       ImGui::End();
-    ImGui::Begin("Graph Editor");          DrawGraphEditor();         ImGui::End();
+    ImGui::Begin("Project Assets");        DrawProjectAssetsPanel();     ImGui::End();
+    ImGui::Begin("Effects Palette");       DrawEffectsPalettePanel();    ImGui::End();
+    ImGui::Begin("Composition Viewport");  DrawViewportCanvas();         ImGui::End();
+    ImGui::Begin("Inspector & Effects");   DrawInspectorPanel();         ImGui::End();
+    ImGui::Begin("Effect Controls");       DrawEffectControlsPanel();    ImGui::End();
+    ImGui::Begin("Timeline");              DrawTimelinePanel();          ImGui::End();
+    ImGui::Begin("Graph Editor");          DrawGraphEditor();            ImGui::End();
 }
 
 // =============================================================================
@@ -406,11 +437,14 @@ void RenderEngine::DrawTimelinePanel() {
             ImGui::TableSetColumnIndex(1);
             ImGui::Checkbox("##3d", &layer.is3D);
 
-            // Selectable name
+            // Selectable name (with [fx] badge if the layer has any enabled effects)
             ImGui::TableSetColumnIndex(2);
             const bool isSelected = (layer.id == layerManager.GetSelectedId());
-            char label[128];
-            std::snprintf(label, sizeof(label), "%s", layer.name.c_str());
+            char label[160];
+            const bool fx = layer.HasAnyEnabledEffect();
+            std::snprintf(label, sizeof(label), "%s%s",
+                          fx ? "[fx] " : "",
+                          layer.name.c_str());
             if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
                 layerManager.SetSelectedId(layer.id);
             }
@@ -1358,6 +1392,146 @@ void RenderEngine::SyncCameraFromLayerIfAny() {
 }
 
 // =============================================================================
+// Effects Palette (Task 5): browse available effects, click to add to selection
+// =============================================================================
+void RenderEngine::DrawEffectsPalettePanel() {
+    if (!effectManager.IsReady()) {
+        ImGui::TextDisabled("Shader pipeline not initialised.");
+        ImGui::TextWrapped("Check the console for the D3DCompile error and confirm d3dcompiler.dll is loadable.");
+        return;
+    }
+    ImGui::Text("Effects (drag or click to add to selection)");
+    ImGui::Separator();
+
+    Layer* sel = layerManager.GetSelectedLayer();
+    const bool haveSel = (sel != nullptr);
+    if (!haveSel) {
+        ImGui::TextDisabled("Select a layer in the Timeline to add effects.");
+        return;
+    }
+
+    auto addRow = [&](const char* label, const char* desc, Effect (*factory)()){
+        ImGui::PushID(label);
+        if (ImGui::Button(label, ImVec2(-1, 0))) {
+            sel->AddEffect(factory());
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(desc);
+            ImGui::EndTooltip();
+        }
+        ImGui::PopID();
+    };
+    addRow("Motion Tile",             "Repeats and (optionally) mirrors the layer across UV space.", Effect::MakeMotionTile);
+    addRow("Directional Motion Blur", "Blurs the layer along an angle. Cap: 16 samples for potato GPUs.", Effect::MakeMotionBlur);
+    addRow("Chromatic Aberration",    "Offsets R/G/B channels radially or along an angle.", Effect::MakeChromaticAberration);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Blend Modes");
+    struct BM { const char* name; BlendMode m; };
+    const BM bms[] = {
+        { "Normal",      BlendMode::Normal     },
+        { "Additive",    BlendMode::Additive   },
+        { "Multiply",    BlendMode::Multiply   },
+        { "Screen",      BlendMode::Screen     },
+        { "Overlay",     BlendMode::Overlay    },
+        { "Color Dodge", BlendMode::ColorDodge },
+    };
+    for (const auto& bm : bms) {
+        ImGui::PushID(bm.name);
+        if (ImGui::Button(bm.name, ImVec2(-1, 0))) {
+            sel->AddEffect(Effect::MakeBlendMode(bm.m));
+        }
+        ImGui::PopID();
+    }
+}
+
+// =============================================================================
+// Effect Controls (Task 5): active stack on the selected layer + parameters
+// =============================================================================
+void RenderEngine::DrawEffectControlsPanel() {
+    Layer* sel = layerManager.GetSelectedLayer();
+    if (!sel) {
+        ImGui::TextDisabled("No layer selected.");
+        return;
+    }
+    ImGui::Text("Effect stack for: %s", sel->name.c_str());
+    if (sel->effects.empty()) {
+        ImGui::TextDisabled("No effects. Add one from the Effects Palette.");
+        return;
+    }
+    ImGui::TextDisabled("Effects run top-to-bottom. Later effects see earlier output.");
+    ImGui::Separator();
+
+    int  moveEffectId = -1;
+    int  moveDelta    = 0;
+    int  deleteId     = -1;
+
+    for (size_t i = 0; i < sel->effects.size(); ++i) {
+        Effect& e = sel->effects[i];
+        ImGui::PushID(e.id);
+
+        // Row header: [x] enabled  Name  [^] [v] [X]
+        ImGui::Checkbox("##en", &e.enabled);
+        ImGui::SameLine();
+        ImGui::Text("%zu. %s", i + 1, e.displayName.c_str());
+
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 88.0f);
+        if (ImGui::SmallButton("^")) { moveEffectId = e.id; moveDelta = -1; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("v")) { moveEffectId = e.id; moveDelta = +1; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X")) { deleteId = e.id; }
+
+        // Type-specific parameter widgets
+        ImGui::Indent();
+        switch (e.type) {
+        case EffectType::MotionTile:
+            ImGui::SliderFloat("Tile Count",    &e.params.p0[0], 1.0f, 32.0f);
+            ImGui::SliderFloat("Phase",         &e.params.p0[1], -1.0f, 1.0f);
+            {
+                bool mirror = e.params.p0[2] > 0.5f;
+                if (ImGui::Checkbox("Mirror Edges", &mirror)) e.params.p0[2] = mirror ? 1.0f : 0.0f;
+            }
+            break;
+        case EffectType::DirectionalMotionBlur:
+            ImGui::SliderFloat("Angle (deg)",   &e.params.p0[0], 0.0f, 360.0f);
+            ImGui::SliderFloat("Intensity",     &e.params.p0[1], 0.0f, 100.0f);
+            ImGui::SliderFloat("Samples (max 16)", &e.params.p0[2], 1.0f, 16.0f);
+            break;
+        case EffectType::ChromaticAberration:
+            ImGui::SliderFloat("Amount (px)",   &e.params.p0[0], 0.0f, 32.0f);
+            ImGui::SliderFloat("Angle (deg)",   &e.params.p0[1], 0.0f, 360.0f);
+            {
+                bool radial = e.params.p0[2] > 0.5f;
+                if (ImGui::Checkbox("Radial", &radial)) e.params.p0[2] = radial ? 1.0f : 0.0f;
+            }
+            break;
+        case EffectType::BlendMode: {
+            static const char* kNames[] = { "Normal","Additive","Multiply","Screen","Overlay","Color Dodge" };
+            int mode = (int)e.params.p0[0];
+            if (mode < 0) mode = 0;
+            if (mode > 5) mode = 5;
+            if (ImGui::Combo("Mode", &mode, kNames, 6)) e.params.p0[0] = (float)mode;
+            break;
+        }
+        case EffectType::COUNT: break;
+        }
+        ImGui::Unindent();
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+
+    // Apply deferred mutations (can't mutate while iterating).
+    if (moveEffectId >= 0) sel->MoveEffect(moveEffectId, moveDelta);
+    if (deleteId     >= 0) sel->RemoveEffectById(deleteId);
+
+    ImGui::TextDisabled("Note: Task 5 wires the pipeline data + UI. Per-layer");
+    ImGui::TextDisabled("shader application to the ImGui viewport ships in");
+    ImGui::TextDisabled("Task 5.0 Usability Pass (see PROJECT_BRIEFING Section 9.5).");
+}
+
+// =============================================================================
 // Graph Editor (unchanged from Task 2 but with the same defensive guards)
 // =============================================================================
 void RenderEngine::DrawGraphEditor() {
@@ -1498,6 +1672,10 @@ void RenderEngine::SpawnShapeAtViewportCenter(ShapeType type, const char* nameHi
 void RenderEngine::Shutdown() {
     if (shutdownCalled) return;
     shutdownCalled = true;
+
+    // Task 5: release GPU resources owned by the effect stack BEFORE the
+    // device/context go away.
+    effectManager.Shutdown();
 
     if (imguiInitialized) {
         ImGui_ImplDX11_Shutdown();
