@@ -55,7 +55,9 @@ int LayerManager::AddLayer(ShapeType type, const std::string& nameHint) {
     }
 
     // Sensible default: center of a 1280x720 composition.
-    L.transform.position = { 640.0f, 360.0f, 0.0f };
+    // Task 5.1: writing to staticValue directly is correct here — this is a
+    // brand-new layer with the stopwatch off, so there's no keyframe to key.
+    L.transform.position.staticValue = Vec3(640.0f, 360.0f, 0.0f);
 
     // Slight color variation so successive adds are visually distinguishable.
     // Cycles through a small palette to stay potato-PC friendly.
@@ -131,10 +133,11 @@ bool LayerManager::SetParent(int childId, int parentId) {
     return true;
 }
 
-void LayerManager::BeginFrame() {
+void LayerManager::BeginFrame(float compTime) {
     frameMatrixCache.clear();
     frameMatrix4Cache.clear();
     frameOpacityCache.clear();
+    currentCompTime = compTime;
 }
 
 int LayerManager::FindActiveCameraLayerId() const {
@@ -155,7 +158,7 @@ Mat3 LayerManager::GetWorldMatrix(int layerId) {
     const Layer* L = GetLayerById(layerId);
     if (!L) return Mat3::Identity();
 
-    Mat3 local = L->transform.ToLocalMatrix();
+    Mat3 local = L->transform.ToLocalMatrix(currentCompTime);
 
     // Column-vector convention: world = parent * local
     // (child transforms happen inside parent's coordinate frame — matches AE).
@@ -179,7 +182,7 @@ Mat4 LayerManager::GetWorldMatrix4(int layerId) {
     const Layer* L = GetLayerById(layerId);
     if (!L) return Mat4::Identity();
 
-    Mat4 local = L->transform.ToLocalMatrix4();
+    Mat4 local = L->transform.ToLocalMatrix4(currentCompTime);
     Mat4 world;
     if (L->parentId >= 0 && L->parentId != L->id) {
         world = GetWorldMatrix4(L->parentId) * local;
@@ -199,7 +202,7 @@ float LayerManager::GetWorldOpacity(int layerId) {
     const Layer* L = GetLayerById(layerId);
     if (!L) return 1.0f;
 
-    float op = std::clamp(L->transform.opacity, 0.0f, 1.0f);
+    float op = std::clamp(L->transform.opacity.Evaluate(currentCompTime), 0.0f, 1.0f);
     if (L->parentId >= 0 && L->parentId != L->id) {
         op *= GetWorldOpacity(L->parentId);
     }

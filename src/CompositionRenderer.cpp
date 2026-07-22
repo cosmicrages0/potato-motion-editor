@@ -402,13 +402,16 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
     // Draw every visible 2D layer in timeline order (later = on top).
     // 3D layers, Camera, and Null are handled elsewhere (Null has its own
     // draw here since it lives in 2D composition space).
+    // Task 5.1: sample AnimatedProperty at the LayerManager's frame comp time
+    // so shape size matches whatever GetWorldMatrix() used for the transform.
+    const float compT = layerManager.CurrentCompTime();
     for (auto& layer : layerManager.Layers()) {
         if (!layer.isVisible) continue;
         if (layer.is3D)       continue;
         if (layer.type == ShapeType::Camera) continue;
 
         const Mat3 wm = layerManager.GetWorldMatrix(layer.id);
-        const Vec2 sz = layer.transform.sizePixels;
+        const Vec2 sz = layer.transform.sizePixels.Evaluate(compT);
 
         // Bake per-layer opacity into the color's alpha channel.
         const float layerOp = layerManager.GetWorldOpacity(layer.id);

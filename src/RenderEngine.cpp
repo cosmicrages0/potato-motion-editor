@@ -86,14 +86,16 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
     const float cy = (float)compositionHeight * 0.5f;
     layerManager.AddLayer(ShapeType::Rectangle, "Background Rect");
     if (Layer* bg = layerManager.GetSelectedLayer()) {
-        bg->transform.sizePixels = { 800.0f, 480.0f };
-        bg->transform.position   = { cx, cy, 0.0f };
+        // Task 5.1: seed layer defaults go directly into .staticValue since
+        // the stopwatch is off at creation time.
+        bg->transform.sizePixels.staticValue = Vec2(800.0f, 480.0f);
+        bg->transform.position  .staticValue = Vec3(cx, cy, 0.0f);
         bg->fillColor = 0xFF3A3A55; // dark violet-ish (ABGR)
     }
     layerManager.AddLayer(ShapeType::Ellipse, "Bouncing Ball");
     if (Layer* ball = layerManager.GetSelectedLayer()) {
-        ball->transform.sizePixels = { 200.0f, 200.0f };
-        ball->transform.position   = { cx, cy, 0.0f };
+        ball->transform.sizePixels.staticValue = Vec2(200.0f, 200.0f);
+        ball->transform.position  .staticValue = Vec3(cx, cy, 0.0f);
         ball->fillColor = 0xFF00B4FF;
     }
     // User feedback from Task 4.5 screenshot review: the slingshot demo was
@@ -244,29 +246,26 @@ void RenderEngine::BeginFrame() {
     if (deltaTime > 0.25f) deltaTime = 0.25f;
 
     animEngine.Update(deltaTime);
-    layerManager.BeginFrame(); // reset per-frame world-matrix cache
 
-    // Task 4.5: bake keyframe tracks into live transforms BEFORE anything
-    // else reads them (camera sync, matrix build, gizmos, hit-test).
-    for (auto& layer : layerManager.Layers()) {
-        layer.SampleTracks(animEngine.currentTime);
-    }
+    // Task 5.1: LayerManager now publishes composition time so every downstream
+    // read (matrix build, opacity chain, camera sync, Inspector) samples at
+    // exactly the same instant. No more per-layer SampleTracks pre-pass — the
+    // AnimatedProperty<T>::Evaluate() call at each read site IS the sampling.
+    layerManager.BeginFrame(animEngine.currentTime);
 
     SyncCameraFromLayerIfAny(); // Task 4: let a Camera layer drive the view
 
     // Legacy Task 2 demo: apply the global slingshot curve as a scale
-    // multiplier on the selected layer. Only kicks in for layers that don't
-    // already have a real scale track — keyframes win.
+    // multiplier on the selected layer. Only kicks in for layers whose scale
+    // stopwatch is off — real keyframes always win over this demo hack.
     if (applySlingshotToSelected) {
         if (Layer* sel = layerManager.GetSelectedLayer()) {
-            const bool hasScaleTrack = sel->scaleTrack && !sel->scaleTrack->empty();
-            if (!hasScaleTrack) {
+            if (!sel->transform.scale.IsAnimated()) {
                 const float safeDur = (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f;
                 const float t = std::clamp(animEngine.currentTime / safeDur, 0.0f, 1.0f);
                 const float k = animEngine.currentCurve.Evaluate(t);
                 const float mul = std::max(k, 0.0f);
-                sel->transform.scale.x = mul;
-                sel->transform.scale.y = mul;
+                sel->transform.scale.staticValue = Vec3(mul, mul, 1.0f);
             }
         }
     }
@@ -653,9 +652,10 @@ void RenderEngine::DrawTimelineStrip() {
                     IM_COL32(60, 60, 70, 255), 1.0f);
 
         // Draw diamonds for each track type this layer owns
-        auto drawKeys = [&](const std::optional<PropertyTrack>& tr, ImU32 col) {
-            if (!tr || tr->empty()) return;
-            for (const auto& k : tr->keys) {
+        // Task 5.1: draw diamonds for each AnimatedProperty on the layer's
+        // transform. Templated lambda so one body handles Vec2/Vec3/float.
+        auto drawKeys = [&](const auto& prop, ImU32 col) {
+            for (const auto& k : prop.keyframes) {
                 const float x = TimeToX(k.time);
                 const ImVec2 p(x, rowYc);
                 const float r = 4.5f;
@@ -668,10 +668,10 @@ void RenderEngine::DrawTimelineStrip() {
                 dl->AddConvexPolyFilled(tri, 4, col);
             }
         };
-        drawKeys(layer.positionTrack, IM_COL32(120, 200, 255, 255));
-        drawKeys(layer.scaleTrack,    IM_COL32(255, 200, 120, 255));
-        drawKeys(layer.rotationTrack, IM_COL32(200, 255, 120, 255));
-        drawKeys(layer.opacityTrack,  IM_COL32(255, 120, 200, 255));
+        drawKeys(layer.transform.position, IM_COL32(120, 200, 255, 255));
+        drawKeys(layer.transform.scale,    IM_COL32(255, 200, 120, 255));
+        drawKeys(layer.transform.rotation, IM_COL32(200, 255, 120, 255));
+        drawKeys(layer.transform.opacity,  IM_COL32(255, 120, 200, 255));
     }
 
     // Playhead
@@ -754,33 +754,61 @@ void RenderEngine::DrawInspectorPanel() {
             return clicked;
         };
 
-        // POSITION
-        if (stopwatch("pos", sel->IsPositionAnimated())) sel->ToggleAnimatePosition(t);
-        ImGui::SameLine();
-        if (ImGui::DragFloat3("Position (x,y,z)", &sel->transform.position.x, 1.0f))
-            sel->AutoKeyPositionIfEnabled(t);
+        // Task 5.1 (AE / Lottie model): each property is an AnimatedProperty<T>.
+        // The pattern for every widget is now identical:
+        //   1. Read current value via Evaluate(t) into a local temp
+        //   2. Present the widget bound to the temp
+        //   3. If the widget returned true, call SetValue(t, temp) — that
+        //      routes the write into either a keyframe (stopwatch ON) or
+        //      the staticValue (stopwatch OFF). Zero ambiguity.
+        //
+        // Because Evaluate() returns the CURRENT canvas value (respecting
+        // keyframe interpolation), the Inspector field ALWAYS shows what
+        // the user sees on screen — killing the "field says 423 but I
+        // typed 500" confusion of the previous architecture.
 
-        // ROTATION
-        if (stopwatch("rot", sel->IsRotationAnimated())) sel->ToggleAnimateRotation(t);
+        // POSITION (Vec3)
+        if (stopwatch("pos", sel->transform.position.HasStopwatch()))
+            sel->transform.position.ToggleStopwatch(t);
         ImGui::SameLine();
-        if (ImGui::DragFloat3("Rotation (deg)",   &sel->transform.rotation.x, 0.5f))
-            sel->AutoKeyRotationIfEnabled(t);
+        Vec3 pos = sel->transform.position.Evaluate(t);
+        if (ImGui::DragFloat3("Position (x,y,z)", &pos.x, 1.0f))
+            sel->transform.position.SetValue(t, pos);
 
-        // SCALE
-        if (stopwatch("scl", sel->IsScaleAnimated())) sel->ToggleAnimateScale(t);
+        // ROTATION (Vec3, degrees)
+        if (stopwatch("rot", sel->transform.rotation.HasStopwatch()))
+            sel->transform.rotation.ToggleStopwatch(t);
         ImGui::SameLine();
-        if (ImGui::DragFloat3("Scale",            &sel->transform.scale.x,    0.01f, -10.0f, 10.0f))
-            sel->AutoKeyScaleIfEnabled(t);
+        Vec3 rot = sel->transform.rotation.Evaluate(t);
+        if (ImGui::DragFloat3("Rotation (deg)", &rot.x, 0.5f))
+            sel->transform.rotation.SetValue(t, rot);
 
-        ImGui::DragFloat2("Anchor (0..1)",    &sel->transform.anchorPoint.x, 0.01f, 0.0f, 1.0f);
-        ImGui::DragFloat2("Size (px)",        &sel->transform.sizePixels.x,  1.0f, 1.0f, 4096.0f);
+        // SCALE (Vec3)
+        if (stopwatch("scl", sel->transform.scale.HasStopwatch()))
+            sel->transform.scale.ToggleStopwatch(t);
+        ImGui::SameLine();
+        Vec3 scl = sel->transform.scale.Evaluate(t);
+        if (ImGui::DragFloat3("Scale", &scl.x, 0.01f, -10.0f, 10.0f))
+            sel->transform.scale.SetValue(t, scl);
+
+        // ANCHOR (Vec2) — animatable but no stopwatch UI for it in Task 5.1
+        Vec2 anchor = sel->transform.anchorPoint.Evaluate(t);
+        if (ImGui::DragFloat2("Anchor (0..1)", &anchor.x, 0.01f, 0.0f, 1.0f))
+            sel->transform.anchorPoint.SetValue(t, anchor);
+
+        // SIZE (Vec2)
+        Vec2 size = sel->transform.sizePixels.Evaluate(t);
+        if (ImGui::DragFloat2("Size (px)", &size.x, 1.0f, 1.0f, 4096.0f))
+            sel->transform.sizePixels.SetValue(t, size);
         ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
 
-        // OPACITY
-        if (stopwatch("op", sel->IsOpacityAnimated())) sel->ToggleAnimateOpacity(t);
+        // OPACITY (float)
+        if (stopwatch("op", sel->transform.opacity.HasStopwatch()))
+            sel->transform.opacity.ToggleStopwatch(t);
         ImGui::SameLine();
-        if (ImGui::SliderFloat("Opacity", &sel->transform.opacity, 0.0f, 1.0f))
-            sel->AutoKeyOpacityIfEnabled(t);
+        float op = sel->transform.opacity.Evaluate(t);
+        if (ImGui::SliderFloat("Opacity", &op, 0.0f, 1.0f))
+            sel->transform.opacity.SetValue(t, op);
 
         // Task 5.0: help hint so users don't need to guess the workflow.
         ImGui::TextDisabled("To animate: click the stopwatch, move the playhead,");
@@ -893,9 +921,13 @@ void RenderEngine::DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                                   ImDrawList* drawList) {
     if (!drawList) return;
 
-    // Four corners of the layer's local box (pre-anchor space).
-    const float w = layer.transform.sizePixels.x;
-    const float h = layer.transform.sizePixels.y;
+    // Task 5.1: legacy path (unused since Task 5.0 CompositionRenderer took
+    // over) but kept for potential preview/debug re-use. Reads AnimatedProperty
+    // fields via Evaluate at the current comp time.
+    const float t = animEngine.currentTime;
+    const Vec2  sz = layer.transform.sizePixels.Evaluate(t);
+    const float w = sz.x;
+    const float h = sz.y;
     const Vec2 c0 = worldMatrix.TransformPoint(Vec2(0.0f, 0.0f));
     const Vec2 c1 = worldMatrix.TransformPoint(Vec2(w,    0.0f));
     const Vec2 c2 = worldMatrix.TransformPoint(Vec2(w,    h));
@@ -964,8 +996,12 @@ void RenderEngine::DrawSelectionGizmos(Layer& layer, const Mat3& worldMatrix,
                                        ImVec2 canvasOrigin, ImDrawList* drawList) {
     if (!drawList) return;
 
-    const float w = layer.transform.sizePixels.x;
-    const float h = layer.transform.sizePixels.y;
+    // Task 5.1: legacy path (Task 5.0 inlined the equivalent into
+    // DrawViewportCanvas). Kept for potential re-use; reads via Evaluate.
+    const float t = animEngine.currentTime;
+    const Vec2  sz = layer.transform.sizePixels.Evaluate(t);
+    const float w = sz.x;
+    const float h = sz.y;
 
     // Corners: NW=(0,0)  NE=(w,0)  SE=(w,h)  SW=(0,h)
     const Vec2 nw = worldMatrix.TransformPoint(Vec2(0.0f, 0.0f));
@@ -991,8 +1027,8 @@ void RenderEngine::DrawSelectionGizmos(Layer& layer, const Mat3& worldMatrix,
     drawList->AddRectFilled(ImVec2(psw.x-R, psw.y-R), ImVec2(psw.x+R, psw.y+R), handle);
 
     // Center move handle (anchor point in world space)
-    const Vec2 center = worldMatrix.TransformPoint(Vec2(layer.transform.anchorPoint.x * w,
-                                                        layer.transform.anchorPoint.y * h));
+    const Vec2 anchor = layer.transform.anchorPoint.Evaluate(t);
+    const Vec2 center = worldMatrix.TransformPoint(Vec2(anchor.x * w, anchor.y * h));
     drawList->AddCircleFilled(ToScreen(center, canvasOrigin), 6.0f, IM_COL32(255, 80, 80, 255));
 }
 
@@ -1003,39 +1039,38 @@ static Vec2 ScreenToWorld(ImVec2 screen, ImVec2 canvasOrigin) {
 
 void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
                                           ImVec2 canvasOrigin, ImVec2 canvasSize) {
-    // Task 5.0: canvasOrigin / canvasSize are the letterbox rect, not the
-    // panel. Mouse coordinates come in as screen pixels but are converted
-    // to canvas-pixel space via ScreenToCanvas so gizmo math stays stable
-    // across panel resizes and letterbox scale.
+    // Task 5.1: reads via .Evaluate(t), writes via .SetValue(t, v).
+    // If a property's stopwatch is on, the write becomes a keyframe at t;
+    // otherwise it updates staticValue. Same call site either way.
+    const float t = animEngine.currentTime;
+
     const ImGuiIO& io = ImGui::GetIO();
     const ImVec2 mouse = io.MousePos;
 
-    const float w = layer.transform.sizePixels.x;
-    const float h = layer.transform.sizePixels.y;
+    // Snapshot the animated properties for THIS frame.
+    const Vec3 posEval  = layer.transform.position   .Evaluate(t);
+    const Vec3 scaleEval = layer.transform.scale     .Evaluate(t);
+    const Vec2 sizeEval = layer.transform.sizePixels .Evaluate(t);
+    const Vec2 anchorEval = layer.transform.anchorPoint.Evaluate(t);
+    const float w = sizeEval.x;
+    const float h = sizeEval.y;
 
     const Vec2 nw = worldMatrix.TransformPoint(Vec2(0.0f, 0.0f));
     const Vec2 ne = worldMatrix.TransformPoint(Vec2(w,    0.0f));
     const Vec2 se = worldMatrix.TransformPoint(Vec2(w,    h));
     const Vec2 sw = worldMatrix.TransformPoint(Vec2(0.0f, h));
-    const Vec2 center = worldMatrix.TransformPoint(Vec2(layer.transform.anchorPoint.x * w,
-                                                        layer.transform.anchorPoint.y * h));
+    const Vec2 center = worldMatrix.TransformPoint(Vec2(anchorEval.x * w, anchorEval.y * h));
 
     const Vec2 mouseCanvas = ScreenToCanvas(mouse);
     auto dist = [](Vec2 a, Vec2 b){
         const float dx = a.x - b.x, dy = a.y - b.y;
         return std::sqrt(dx*dx + dy*dy);
     };
-    // Hit-test threshold: 12 screen pixels, converted to canvas pixels via
-    // the letterbox scale. Prevents tiny letterboxed images from making the
-    // handles unclickable.
     const float scale = (lastCanvasLetterboxSize.x > 1.0f)
                             ? ((float)compTextureWidth / lastCanvasLetterboxSize.x)
                             : 1.0f;
     const float kHit = 12.0f * scale;
 
-    // Full letterbox-area button so drag focus works even in empty space
-    // inside the composition. Note: this competes with the parent panel's
-    // click-to-select InvisibleButton; whichever fires first wins.
     ImGui::SetCursorScreenPos(canvasOrigin);
     ImGui::InvisibleButton("ViewportHitTest", canvasSize);
     const bool hovered = ImGui::IsItemHovered();
@@ -1060,9 +1095,9 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
             activeGizmo         = mode;
             dragLayerId         = layer.id;
             dragStartMouseLocal = mouseCanvas;
-            dragStartPosition   = { layer.transform.position.x, layer.transform.position.y };
-            dragStartScale      = layer.transform.scale;
-            dragStartSize       = layer.transform.sizePixels;
+            dragStartPosition   = { posEval.x, posEval.y };
+            dragStartScale      = scaleEval;
+            dragStartSize       = sizeEval;
         }
     }
 
@@ -1071,21 +1106,18 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
         const Vec2 delta = { mouseCanvas.x - dragStartMouseLocal.x,
                              mouseCanvas.y - dragStartMouseLocal.y };
         if (activeGizmo == GizmoMode::Move) {
-            layer.transform.position.x = dragStartPosition.x + delta.x;
-            layer.transform.position.y = dragStartPosition.y + delta.y;
+            // Task 5.1: route the write through SetValue so it auto-keys
+            // if the position stopwatch is on.
+            Vec3 newPos = posEval;
+            newPos.x = dragStartPosition.x + delta.x;
+            newPos.y = dragStartPosition.y + delta.y;
+            layer.transform.position.SetValue(t, newPos);
         } else {
-            // Uniform corner-scale about the anchor. We convert the mouse
-            // delta into the layer's LOCAL space using the inverse matrix,
-            // then compute a scale ratio relative to the box size.
             const Mat3 inv = worldMatrix.InverseAffine();
-            const Vec2 anchorLocal(layer.transform.anchorPoint.x * dragStartSize.x,
-                                   layer.transform.anchorPoint.y * dragStartSize.y);
+            const Vec2 anchorLocal(anchorEval.x * dragStartSize.x,
+                                   anchorEval.y * dragStartSize.y);
             const Vec2 mouseLocal = inv.TransformPoint(mouseCanvas);
 
-            // Pick the "opposite" corner of the dragged handle as the fixed pivot.
-            // In local (pre-scale) coords the corners are just (0/w, 0/h). We
-            // measure the mouse distance from the anchor and scale so that
-            // handle stays under the cursor.
             Vec2 handleLocalStart;
             switch (activeGizmo) {
                 case GizmoMode::ScaleNW: handleLocalStart = Vec2(0.0f,             0.0f);             break;
@@ -1102,9 +1134,11 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
             const float sx = (std::fabs(startDX) > 0.5f) ? (curDX / startDX) : 1.0f;
             const float sy = (std::fabs(startDY) > 0.5f) ? (curDY / startDY) : 1.0f;
 
-            // Clamp to a sane range so a wild mouse fling doesn't NaN us.
-            layer.transform.scale.x = std::clamp(dragStartScale.x * sx, -20.0f, 20.0f);
-            layer.transform.scale.y = std::clamp(dragStartScale.y * sy, -20.0f, 20.0f);
+            // Task 5.1: route write through SetValue so scale stopwatch is honored.
+            Vec3 newScale = dragStartScale;
+            newScale.x = std::clamp(dragStartScale.x * sx, -20.0f, 20.0f);
+            newScale.y = std::clamp(dragStartScale.y * sy, -20.0f, 20.0f);
+            layer.transform.scale.SetValue(t, newScale);
         }
     }
 
@@ -1123,8 +1157,9 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
             const Mat3 wm = layerManager.GetWorldMatrix(it->id);
             const Mat3 inv = wm.InverseAffine();
             const Vec2 local = inv.TransformPoint(mouseCanvas);
-            if (local.x >= 0.0f && local.x <= it->transform.sizePixels.x &&
-                local.y >= 0.0f && local.y <= it->transform.sizePixels.y) {
+            const Vec2 sizeIt = it->transform.sizePixels.Evaluate(t);
+            if (local.x >= 0.0f && local.x <= sizeIt.x &&
+                local.y >= 0.0f && local.y <= sizeIt.y) {
                 layerManager.SetSelectedId(it->id);
                 break;
             }
@@ -1258,13 +1293,17 @@ void RenderEngine::DrawViewportCanvas() {
     static thread_local std::vector<ThreeDEntry> depthList;
     depthList.clear();
     Mat4 viewMat = camera.GetViewMatrix();
+    const float tDepth = animEngine.currentTime;
     for (auto& layer : L) {
         if (!layer.isVisible)                    continue;
         if (!layer.is3D)                         continue;
         if (layer.type == ShapeType::Camera)     continue;
         Mat4 wm4 = layerManager.GetWorldMatrix4(layer.id);
-        const float ax = layer.transform.anchorPoint.x * layer.transform.sizePixels.x;
-        const float ay = layer.transform.anchorPoint.y * layer.transform.sizePixels.y;
+        // Task 5.1: sample anchor + size at current comp time.
+        const Vec2 anchorD = layer.transform.anchorPoint.Evaluate(tDepth);
+        const Vec2 sizeD   = layer.transform.sizePixels .Evaluate(tDepth);
+        const float ax = anchorD.x * sizeD.x;
+        const float ay = anchorD.y * sizeD.y;
         Vec4 centerWorld = wm4.TransformVec4(Vec4(ax, ay, 0.0f, 1.0f));
         Vec4 centerView  = viewMat.TransformVec4(centerWorld);
         depthList.push_back({ layer.id, centerView.z });
@@ -1287,12 +1326,13 @@ void RenderEngine::DrawViewportCanvas() {
         if (sel->type == ShapeType::Camera) {
             DrawCameraGizmos(*sel, lbOrigin, lbSize, draw_list);
         } else if (!sel->is3D) {
-            // Draw the bounding box + handles by transforming the layer's
-            // 4 corners into CANVAS space via the layer's world matrix, then
-            // into SCREEN space via the letterbox transform.
+            // Task 5.1: sample size + anchor at current comp time.
+            const float tSelBox = animEngine.currentTime;
+            const Vec2 sizeSel   = sel->transform.sizePixels .Evaluate(tSelBox);
+            const Vec2 anchorSel = sel->transform.anchorPoint.Evaluate(tSelBox);
             const Mat3 wm = layerManager.GetWorldMatrix(sel->id);
-            const float w = sel->transform.sizePixels.x;
-            const float h = sel->transform.sizePixels.y;
+            const float w = sizeSel.x;
+            const float h = sizeSel.y;
             const Vec2 c0 = wm.TransformPoint(Vec2(0.0f, 0.0f));
             const Vec2 c1 = wm.TransformPoint(Vec2(w,    0.0f));
             const Vec2 c2 = wm.TransformPoint(Vec2(w,    h));
@@ -1312,16 +1352,17 @@ void RenderEngine::DrawViewportCanvas() {
             draw_list->AddRectFilled(ImVec2(p1.x-R, p1.y-R), ImVec2(p1.x+R, p1.y+R), handle);
             draw_list->AddRectFilled(ImVec2(p2.x-R, p2.y-R), ImVec2(p2.x+R, p2.y+R), handle);
             draw_list->AddRectFilled(ImVec2(p3.x-R, p3.y-R), ImVec2(p3.x+R, p3.y+R), handle);
-            const Vec2 centerC = wm.TransformPoint(Vec2(sel->transform.anchorPoint.x * w,
-                                                        sel->transform.anchorPoint.y * h));
+            const Vec2 centerC = wm.TransformPoint(Vec2(anchorSel.x * w, anchorSel.y * h));
             draw_list->AddCircleFilled(CanvasToScreen(centerC), 6.0f, IM_COL32(255, 80, 80, 255));
 
             HandleGizmoInteraction(*sel, wm, lbOrigin, lbSize);
         } else {
             // 3D selection bounding quad (unchanged behavior from Task 4)
+            const float tSel3D = animEngine.currentTime;
+            const Vec2 size3D = sel->transform.sizePixels.Evaluate(tSel3D);
             const Mat4 wm4 = layerManager.GetWorldMatrix4(sel->id);
-            const float w = sel->transform.sizePixels.x;
-            const float h = sel->transform.sizePixels.y;
+            const float w = size3D.x;
+            const float h = size3D.y;
             const Vec4 corners_local[4] = {
                 Vec4(0.0f, 0.0f, 0.0f, 1.0f),
                 Vec4(w,    0.0f, 0.0f, 1.0f),
@@ -1357,6 +1398,7 @@ void RenderEngine::DrawViewportCanvas() {
         ImGui::SetCursorScreenPos(panelOrigin);
         ImGui::InvisibleButton("ViewportHitTestEmpty", panelSize);
         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const float tSel = animEngine.currentTime;
             const Vec2 mw = ScreenToCanvas(ImGui::GetIO().MousePos);
             auto& Ls = layerManager.Layers();
             for (auto it = Ls.rbegin(); it != Ls.rend(); ++it) {
@@ -1365,8 +1407,9 @@ void RenderEngine::DrawViewportCanvas() {
                 const Mat3 wm2 = layerManager.GetWorldMatrix(it->id);
                 const Mat3 inv = wm2.InverseAffine();
                 const Vec2 local = inv.TransformPoint(mw);
-                if (local.x >= 0.0f && local.x <= it->transform.sizePixels.x &&
-                    local.y >= 0.0f && local.y <= it->transform.sizePixels.y) {
+                const Vec2 sizeIt = it->transform.sizePixels.Evaluate(tSel);
+                if (local.x >= 0.0f && local.x <= sizeIt.x &&
+                    local.y >= 0.0f && local.y <= sizeIt.y) {
                     layerManager.SetSelectedId(it->id);
                     break;
                 }
@@ -1421,8 +1464,10 @@ void RenderEngine::DrawLayerShape3D(const Layer& layer, const Mat4& worldMatrix4
                                     ImVec2 canvasSize, ImDrawList* drawList) {
     if (!drawList) return;
 
-    const float w = layer.transform.sizePixels.x;
-    const float h = layer.transform.sizePixels.y;
+    // Task 5.1: sample size at the current comp time.
+    const Vec2 sz3D = layer.transform.sizePixels.Evaluate(animEngine.currentTime);
+    const float w = sz3D.x;
+    const float h = sz3D.y;
 
     // Transform the four corners through World -> Clip -> NDC -> Pixels.
     Vec4 wc0 = worldMatrix4.TransformVec4(Vec4(0.0f, 0.0f, 0.0f, 1.0f));
@@ -1626,7 +1671,9 @@ void RenderEngine::HandleCameraControls(ImVec2 canvasOrigin, ImVec2 canvasSize) 
         const int camLayerId = layerManager.FindActiveCameraLayerId();
         if (camLayerId >= 0) {
             if (Layer* cl = layerManager.GetLayerById(camLayerId)) {
-                cl->transform.position = camera.position;
+                // Task 5.1: route through SetValue so keyframing works if the
+                // Camera layer's position stopwatch is on.
+                cl->transform.position.SetValue(animEngine.currentTime, camera.position);
             }
         }
     }
@@ -1644,14 +1691,13 @@ void RenderEngine::SyncCameraFromLayerIfAny() {
     const Layer* cl = layerManager.GetLayerById(camLayerId);
     if (!cl) return;
 
-    // The Camera layer's transform.position becomes the eye. Rotation is
-    // interpreted as pitch/yaw/roll. If the layer is currently being edited
-    // via keyframes, this is the point where the animated value takes effect.
-    camera.position = cl->transform.position;
-    // If user has toggled off LookAt mode in the inspector, use the layer's
-    // rotation directly; otherwise keep the existing target.
+    // Task 5.1: read the Camera layer's animated properties at current time.
+    // If the layer has keyframes on position/rotation, the camera follows the
+    // animation for free — no special sync code required.
+    const float t = animEngine.currentTime;
+    camera.position = cl->transform.position.Evaluate(t);
     if (!camera.useTargetMode) {
-        camera.rotation = cl->transform.rotation;
+        camera.rotation = cl->transform.rotation.Evaluate(t);
     }
 }
 
@@ -2071,22 +2117,30 @@ void RenderEngine::DrawDebugPanel() {
     if (!sel) {
         ImGui::TextDisabled("(none)");
     } else {
+        // Task 5.1: print BOTH static value and current evaluated value so it's
+        // obvious when keyframes are interpolating vs. holding.
+        const float tDbg = animEngine.currentTime;
+        const Vec3 posE = sel->transform.position.Evaluate(tDbg);
+        const Vec3 rotE = sel->transform.rotation.Evaluate(tDbg);
+        const Vec3 sclE = sel->transform.scale.Evaluate(tDbg);
+        const Vec2 anE  = sel->transform.anchorPoint.Evaluate(tDbg);
+        const Vec2 szE  = sel->transform.sizePixels.Evaluate(tDbg);
+        const float opE = sel->transform.opacity.Evaluate(tDbg);
         ImGui::Text("id=%d  parent=%d  '%s'", sel->id, sel->parentId, sel->name.c_str());
-        ImGui::Text("Position:  (%.2f, %.2f, %.2f)",
-                    sel->transform.position.x, sel->transform.position.y, sel->transform.position.z);
-        ImGui::Text("Rotation:  (%.2f, %.2f, %.2f)",
-                    sel->transform.rotation.x, sel->transform.rotation.y, sel->transform.rotation.z);
-        ImGui::Text("Scale:     (%.3f, %.3f, %.3f)",
-                    sel->transform.scale.x, sel->transform.scale.y, sel->transform.scale.z);
-        ImGui::Text("Anchor:    (%.2f, %.2f)   Size: (%.0f, %.0f)",
-                    sel->transform.anchorPoint.x, sel->transform.anchorPoint.y,
-                    sel->transform.sizePixels.x, sel->transform.sizePixels.y);
-        ImGui::Text("Opacity:   %.3f", sel->transform.opacity);
+        ImGui::Text("Position (eval): (%.2f, %.2f, %.2f)  keys=%zu",
+                    posE.x, posE.y, posE.z, sel->transform.position.keyframes.size());
+        ImGui::Text("Rotation (eval): (%.2f, %.2f, %.2f)  keys=%zu",
+                    rotE.x, rotE.y, rotE.z, sel->transform.rotation.keyframes.size());
+        ImGui::Text("Scale    (eval): (%.3f, %.3f, %.3f)  keys=%zu",
+                    sclE.x, sclE.y, sclE.z, sel->transform.scale.keyframes.size());
+        ImGui::Text("Anchor:  (%.2f, %.2f)   Size: (%.0f, %.0f)",
+                    anE.x, anE.y, szE.x, szE.y);
+        ImGui::Text("Opacity: %.3f  keys=%zu", opE, sel->transform.opacity.keyframes.size());
         ImGui::Text("Stopwatches: pos=%d  rot=%d  scl=%d  op=%d",
-                    (int)sel->IsPositionAnimated(),
-                    (int)sel->IsRotationAnimated(),
-                    (int)sel->IsScaleAnimated(),
-                    (int)sel->IsOpacityAnimated());
+                    (int)sel->transform.position.HasStopwatch(),
+                    (int)sel->transform.rotation.HasStopwatch(),
+                    (int)sel->transform.scale.HasStopwatch(),
+                    (int)sel->transform.opacity.HasStopwatch());
         ImGui::Text("Effects: %zu  (%d enabled)",
                     sel->effects.size(),
                     (int)std::count_if(sel->effects.begin(), sel->effects.end(),
@@ -2227,29 +2281,32 @@ void RenderEngine::SpawnShapeAtViewportCenter(ShapeType type, const char* nameHi
     Layer* layer = layerManager.GetLayerById(newId);
     if (!layer) return;
 
-    layer->transform.position.x = (float)compositionWidth  * 0.5f;
-    layer->transform.position.y = (float)compositionHeight * 0.5f;
-    layer->transform.position.z = 0.0f;
+    // Task 5.1: newly-spawned layers have their stopwatches off, so writing
+    // to .staticValue directly is correct (no keyframe to key).
+    layer->transform.position.staticValue = Vec3(
+        (float)compositionWidth  * 0.5f,
+        (float)compositionHeight * 0.5f,
+        0.0f);
 
     // Sensible per-type defaults so the shape is visible immediately.
     switch (type) {
         case ShapeType::Rectangle:
-            layer->transform.sizePixels = { 200.0f, 120.0f };
+            layer->transform.sizePixels.staticValue = Vec2(200.0f, 120.0f);
             break;
         case ShapeType::Ellipse:
-            layer->transform.sizePixels = { 120.0f, 120.0f };
+            layer->transform.sizePixels.staticValue = Vec2(120.0f, 120.0f);
             break;
         case ShapeType::CustomPath:
-            layer->transform.sizePixels = { 160.0f, 160.0f };
+            layer->transform.sizePixels.staticValue = Vec2(160.0f, 160.0f);
             break;
         case ShapeType::Camera:
             layer->is3D = true;
-            layer->transform.sizePixels = { 60.0f, 40.0f };
-            layer->transform.position   = camera.position; // camera lives in 3D
+            layer->transform.sizePixels.staticValue = Vec2(60.0f, 40.0f);
+            layer->transform.position.staticValue   = camera.position; // camera lives in 3D
             break;
         case ShapeType::Null:
-            layer->transform.sizePixels = { 60.0f, 60.0f };
-            layer->fillColor            = 0xFFAAAAAA; // gray marker
+            layer->transform.sizePixels.staticValue = Vec2(60.0f, 60.0f);
+            layer->fillColor                        = 0xFFAAAAAA; // gray marker
             break;
     }
 }

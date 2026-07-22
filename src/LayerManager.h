@@ -50,11 +50,17 @@ public:
     // Compute the world-space (composition-space) matrix for a layer by
     // walking up the parent chain. Uses per-frame memoization so a deep chain
     // costs O(depth) once and O(1) on subsequent queries within the same frame.
-    // Call BeginFrame() at the start of each frame to reset the cache.
-    void BeginFrame();
+    // Call BeginFrame(compTime) at the start of each frame to reset the cache
+    // AND publish the composition time all Evaluate() calls will sample at.
+    void BeginFrame(float compTime);
     Mat3 GetWorldMatrix(int layerId);            // 2D affine (Task 3 path)
     Mat4 GetWorldMatrix4(int layerId);           // Full 3D (Task 4 path)
     float GetWorldOpacity(int layerId);
+
+    // Composition time for THIS frame. Set by BeginFrame(); available so any
+    // per-frame code that needs to Evaluate() a property (Inspector, gizmo,
+    // camera sync) samples at exactly the same instant as the renderer.
+    float CurrentCompTime() const { return currentCompTime; }
 
     // Find the first Camera-type layer, if any (returns -1 if none exist).
     int FindActiveCameraLayerId() const;
@@ -75,4 +81,7 @@ private:
     std::unordered_map<int, Mat3>   frameMatrixCache;
     std::unordered_map<int, Mat4>   frameMatrix4Cache;
     std::unordered_map<int, float>  frameOpacityCache;
+
+    // Composition time for the current frame, set by BeginFrame().
+    float currentCompTime = 0.0f;
 };
