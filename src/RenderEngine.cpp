@@ -265,19 +265,58 @@ void RenderEngine::BeginFrame() {
 
     SyncCameraFromLayerIfAny(); // Task 4: let a Camera layer drive the view
 
-    // Legacy Task 2 demo: apply the global slingshot curve as a scale
-    // multiplier on the selected layer. Only kicks in for layers whose scale
-    // stopwatch is off — real keyframes always win over this demo hack.
-    if (applySlingshotToSelected) {
-        if (Layer* sel = layerManager.GetSelectedLayer()) {
+    // Task 2 demo (slingshot -> selected scale).
+    // Task 5.3-fix-3: previously this used to overwrite scale.staticValue
+    // every frame while active, and when the user toggled OFF we just
+    // stopped writing — leaving the last-computed scale (usually ~0.9 or
+    // whatever mul was at that instant) baked in permanently. Now we
+    // cache the layer's ORIGINAL scale when the toggle first turns on
+    // (or when the selected layer changes while active) and RESTORE it
+    // when the toggle turns off.
+    {
+        const int selId = layerManager.GetSelectedId();
+        const bool nowActive = applySlingshotToSelected;
+        Layer* sel = layerManager.GetSelectedLayer();
+
+        // Transition OFF, or selection changed while active -> restore.
+        const bool needRestore =
+            slingshotWasActiveLastFrame &&
+            (!nowActive || selId != slingshotOriginalLayerId);
+        if (needRestore && slingshotOriginalLayerId >= 0) {
+            if (Layer* prev = layerManager.GetLayerById(slingshotOriginalLayerId)) {
+                if (!prev->transform.scale.IsAnimated()) {
+                    prev->transform.scale.staticValue = slingshotOriginalScale;
+                }
+            }
+            slingshotOriginalLayerId = -1;
+        }
+
+        // Transition ON, or selection changed to a new layer while active:
+        // capture the pre-demo scale so we can restore later.
+        if (nowActive && sel &&
+            (!slingshotWasActiveLastFrame || selId != slingshotOriginalLayerId)) {
             if (!sel->transform.scale.IsAnimated()) {
-                const float safeDur = (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f;
-                const float t = std::clamp(animEngine.currentTime / safeDur, 0.0f, 1.0f);
-                const float k = animEngine.currentCurve.Evaluate(t);
-                const float mul = std::max(k, 0.0f);
-                sel->transform.scale.staticValue = Vec3(mul, mul, 1.0f);
+                slingshotOriginalScale   = sel->transform.scale.staticValue;
+                slingshotOriginalLayerId = selId;
             }
         }
+
+        // Live: drive scale from the slingshot curve. Only kicks in for
+        // layers whose scale stopwatch is off — real keyframes always win.
+        if (nowActive && sel && !sel->transform.scale.IsAnimated()) {
+            const float safeDur = (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f;
+            const float t = std::clamp(animEngine.currentTime / safeDur, 0.0f, 1.0f);
+            const float k = animEngine.currentCurve.Evaluate(t);
+            const float mul = std::max(k, 0.0f);
+            // Multiply against the ORIGINAL scale so a shape that started
+            // at scale (2,2) slingshots between (0, 2*peak) not between (0, peak).
+            sel->transform.scale.staticValue = Vec3(
+                slingshotOriginalScale.x * mul,
+                slingshotOriginalScale.y * mul,
+                slingshotOriginalScale.z);
+        }
+
+        slingshotWasActiveLastFrame = nowActive;
     }
 
     ImGui_ImplDX11_NewFrame();
@@ -1118,15 +1157,69 @@ void RenderEngine::DrawInspectorPanel() {
             sel->transform.rotation.SetValue(t, rot);
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
-        // SCALE (Vec3)
+        // SCALE (Vec3) + linked-scale chain button (Task 5.3-fix-3).
+        // The chain button between the stopwatch and the DragFloat3 toggles
+        // uniform scaling. When linked, editing scale.x auto-updates scale.y
+        // and scale.z to preserve the current X:Y:Z ratio (matches AE's
+        // classic chain icon behavior).
         if (stopwatch("scl", sel->transform.scale.HasStopwatch())) {
             MarkForSnapshot();
             sel->transform.scale.ToggleStopwatch(t);
         }
         ImGui::SameLine();
+        // Chain-link button. Lit orange when linked, dim gray when unlinked.
+        // Text label is a simple ASCII glyph so we don't depend on a font.
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                linkedScale ? IM_COL32(240, 130, 30, 255)
+                            : IM_COL32(60, 60, 70, 255));
+            if (ImGui::Button(linkedScale ? "8##link" : "o##link", ImVec2(22, 0))) {
+                linkedScale = !linkedScale;
+            }
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", linkedScale
+                    ? "Uniform scale ON: X drives Y and Z. Click to unlink."
+                    : "Uniform scale OFF: X, Y, Z edit independently. Click to link.");
+            }
+        }
+        ImGui::SameLine();
         Vec3 scl = sel->transform.scale.Evaluate(t);
-        if (ImGui::DragFloat3("Scale", &scl.x, 0.01f, -10.0f, 10.0f))
+        const Vec3 sclBefore = scl;
+        if (ImGui::DragFloat3("Scale", &scl.x, 0.01f, -10.0f, 10.0f)) {
+            if (linkedScale) {
+                // Which component did the user actually drag? Compare against
+                // sclBefore; whichever differs is the "driver". If X changed,
+                // scale Y and Z by the same ratio (or absolute for zero-start).
+                auto applyLink = [&](float& driverBefore, float& driverAfter,
+                                     float& yBefore, float& yAfter,
+                                     float& zBefore, float& zAfter) {
+                    if (std::fabs(driverBefore) < 1e-6f) {
+                        // Ratio undefined; fall back to setting all to driver.
+                        yAfter = driverAfter;
+                        zAfter = driverAfter;
+                    } else {
+                        const float ratio = driverAfter / driverBefore;
+                        yAfter = yBefore * ratio;
+                        zAfter = zBefore * ratio;
+                    }
+                };
+                if (std::fabs(scl.x - sclBefore.x) > 1e-6f) {
+                    Vec3 b = sclBefore, a = scl;
+                    applyLink(b.x, a.x, b.y, a.y, b.z, a.z);
+                    scl = a;
+                } else if (std::fabs(scl.y - sclBefore.y) > 1e-6f) {
+                    Vec3 b = sclBefore, a = scl;
+                    applyLink(b.y, a.y, b.x, a.x, b.z, a.z);
+                    scl = a;
+                } else if (std::fabs(scl.z - sclBefore.z) > 1e-6f) {
+                    Vec3 b = sclBefore, a = scl;
+                    applyLink(b.z, a.z, b.x, a.x, b.y, a.y);
+                    scl = a;
+                }
+            }
             sel->transform.scale.SetValue(t, scl);
+        }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // ANCHOR (Vec2) — animatable but no stopwatch UI for it in Task 5.1

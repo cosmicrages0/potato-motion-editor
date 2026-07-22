@@ -89,6 +89,17 @@ private:
     // single shared engine with per-property keyframe tracks.
     AnimationEngine animEngine;
     bool applySlingshotToSelected = false;
+    // Task 5.3-fix-3: slingshot demo used to leave the selected layer's
+    // scale permanently shrunk after the toggle turned off. We now cache
+    // the pre-demo scale and the layer id it belonged to, so toggling off
+    // (or switching layers) restores the original scale cleanly.
+    bool  slingshotWasActiveLastFrame = false;
+    int   slingshotOriginalLayerId    = -1;
+    Vec3  slingshotOriginalScale      = { 1.0f, 1.0f, 1.0f };
+    // Task 5.3-fix-3: linked-scale toggle (chain icon next to Scale field).
+    // When true, editing scale.x drives scale.y to match, preserving aspect
+    // ratio. AE default is unlinked; users click the chain to link.
+    bool  linkedScale = false;
 
     LayerManager   layerManager;
     Camera         camera;
