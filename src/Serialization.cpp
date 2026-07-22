@@ -302,40 +302,131 @@ void ReadAnim(const json& j, AnimationEngine& a) {
 } // anonymous namespace
 
 // =============================================================================
-// Public API
+// Core (de)serialization — file and string versions both go through these.
+// Task 5.3 split: extracted from the file-based API so UndoStack can round-trip
+// AppState to std::string without touching the disk.
 // =============================================================================
-bool SaveProject(const AppState& state, const std::string& path, std::string* outError) {
+namespace {
+
+// Serialize an AppState into a fully-formed nlohmann::json root object.
+// Never throws. Returns true on success (currently always true; kept as a
+// bool for symmetry with the reader).
+bool AppStateToJson(const AppState& state, json& outRoot, std::string* outError) {
     if (!state.layerManager || !state.camera || !state.animEngine) {
-        if (outError) *outError = "SaveProject: missing state pointer";
+        if (outError) *outError = "AppStateToJson: missing state pointer";
         return false;
     }
 
-    json root;
-    root["pmge_version"] = kPmgeFormatVersion;
+    outRoot = json{};
+    outRoot["pmge_version"] = kPmgeFormatVersion;
 
     json comp;
     comp["width"]          = state.compositionWidth;
     comp["height"]         = state.compositionHeight;
     comp["cameraStyle"]    = (state.cameraStyleInt == 1) ? "AlightMotion" : "AfterEffects";
     comp["show3DFeatures"] = state.show3DFeatures;
-    root["composition"] = std::move(comp);
+    outRoot["composition"] = std::move(comp);
 
-    root["camera"]    = WriteCamera(*state.camera);
-    root["animation"] = WriteAnim(*state.animEngine);
+    outRoot["camera"]    = WriteCamera(*state.camera);
+    outRoot["animation"] = WriteAnim(*state.animEngine);
 
     json layersArr = json::array();
     for (const auto& L : state.layerManager->Layers()) {
         layersArr.push_back(WriteLayer(L));
     }
-    root["layers"] = std::move(layersArr);
-    root["nextLayerId"] = state.layerManager->GetNextId();
+    outRoot["layers"]      = std::move(layersArr);
+    outRoot["nextLayerId"] = state.layerManager->GetNextId();
+    return true;
+}
 
+// Inverse of AppStateToJson. Wipes state.layerManager before repopulating so
+// there's no leakage from whatever was in memory.
+bool JsonToAppState(const json& root, AppState& state, std::string* outError) {
+    if (!state.layerManager || !state.camera || !state.animEngine) {
+        if (outError) *outError = "JsonToAppState: missing state pointer";
+        return false;
+    }
+
+    const int fileVersion = root.value("pmge_version", 0);
+    if (fileVersion > kPmgeFormatVersion) {
+        std::cerr << "[JsonToAppState] warning: file version " << fileVersion
+                  << " is newer than app version " << kPmgeFormatVersion
+                  << "; attempting best-effort load." << std::endl;
+    }
+
+    if (root.contains("composition") && root["composition"].is_object()) {
+        const auto& comp = root["composition"];
+        state.compositionWidth  = comp.value("width",  state.compositionWidth);
+        state.compositionHeight = comp.value("height", state.compositionHeight);
+        std::string style       = comp.value("cameraStyle", std::string("AfterEffects"));
+        state.cameraStyleInt    = (style == "AlightMotion") ? 1 : 0;
+        state.show3DFeatures    = comp.value("show3DFeatures", state.show3DFeatures);
+    }
+    if (root.contains("camera"))    ReadCamera(root["camera"], *state.camera);
+    if (root.contains("animation")) ReadAnim(root["animation"], *state.animEngine);
+
+    state.layerManager->Clear();
+    int maxId = 0;
+    if (root.contains("layers") && root["layers"].is_array()) {
+        for (const auto& lj : root["layers"]) {
+            Layer L = ReadLayer(lj);
+            if (L.id > maxId) maxId = L.id;
+            state.layerManager->Layers().push_back(std::move(L));
+        }
+    }
+    const int nextId = std::max(maxId + 1, root.value("nextLayerId", maxId + 1));
+    state.layerManager->SetNextId(nextId);
+    // Force idToIndex cache rebuild (LayerManager only rebuilds on Add/Delete).
+    // Piggyback via a dummy Add+Delete. One-time cost per load; negligible.
+    const int dummy = state.layerManager->AddLayer(ShapeType::Null, "___pmge_load_dummy___");
+    state.layerManager->DeleteLayerById(dummy);
+
+    if (state.layerManager->GetSelectedId() < 0 && !state.layerManager->Layers().empty()) {
+        state.layerManager->SetSelectedId(state.layerManager->Layers().front().id);
+    }
+    return true;
+}
+
+} // namespace
+
+// =============================================================================
+// Public API
+// =============================================================================
+bool SaveProjectToString(const AppState& state, std::string& outJson, std::string* outError) {
+    json root;
+    if (!AppStateToJson(state, root, outError)) return false;
+    try {
+        // dump(-1) = compact for undo snapshots (smaller in memory, still valid JSON).
+        // File saves use pretty-printed dump(2) for readability -- see SaveProject below.
+        outJson = root.dump(-1);
+        return true;
+    } catch (const std::exception& e) {
+        if (outError) *outError = std::string("Save-to-string exception: ") + e.what();
+        return false;
+    }
+}
+
+bool LoadProjectFromString(AppState& state, const std::string& inJson, std::string* outError) {
+    json root;
+    try {
+        root = json::parse(inJson);
+    } catch (const std::exception& e) {
+        if (outError) *outError = std::string("Parse error: ") + e.what();
+        return false;
+    }
+    return JsonToAppState(root, state, outError);
+}
+
+bool SaveProject(const AppState& state, const std::string& path, std::string* outError) {
+    json root;
+    if (!AppStateToJson(state, root, outError)) return false;
     try {
         std::ofstream f(path, std::ios::binary);
         if (!f.is_open()) {
             if (outError) *outError = "Could not open path for writing: " + path;
             return false;
         }
+        // Pretty-printed for on-disk .pmge files (2-space indent, git-diff friendly).
         f << std::setw(2) << root;
         return true;
     } catch (const std::exception& e) {
@@ -345,11 +436,6 @@ bool SaveProject(const AppState& state, const std::string& path, std::string* ou
 }
 
 bool LoadProject(AppState& state, const std::string& path, std::string* outError) {
-    if (!state.layerManager || !state.camera || !state.animEngine) {
-        if (outError) *outError = "LoadProject: missing state pointer";
-        return false;
-    }
-
     json root;
     try {
         std::ifstream f(path, std::ios::binary);
@@ -362,60 +448,5 @@ bool LoadProject(AppState& state, const std::string& path, std::string* outError
         if (outError) *outError = std::string("Parse error: ") + e.what();
         return false;
     }
-
-    const int fileVersion = root.value("pmge_version", 0);
-    if (fileVersion > kPmgeFormatVersion) {
-        std::cerr << "[LoadProject] warning: file version " << fileVersion
-                  << " is newer than app version " << kPmgeFormatVersion
-                  << "; attempting best-effort load." << std::endl;
-    }
-
-    // Composition metadata
-    if (root.contains("composition") && root["composition"].is_object()) {
-        const auto& comp = root["composition"];
-        state.compositionWidth  = comp.value("width",  state.compositionWidth);
-        state.compositionHeight = comp.value("height", state.compositionHeight);
-        std::string style       = comp.value("cameraStyle", std::string("AfterEffects"));
-        state.cameraStyleInt    = (style == "AlightMotion") ? 1 : 0;
-        state.show3DFeatures    = comp.value("show3DFeatures", state.show3DFeatures);
-    }
-
-    // Camera
-    if (root.contains("camera")) ReadCamera(root["camera"], *state.camera);
-
-    // Animation engine + slingshot curve
-    if (root.contains("animation")) ReadAnim(root["animation"], *state.animEngine);
-
-    // Layers — wipe existing state first so nothing from the previous scene leaks
-    state.layerManager->Clear();
-    int maxId = 0;
-    if (root.contains("layers") && root["layers"].is_array()) {
-        for (const auto& lj : root["layers"]) {
-            Layer L = ReadLayer(lj);
-            if (L.id > maxId) maxId = L.id;
-            state.layerManager->Layers().push_back(std::move(L));
-        }
-    }
-    // Force the id counter past every restored id so future AddLayer calls
-    // never collide with a loaded id.
-    const int nextId = std::max(maxId + 1, root.value("nextLayerId", maxId + 1));
-    state.layerManager->SetNextId(nextId);
-    // Rebuild the idToIndex cache after direct push_back (bypasses AddLayer).
-    // We do this by calling a no-op mutation. AddLayer + immediate DeleteLayer
-    // would work but is ugly; instead we rely on GetLayerById triggering the
-    // index build on the next access... but the cache is populated during
-    // structural mutations only. Simplest fix: add a Layer, delete it.
-    // Actually cleaner: expose a RebuildIndex hook. LayerManager already has
-    // one internally but it's private. We piggyback by adding + deleting a
-    // dummy layer, which triggers the private RebuildIndex twice. Fine on
-    // load (one-time cost).
-    const int dummy = state.layerManager->AddLayer(ShapeType::Null, "___pmge_load_dummy___");
-    state.layerManager->DeleteLayerById(dummy);
-
-    // Select the first layer if there is one and nothing else is selected.
-    if (state.layerManager->GetSelectedId() < 0 && !state.layerManager->Layers().empty()) {
-        state.layerManager->SetSelectedId(state.layerManager->Layers().front().id);
-    }
-
-    return true;
+    return JsonToAppState(root, state, outError);
 }

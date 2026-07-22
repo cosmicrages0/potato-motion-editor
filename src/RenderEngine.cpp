@@ -235,6 +235,7 @@ void RenderEngine::HandleEvents(bool& running) {
             const SDL_Keycode k = event.key.keysym.sym;
             if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
                 if (layerManager.GetSelectedId() != -1) {
+                    MarkForSnapshot();
                     layerManager.DeleteLayerById(layerManager.GetSelectedId());
                 }
             }
@@ -248,6 +249,11 @@ void RenderEngine::BeginFrame() {
     float deltaTime = (freq > 0) ? (float)((now - lastTime) / (double)freq) : 0.0f;
     lastTime = now;
     if (deltaTime > 0.25f) deltaTime = 0.25f;
+
+    // Task 5.3: coalesce any snapshots requested during the previous frame
+    // into a single undo entry BEFORE the new frame's input runs. Guarantees
+    // that a mouse-move-heavy drag records only one undo state per drag.
+    FlushPendingSnapshot();
 
     animEngine.Update(deltaTime);
 
@@ -283,10 +289,9 @@ void RenderEngine::BeginFrame() {
 // Docking layout + main menu
 // =============================================================================
 void RenderEngine::RenderUI() {
-    // Task 5.2: global keyboard shortcuts. Checked once per frame before any
-    // panel gets to consume the keypress. WantTextInput guard means Ctrl+S
-    // while typing in a text field falls through to the field's own binding
-    // (which is what the user expects).
+    // Task 5.2/5.3: global keyboard shortcuts. Checked once per frame before
+    // any panel consumes the keypress. WantTextInput guard means Ctrl+S while
+    // typing in a text field falls through to the field's own binding.
     const ImGuiIO& io = ImGui::GetIO();
     if (!io.WantTextInput && io.KeyCtrl) {
         // Ctrl+S = Save (or Save As if no path yet); Ctrl+Shift+S = Save As
@@ -295,9 +300,7 @@ void RenderEngine::RenderUI() {
                                 ? OpenSaveFileDialog("scene.pmge", true)
                                 : lastSavePath;
             if (!p.empty()) {
-                AppState st{ &layerManager, &camera, &animEngine,
-                             compositionWidth, compositionHeight,
-                             (int)cameraStyle, show3DFeatures };
+                AppState st{}; BuildAppState(st);
                 std::string err;
                 if (SaveProject(st, p, &err)) {
                     lastSavePath = p;
@@ -311,30 +314,42 @@ void RenderEngine::RenderUI() {
         if (ImGui::IsKeyPressed(ImGuiKey_O, false)) {
             const std::string p = OpenSaveFileDialog("scene.pmge", false);
             if (!p.empty()) {
-                AppState st{ &layerManager, &camera, &animEngine,
-                             compositionWidth, compositionHeight,
-                             (int)cameraStyle, show3DFeatures };
+                AppState st{}; BuildAppState(st);
                 std::string err;
                 if (LoadProject(st, p, &err)) {
-                    compositionWidth  = st.compositionWidth;
-                    compositionHeight = st.compositionHeight;
-                    cameraStyle       = (st.cameraStyleInt == 1)
-                                            ? CameraStyle::AlightMotion
-                                            : CameraStyle::AfterEffects;
-                    show3DFeatures    = st.show3DFeatures;
-                    if (compTextureWidth != (UINT)compositionWidth ||
-                        compTextureHeight != (UINT)compositionHeight) {
-                        ReleaseCompositionRT();
-                        CreateCompositionRT((UINT)compositionWidth,
-                                            (UINT)compositionHeight);
-                        effectManager.Resize((UINT)compositionWidth,
-                                             (UINT)compositionHeight);
-                    }
+                    ApplyLoadedScalars(st);
                     lastSavePath = p;
+                    // Loading a new file is not undoable back into whatever
+                    // was in memory before -- clear both stacks to avoid a
+                    // confusing "undo brought me to a totally different file"
+                    // experience.
+                    undoStack.Clear();
                     SetStatus("Loaded: " + p, false);
                 } else {
                     SetStatus("Load failed: " + err, true);
                 }
+            }
+        }
+        // Task 5.3: Ctrl+Z = Undo, Ctrl+Y or Ctrl+Shift+Z = Redo
+        if (ImGui::IsKeyPressed(ImGuiKey_Z, false) && !io.KeyShift) {
+            AppState st{}; BuildAppState(st);
+            if (undoStack.Undo(st)) {
+                ApplyLoadedScalars(st);
+                SetStatus("Undo (" + std::to_string(undoStack.PastCount()) +
+                          " more available)", false, 1.5f);
+            } else {
+                SetStatus("Nothing to undo", false, 1.0f);
+            }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Y, false) ||
+            (ImGui::IsKeyPressed(ImGuiKey_Z, false) && io.KeyShift)) {
+            AppState st{}; BuildAppState(st);
+            if (undoStack.Redo(st)) {
+                ApplyLoadedScalars(st);
+                SetStatus("Redo (" + std::to_string(undoStack.FutureCount()) +
+                          " more available)", false, 1.5f);
+            } else {
+                SetStatus("Nothing to redo", false, 1.0f);
             }
         }
     }
@@ -392,42 +407,23 @@ void RenderEngine::RenderAEDockingLayout() {
             if (ImGui::MenuItem("Open...", "Ctrl+O")) {
                 const std::string p = OpenSaveFileDialog("scene.pmge", false);
                 if (!p.empty()) {
-                    AppState st{ &layerManager, &camera, &animEngine,
-                                 compositionWidth, compositionHeight,
-                                 (int)cameraStyle, show3DFeatures };
+                    AppState st{}; BuildAppState(st);
                     std::string err;
                     if (LoadProject(st, p, &err)) {
-                        // Apply the loaded scalar members back to RenderEngine.
-                        compositionWidth  = st.compositionWidth;
-                        compositionHeight = st.compositionHeight;
-                        cameraStyle       = (st.cameraStyleInt == 1)
-                                                ? CameraStyle::AlightMotion
-                                                : CameraStyle::AfterEffects;
-                        show3DFeatures    = st.show3DFeatures;
-                        // Resize the composition RT if the loaded comp size differs.
-                        if (compTextureWidth != (UINT)compositionWidth ||
-                            compTextureHeight != (UINT)compositionHeight) {
-                            ReleaseCompositionRT();
-                            CreateCompositionRT((UINT)compositionWidth,
-                                                (UINT)compositionHeight);
-                            effectManager.Resize((UINT)compositionWidth,
-                                                 (UINT)compositionHeight);
-                        }
+                        ApplyLoadedScalars(st);
                         lastSavePath = p;
+                        undoStack.Clear();   // see Ctrl+O handler for rationale
                         SetStatus("Loaded: " + p, false);
                     } else {
                         SetStatus("Load failed: " + err, true);
                     }
                 }
             }
-            const bool haveSavePath = !lastSavePath.empty();
-            if (ImGui::MenuItem("Save", "Ctrl+S", false, haveSavePath || true)) {
+            if (ImGui::MenuItem("Save", "Ctrl+S")) {
                 std::string p = lastSavePath;
                 if (p.empty()) p = OpenSaveFileDialog("scene.pmge", true);
                 if (!p.empty()) {
-                    AppState st{ &layerManager, &camera, &animEngine,
-                                 compositionWidth, compositionHeight,
-                                 (int)cameraStyle, show3DFeatures };
+                    AppState st{}; BuildAppState(st);
                     std::string err;
                     if (SaveProject(st, p, &err)) {
                         lastSavePath = p;
@@ -440,9 +436,7 @@ void RenderEngine::RenderAEDockingLayout() {
             if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) {
                 const std::string p = OpenSaveFileDialog("scene.pmge", true);
                 if (!p.empty()) {
-                    AppState st{ &layerManager, &camera, &animEngine,
-                                 compositionWidth, compositionHeight,
-                                 (int)cameraStyle, show3DFeatures };
+                    AppState st{}; BuildAppState(st);
                     std::string err;
                     if (SaveProject(st, p, &err)) {
                         lastSavePath = p;
@@ -472,7 +466,32 @@ void RenderEngine::RenderAEDockingLayout() {
             }
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Edit")) { ImGui::MenuItem("Undo"); ImGui::MenuItem("Redo"); ImGui::EndMenu(); }
+        // Task 5.3: real Undo/Redo menu items backed by UndoStack. The
+        // in-item Ctrl+Z / Ctrl+Y strings are cosmetic; the actual key
+        // handling is in RenderUI's shortcut block above so it fires even
+        // when the menu isn't open.
+        if (ImGui::BeginMenu("Edit")) {
+            const bool canU = undoStack.CanUndo();
+            const bool canR = undoStack.CanRedo();
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, canU)) {
+                AppState st{}; BuildAppState(st);
+                if (undoStack.Undo(st)) {
+                    ApplyLoadedScalars(st);
+                    SetStatus("Undo", false, 1.5f);
+                }
+            }
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, canR)) {
+                AppState st{}; BuildAppState(st);
+                if (undoStack.Redo(st)) {
+                    ApplyLoadedScalars(st);
+                    SetStatus("Redo", false, 1.5f);
+                }
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("Undo stack: %zu past / %zu redo",
+                                undoStack.PastCount(), undoStack.FutureCount());
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Layer")) {
             if (ImGui::MenuItem("New Rectangle")) SpawnShapeAtViewportCenter(ShapeType::Rectangle);
             if (ImGui::MenuItem("New Ellipse"))   SpawnShapeAtViewportCenter(ShapeType::Ellipse);
@@ -482,7 +501,10 @@ void RenderEngine::RenderAEDockingLayout() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Delete Selected", "Del")) {
-                if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
+                if (layerManager.GetSelectedId() != -1) {
+                    MarkForSnapshot();
+                    layerManager.DeleteLayerById(layerManager.GetSelectedId());
+                }
             }
             ImGui::EndMenu();
         }
@@ -510,17 +532,19 @@ void RenderEngine::RenderAEDockingLayout() {
             Layer* selForFx = layerManager.GetSelectedLayer();
             const bool haveSel = (selForFx != nullptr);
             if (!haveSel) ImGui::BeginDisabled();
-            if (ImGui::MenuItem("Add Motion Tile"))         { if (selForFx) selForFx->AddEffect(Effect::MakeMotionTile()); }
-            if (ImGui::MenuItem("Add Directional Motion Blur")) { if (selForFx) selForFx->AddEffect(Effect::MakeMotionBlur()); }
-            if (ImGui::MenuItem("Add Chromatic Aberration")) { if (selForFx) selForFx->AddEffect(Effect::MakeChromaticAberration()); }
+            // Task 5.3: every effect-add snapshots first for undo.
+            auto addFx = [&](const Effect& e) { if (selForFx) { MarkForSnapshot(); selForFx->AddEffect(e); } };
+            if (ImGui::MenuItem("Add Motion Tile"))         addFx(Effect::MakeMotionTile());
+            if (ImGui::MenuItem("Add Directional Motion Blur")) addFx(Effect::MakeMotionBlur());
+            if (ImGui::MenuItem("Add Chromatic Aberration")) addFx(Effect::MakeChromaticAberration());
             ImGui::Separator();
             if (ImGui::BeginMenu("Add Blend Mode")) {
-                if (ImGui::MenuItem("Normal"))     { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Normal)); }
-                if (ImGui::MenuItem("Additive"))   { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Additive)); }
-                if (ImGui::MenuItem("Multiply"))   { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Multiply)); }
-                if (ImGui::MenuItem("Screen"))     { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Screen)); }
-                if (ImGui::MenuItem("Overlay"))    { if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::Overlay)); }
-                if (ImGui::MenuItem("Color Dodge")){ if (selForFx) selForFx->AddEffect(Effect::MakeBlendMode(BlendMode::ColorDodge)); }
+                if (ImGui::MenuItem("Normal"))     addFx(Effect::MakeBlendMode(BlendMode::Normal));
+                if (ImGui::MenuItem("Additive"))   addFx(Effect::MakeBlendMode(BlendMode::Additive));
+                if (ImGui::MenuItem("Multiply"))   addFx(Effect::MakeBlendMode(BlendMode::Multiply));
+                if (ImGui::MenuItem("Screen"))     addFx(Effect::MakeBlendMode(BlendMode::Screen));
+                if (ImGui::MenuItem("Overlay"))    addFx(Effect::MakeBlendMode(BlendMode::Overlay));
+                if (ImGui::MenuItem("Color Dodge"))addFx(Effect::MakeBlendMode(BlendMode::ColorDodge));
                 ImGui::EndMenu();
             }
             if (!haveSel) ImGui::EndDisabled();
@@ -586,7 +610,10 @@ void RenderEngine::DrawTimelinePanel() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Delete Selected")) {
-        if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
+        if (layerManager.GetSelectedId() != -1) {
+            MarkForSnapshot();
+            layerManager.DeleteLayerById(layerManager.GetSelectedId());
+        }
     }
     ImGui::SameLine();
     ImGui::Checkbox("Slingshot -> Selected Scale", &applySlingshotToSelected);
@@ -645,7 +672,16 @@ void RenderEngine::DrawTimelinePanel() {
             std::snprintf(label, sizeof(label), "%s%s",
                           fx ? "[fx] " : "",
                           layer.name.c_str());
-            if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+            // Task 5.3 fix: without AllowOverlap the Selectable steals every
+            // click across the entire row (including on the Parent Combo two
+            // cells over) because SpanAllColumns extends its hit-rect
+            // across all columns. AllowOverlap lets subsequent widgets in the
+            // row (like the Combo) claim their own hit-rects and receive
+            // clicks normally.
+            const ImGuiSelectableFlags selFlags =
+                (ImGuiSelectableFlags)((int)ImGuiSelectableFlags_SpanAllColumns |
+                                       (int)ImGuiSelectableFlags_AllowOverlap);
+            if (ImGui::Selectable(label, isSelected, selFlags)) {
                 layerManager.SetSelectedId(layer.id);
             }
 
@@ -663,10 +699,16 @@ void RenderEngine::DrawTimelinePanel() {
 
             // Parent dropdown
             ImGui::TableSetColumnIndex(parentCol);
+            // Task 5.3 fix: paired with the Selectable's AllowOverlap flag
+            // above. Tells ImGui this widget's hit-rect wins over any prior
+            // overlapping item — the Combo now receives clicks that used to
+            // be stolen by the Name column's row-spanning Selectable.
+            ImGui::SetNextItemAllowOverlap();
             const Layer* parent = layerManager.GetLayerById(layer.parentId);
             const char* preview = parent ? parent->name.c_str() : "(none)";
             if (ImGui::BeginCombo("##parent", preview, ImGuiComboFlags_HeightSmall)) {
                 if (ImGui::Selectable("(none)", layer.parentId == -1)) {
+                    MarkForSnapshot();
                     layerManager.SetParent(layer.id, -1);
                 }
                 for (const auto& candidate : L) {
@@ -675,6 +717,7 @@ void RenderEngine::DrawTimelinePanel() {
                     ImGuiSelectableFlags flags = wouldCycle ? ImGuiSelectableFlags_Disabled : 0;
                     const bool sel = (layer.parentId == candidate.id);
                     if (ImGui::Selectable(candidate.name.c_str(), sel, flags)) {
+                        MarkForSnapshot();
                         layerManager.SetParent(layer.id, candidate.id);
                     }
                 }
@@ -776,27 +819,135 @@ void RenderEngine::DrawTimelineStrip() {
         dl->AddLine(ImVec2(trackX0, rowYc), ImVec2(trackX1, rowYc),
                     IM_COL32(60, 60, 70, 255), 1.0f);
 
-        // Draw diamonds for each track type this layer owns
-        // Task 5.1: draw diamonds for each AnimatedProperty on the layer's
-        // transform. Templated lambda so one body handles Vec2/Vec3/float.
-        auto drawKeys = [&](const auto& prop, ImU32 col) {
-            for (const auto& k : prop.keyframes) {
+        // Draw + hit-test each AnimatedProperty's keyframe diamonds.
+        // Task 5.3: diamonds are now interactive — left-click to start drag,
+        // right-click to open a context menu, drag to slide along the ruler.
+        // A drag in flight suppresses the strip's scrub button below.
+        //
+        // Templated lambda so one body handles Vec2/Vec3/float property types.
+        const ImVec2 mp = ImGui::GetIO().MousePos;
+        auto drawAndHitKeys = [&](auto& prop, DiamondProperty which, ImU32 col) {
+            const float r = 5.0f;
+            for (size_t ki = 0; ki < prop.keyframes.size(); ++ki) {
+                const auto& k = prop.keyframes[ki];
                 const float x = TimeToX(k.time);
                 const ImVec2 p(x, rowYc);
-                const float r = 4.5f;
                 const ImVec2 tri[4] = {
                     ImVec2(p.x,     p.y - r),
                     ImVec2(p.x + r, p.y),
                     ImVec2(p.x,     p.y + r),
                     ImVec2(p.x - r, p.y),
                 };
-                dl->AddConvexPolyFilled(tri, 4, col);
+                // Highlight the diamond being dragged or opened in a menu.
+                const bool isTarget =
+                    ((draggedDiamond.layerId == layer.id &&
+                      (int)draggedDiamond.which == (int)which &&
+                      draggedDiamond.keyIndex == (int)ki) ||
+                     (contextDiamond.layerId == layer.id &&
+                      (int)contextDiamond.which == (int)which &&
+                      contextDiamond.keyIndex == (int)ki));
+                dl->AddConvexPolyFilled(tri, 4, isTarget ? IM_COL32(255,255,255,255) : col);
+
+                // Hit-test: 6px square around the diamond center.
+                if (std::fabs(mp.x - p.x) <= r + 1.0f &&
+                    std::fabs(mp.y - p.y) <= r + 1.0f) {
+                    // Left-click begins a drag.
+                    if (!diamondDragActive &&
+                        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        diamondDragActive = true;
+                        draggedDiamond.layerId  = layer.id;
+                        draggedDiamond.which    = which;
+                        draggedDiamond.keyIndex = (int)ki;
+                        draggedDiamond.origTime = k.time;
+                    }
+                    // Right-click stages a context menu (opened below).
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                        contextDiamond.layerId  = layer.id;
+                        contextDiamond.which    = which;
+                        contextDiamond.keyIndex = (int)ki;
+                        contextDiamond.origTime = k.time;
+                        ImGui::OpenPopup("##kfContext");
+                    }
+                }
             }
         };
-        drawKeys(layer.transform.position, IM_COL32(120, 200, 255, 255));
-        drawKeys(layer.transform.scale,    IM_COL32(255, 200, 120, 255));
-        drawKeys(layer.transform.rotation, IM_COL32(200, 255, 120, 255));
-        drawKeys(layer.transform.opacity,  IM_COL32(255, 120, 200, 255));
+        drawAndHitKeys(layer.transform.position, DiamondProperty::Position, IM_COL32(120, 200, 255, 255));
+        drawAndHitKeys(layer.transform.scale,    DiamondProperty::Scale,    IM_COL32(255, 200, 120, 255));
+        drawAndHitKeys(layer.transform.rotation, DiamondProperty::Rotation, IM_COL32(200, 255, 120, 255));
+        drawAndHitKeys(layer.transform.opacity,  DiamondProperty::Opacity,  IM_COL32(255, 120, 200, 255));
+    }
+
+    // Right-click context menu for a keyframe. contextDiamond is set by the
+    // diamond hit-test above (which also calls OpenPopup on the click).
+    // Kept OUTSIDE the per-layer loop so the popup opens once per frame.
+    if (ImGui::BeginPopup("##kfContext")) {
+        if (contextDiamond.valid()) {
+            Layer* cl = layerManager.GetLayerById(contextDiamond.layerId);
+            if (cl) {
+                ImGui::TextDisabled("Keyframe at t=%.3fs", contextDiamond.origTime);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Delete Keyframe")) {
+                    MarkForSnapshot();
+                    switch (contextDiamond.which) {
+                    case DiamondProperty::Position: cl->transform.position.RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Rotation: cl->transform.rotation.RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Scale:    cl->transform.scale   .RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Opacity:  cl->transform.opacity .RemoveKeyAt(contextDiamond.origTime); break;
+                    }
+                    contextDiamond.clear();
+                }
+                if (ImGui::MenuItem("Go to Keyframe")) {
+                    animEngine.currentTime = contextDiamond.origTime;
+                    animEngine.isPlaying   = false;
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    // Handle in-flight diamond drag: slide the keyframe's time as the mouse moves.
+    // On mouse-up: commit + snapshot.
+    if (diamondDragActive) {
+        Layer* dl_layer = layerManager.GetLayerById(draggedDiamond.layerId);
+        if (dl_layer && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const ImVec2 mmp = ImGui::GetIO().MousePos;
+            const float newTime = std::clamp(XToTime(mmp.x), 0.0f,
+                                             (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f);
+            // Move the keyframe by re-inserting at the new time. RemoveKeyAt
+            // + SetValue on the same AnimatedProperty preserves the value.
+            auto moveKey = [&](auto& prop) {
+                if (draggedDiamond.keyIndex < 0 ||
+                    draggedDiamond.keyIndex >= (int)prop.keyframes.size()) return;
+                auto oldVal = prop.keyframes[draggedDiamond.keyIndex].value;
+                // Force the write path via a temporarily-enabled stopwatch so
+                // SetValue actually keys (it may already be enabled; toggle is
+                // a no-op then).
+                const bool wasOn = prop.stopwatchEnabled;
+                prop.stopwatchEnabled = true;
+                prop.RemoveKeyAt(draggedDiamond.origTime);
+                prop.SetValue(newTime, oldVal);
+                prop.stopwatchEnabled = wasOn || true;   // keep on; drag implies animation
+                draggedDiamond.origTime = newTime;
+                // keyIndex may have shifted after re-sort; find it again next frame.
+                for (size_t i = 0; i < prop.keyframes.size(); ++i) {
+                    if (std::fabs(prop.keyframes[i].time - newTime) < 1e-3f) {
+                        draggedDiamond.keyIndex = (int)i;
+                        break;
+                    }
+                }
+            };
+            switch (draggedDiamond.which) {
+            case DiamondProperty::Position: moveKey(dl_layer->transform.position); break;
+            case DiamondProperty::Rotation: moveKey(dl_layer->transform.rotation); break;
+            case DiamondProperty::Scale:    moveKey(dl_layer->transform.scale);    break;
+            case DiamondProperty::Opacity:  moveKey(dl_layer->transform.opacity);  break;
+            }
+        } else {
+            // Mouse released -> end drag and record undo.
+            MarkForSnapshot();
+            diamondDragActive = false;
+            draggedDiamond.clear();
+        }
     }
 
     // Playhead
@@ -811,14 +962,14 @@ void RenderEngine::DrawTimelineStrip() {
         IM_COL32(255, 60, 60, 255));
 
     // Interaction: click / drag anywhere in the strip below the ruler to
-    // scrub, click in the ruler to also scrub. Selecting a layer via the
-    // strip is handled by the layer table below — one thing per widget.
+    // scrub. Suppressed while a keyframe diamond is being dragged so the
+    // two interactions don't fight over the same mouse events.
     ImGui::SetCursorScreenPos(origin);
     ImGui::InvisibleButton("TimelineStripHit", ImVec2(stripW, totalH));
-    if (ImGui::IsItemActive()) {
-        const ImVec2 mp = ImGui::GetIO().MousePos;
-        if (mp.x >= trackX0 && mp.x <= trackX1) {
-            animEngine.currentTime = XToTime(mp.x);
+    if (!diamondDragActive && ImGui::IsItemActive()) {
+        const ImVec2 mp2 = ImGui::GetIO().MousePos;
+        if (mp2.x >= trackX0 && mp2.x <= trackX1) {
+            animEngine.currentTime = XToTime(mp2.x);
             animEngine.isPlaying   = false; // scrubbing pauses playback
         }
     }
@@ -892,48 +1043,68 @@ void RenderEngine::DrawInspectorPanel() {
         // the user sees on screen — killing the "field says 423 but I
         // typed 500" confusion of the previous architecture.
 
+        // Task 5.3: every stopwatch toggle and every completed slider drag
+        // records an undo snapshot. Live drag mutations DO NOT snapshot per
+        // frame (that would fill the stack with 60 identical-ish states);
+        // instead we call MarkForSnapshot on IsItemDeactivatedAfterEdit,
+        // which fires exactly once when the slider is released.
+
         // POSITION (Vec3)
-        if (stopwatch("pos", sel->transform.position.HasStopwatch()))
+        if (stopwatch("pos", sel->transform.position.HasStopwatch())) {
+            MarkForSnapshot();
             sel->transform.position.ToggleStopwatch(t);
+        }
         ImGui::SameLine();
         Vec3 pos = sel->transform.position.Evaluate(t);
         if (ImGui::DragFloat3("Position (x,y,z)", &pos.x, 1.0f))
             sel->transform.position.SetValue(t, pos);
+        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
 
         // ROTATION (Vec3, degrees)
-        if (stopwatch("rot", sel->transform.rotation.HasStopwatch()))
+        if (stopwatch("rot", sel->transform.rotation.HasStopwatch())) {
+            MarkForSnapshot();
             sel->transform.rotation.ToggleStopwatch(t);
+        }
         ImGui::SameLine();
         Vec3 rot = sel->transform.rotation.Evaluate(t);
         if (ImGui::DragFloat3("Rotation (deg)", &rot.x, 0.5f))
             sel->transform.rotation.SetValue(t, rot);
+        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
 
         // SCALE (Vec3)
-        if (stopwatch("scl", sel->transform.scale.HasStopwatch()))
+        if (stopwatch("scl", sel->transform.scale.HasStopwatch())) {
+            MarkForSnapshot();
             sel->transform.scale.ToggleStopwatch(t);
+        }
         ImGui::SameLine();
         Vec3 scl = sel->transform.scale.Evaluate(t);
         if (ImGui::DragFloat3("Scale", &scl.x, 0.01f, -10.0f, 10.0f))
             sel->transform.scale.SetValue(t, scl);
+        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
 
         // ANCHOR (Vec2) — animatable but no stopwatch UI for it in Task 5.1
         Vec2 anchor = sel->transform.anchorPoint.Evaluate(t);
         if (ImGui::DragFloat2("Anchor (0..1)", &anchor.x, 0.01f, 0.0f, 1.0f))
             sel->transform.anchorPoint.SetValue(t, anchor);
+        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
 
         // SIZE (Vec2)
         Vec2 size = sel->transform.sizePixels.Evaluate(t);
         if (ImGui::DragFloat2("Size (px)", &size.x, 1.0f, 1.0f, 4096.0f))
             sel->transform.sizePixels.SetValue(t, size);
+        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
         ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
 
         // OPACITY (float)
-        if (stopwatch("op", sel->transform.opacity.HasStopwatch()))
+        if (stopwatch("op", sel->transform.opacity.HasStopwatch())) {
+            MarkForSnapshot();
             sel->transform.opacity.ToggleStopwatch(t);
+        }
         ImGui::SameLine();
         float op = sel->transform.opacity.Evaluate(t);
         if (ImGui::SliderFloat("Opacity", &op, 0.0f, 1.0f))
             sel->transform.opacity.SetValue(t, op);
+        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
 
         // Task 5.0: help hint so users don't need to guess the workflow.
         ImGui::TextDisabled("To animate: click the stopwatch, move the playhead,");
@@ -1269,6 +1440,9 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
 
     // End drag on release
     if (activeGizmo != GizmoMode::None && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        // Task 5.3: one snapshot per drag (mouse-up), NOT one per frame during
+        // the drag. Coalescing via MarkForSnapshot ensures this.
+        MarkForSnapshot();
         activeGizmo = GizmoMode::None;
         dragLayerId = -1;
     }
@@ -1872,6 +2046,7 @@ void RenderEngine::DrawEffectsPalettePanel() {
     auto addRow = [&](const char* label, const char* desc, Effect (*factory)()){
         ImGui::PushID(label);
         if (ImGui::Button(label, ImVec2(-1, 0))) {
+            MarkForSnapshot();   // Task 5.3: undo covers "add effect"
             sel->AddEffect(factory());
         }
         if (ImGui::IsItemHovered()) {
@@ -1897,6 +2072,7 @@ void RenderEngine::DrawEffectsPalettePanel() {
     for (const auto& bm : bms) {
         ImGui::PushID(bm.name);
         if (ImGui::Button(bm.name, ImVec2(-1, 0))) {
+            MarkForSnapshot();   // Task 5.3
             sel->AddEffect(Effect::MakeBlendMode(bm.m));
         }
         ImGui::PopID();
@@ -1980,8 +2156,8 @@ void RenderEngine::DrawEffectControlsPanel() {
     }
 
     // Apply deferred mutations (can't mutate while iterating).
-    if (moveEffectId >= 0) sel->MoveEffect(moveEffectId, moveDelta);
-    if (deleteId     >= 0) sel->RemoveEffectById(deleteId);
+    if (moveEffectId >= 0) { MarkForSnapshot(); sel->MoveEffect(moveEffectId, moveDelta); }
+    if (deleteId     >= 0) { MarkForSnapshot(); sel->RemoveEffectById(deleteId); }
 
     ImGui::TextDisabled("Task 5.0: effects now visually apply to the whole");
     ImGui::TextDisabled("composition (all enabled effects across all layers");
@@ -2426,6 +2602,9 @@ void RenderEngine::EndFrame() {
 // viewport panel), so new shapes always land in the middle of the visible
 // letterboxed image regardless of panel size or camera pan.
 void RenderEngine::SpawnShapeAtViewportCenter(ShapeType type, const char* nameHint) {
+    // Task 5.3: undo snapshot BEFORE the mutation so Ctrl+Z returns to
+    // pre-spawn state.
+    MarkForSnapshot();
     const int newId = layerManager.AddLayer(type, nameHint ? std::string(nameHint) : std::string());
     Layer* layer = layerManager.GetLayerById(newId);
     if (!layer) return;
@@ -2569,6 +2748,42 @@ void RenderEngine::SetStatus(const std::string& msg, bool isError, float duratio
         }
         SDL_SetWindowTitle(window, title.c_str());
     }
+}
+
+// =============================================================================
+// Task 5.3: undo/redo + AppState helpers
+// =============================================================================
+void RenderEngine::BuildAppState(AppState& out) {
+    out.layerManager      = &layerManager;
+    out.camera            = &camera;
+    out.animEngine        = &animEngine;
+    out.compositionWidth  = compositionWidth;
+    out.compositionHeight = compositionHeight;
+    out.cameraStyleInt    = (int)cameraStyle;
+    out.show3DFeatures    = show3DFeatures;
+}
+
+void RenderEngine::ApplyLoadedScalars(const AppState& st) {
+    compositionWidth  = st.compositionWidth;
+    compositionHeight = st.compositionHeight;
+    cameraStyle       = (st.cameraStyleInt == 1) ? CameraStyle::AlightMotion
+                                                 : CameraStyle::AfterEffects;
+    show3DFeatures    = st.show3DFeatures;
+    if (compTextureWidth  != (UINT)compositionWidth ||
+        compTextureHeight != (UINT)compositionHeight) {
+        ReleaseCompositionRT();
+        CreateCompositionRT((UINT)compositionWidth, (UINT)compositionHeight);
+        effectManager.Resize((UINT)compositionWidth, (UINT)compositionHeight);
+    }
+}
+
+void RenderEngine::FlushPendingSnapshot() {
+    if (!pendingSnapshot) return;
+    pendingSnapshot = false;
+    AppState st{};
+    BuildAppState(st);
+    // Silent on success (undo works transparently). Log on failure only.
+    undoStack.PushSnapshot(st);
 }
 
 void RenderEngine::Shutdown() {

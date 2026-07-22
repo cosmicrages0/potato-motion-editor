@@ -24,6 +24,7 @@
 #include "ExportEngine.h"
 #include "AlightXmlImporter.h"
 #include "CompositionRenderer.h"
+#include "UndoStack.h"
 
 class RenderEngine {
 public:
@@ -118,10 +119,40 @@ private:
     std::string            statusMessage;                 // shown at bottom of viewport
     float                  statusMessageExpiresAt = 0.0f; // seconds (comp-clock-independent)
     bool                   statusIsError = false;
-    // Wrap a Win32 OPENFILENAMEA into a portable helper. Empty return = cancel.
-    // filterDesc example: "Potato Motion Editor (*.pmge)\0*.pmge\0" (double NUL terminator).
     std::string OpenSaveFileDialog(const char* defaultName, bool save);
     void SetStatus(const std::string& msg, bool isError = false, float durationSeconds = 4.0f);
+
+    // Task 5.3: undo/redo. See DESIGN_COMMIT3_UNDO_KEYFRAMES_PARENT.md for the
+    // coalescing model. MarkForSnapshot() sets a flag; the actual PushSnapshot
+    // happens once at the top of the next BeginFrame, so multiple marks in one
+    // frame collapse to one undo entry.
+    UndoStack   undoStack;
+    bool        pendingSnapshot = false;
+    void MarkForSnapshot() { pendingSnapshot = true; }
+    // Called from BeginFrame BEFORE user input is processed.
+    void FlushPendingSnapshot();
+    // Build the AppState aggregate that undo/save/load all consume.
+    void BuildAppState(struct AppState& out);
+    // Apply post-load / post-undo state back onto the RenderEngine members
+    // (composition size, camera style, show3D). Handles compRT resize.
+    void ApplyLoadedScalars(const struct AppState& st);
+
+    // Task 5.3: keyframe diamond interaction state for the timeline strip.
+    // Not a public type; scoped to timeline drawing.
+    enum class DiamondProperty : int { Position = 0, Rotation = 1, Scale = 2, Opacity = 3 };
+    struct DiamondHit {
+        int             layerId  = -1;
+        DiamondProperty which    = DiamondProperty::Position;
+        int             keyIndex = -1;
+        float           origTime = 0.0f;
+        bool valid() const { return layerId >= 0 && keyIndex >= 0; }
+        void clear() { layerId = -1; keyIndex = -1; }
+    };
+    DiamondHit  draggedDiamond;
+    bool        diamondDragActive = false;
+    // Right-click context menu target (persisted across frames because ImGui
+    // popups open on the frame AFTER the click).
+    DiamondHit  contextDiamond;
     // Task 5.0: last "Test FFmpeg" result shown under the button.
     std::string            ffmpegTestResult;
     bool                   ffmpegTestOk = false;

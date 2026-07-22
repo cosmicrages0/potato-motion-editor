@@ -45,3 +45,14 @@ bool SaveProject(const AppState& state,
 bool LoadProject(AppState& state,
                  const std::string& path,
                  std::string* outError = nullptr);
+
+// Task 5.3: string-based (de)serialization. Same JSON layout as the file
+// versions, but the caller supplies/receives the JSON as a std::string. Used
+// by UndoStack for in-memory snapshots so we don't touch the disk on Ctrl+Z.
+bool SaveProjectToString(const AppState& state,
+                         std::string& outJson,
+                         std::string* outError = nullptr);
+
+bool LoadProjectFromString(AppState& state,
+                           const std::string& inJson,
+                           std::string* outError = nullptr);
