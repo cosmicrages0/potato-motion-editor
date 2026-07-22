@@ -13,6 +13,46 @@ ExportEngine::ExportEngine() {
     QueryPerformanceFrequency(&freq_);
 }
 
+// Task 5.0: one-click diagnostic. Runs `<ffmpegPath> -version` via _popen in
+// TEXT mode this time (we're reading text output, not writing raw pixels).
+// If _popen returns a valid pipe but the child immediately dies (ffmpeg not
+// found, launched a shell that failed), fgets returns EOF right away and we
+// report that. If ffmpeg is installed we get its banner starting with
+// "ffmpeg version N.N.N ...".
+bool ExportEngine::TestFfmpegBinary(const std::string& ffmpegPath, std::string& outResult) {
+    // Build "<ffmpeg> -version 2>&1" so stderr (where ffmpeg prints its
+    // banner on some builds) gets captured too.
+    std::string cmd = "\"" + ffmpegPath + "\" -version 2>&1";
+    FILE* pipe = _popen(cmd.c_str(), "r");
+    if (!pipe) {
+        outResult = "Could not spawn a shell to test ffmpeg. This is unusual.";
+        return false;
+    }
+    char buf[512] = {0};
+    std::string all;
+    // Read up to ~4KB of output.
+    while (std::fgets(buf, sizeof(buf), pipe)) {
+        all += buf;
+        if (all.size() > 4096) break;
+    }
+    int rc = _pclose(pipe);
+    if (all.empty()) {
+        outResult = "No output from ffmpeg. It's probably not installed, "
+                    "or the path is wrong. Install FFmpeg and add it to your "
+                    "system PATH, or set an absolute path like "
+                    "C:\\\\ffmpeg\\\\bin\\\\ffmpeg.exe";
+        return false;
+    }
+    // Keep first ~300 chars to fit the UI cleanly.
+    if (all.size() > 300) all = all.substr(0, 300) + "\n... (truncated)";
+    outResult = all;
+    // Exit code 0 = ok; some ffmpeg builds return non-zero on -version anyway,
+    // so trust the presence of "ffmpeg version" text as the success signal.
+    return all.find("ffmpeg version") != std::string::npos ||
+           all.find("ffmpeg  version") != std::string::npos ||
+           rc == 0;
+}
+
 ExportEngine::~ExportEngine() {
     End(true);
 }

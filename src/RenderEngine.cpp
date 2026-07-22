@@ -688,37 +688,61 @@ void RenderEngine::DrawInspectorPanel() {
 
     if (ImGui::BeginTabItem("Transform")) {
     if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Task 4.5: a diamond button beside each property sets a keyframe at
-        // the current comp time. A subtle color hint shows whether the
-        // property already has any keys.
+        // Task 5.0: AE-style stopwatch UX. Each property has a small orange
+        // circle button ("stopwatch"). Click it -> keyframing turns ON and a
+        // first keyframe is dropped at the current time. Any subsequent
+        // value change (drag, type) auto-adds a keyframe at the current time.
+        // Click stopwatch again -> all keys for that property are removed,
+        // the property becomes static.
+        //
+        // Colors: lit ORANGE dot when the stopwatch is on; DIM gray when off.
         const float t = animEngine.currentTime;
-        auto kfButton = [&](const char* id, bool has) {
+        auto stopwatch = [&](const char* id, bool lit) {
             ImGui::PushStyleColor(ImGuiCol_Button,
-                has ? IM_COL32(200, 150, 30, 255) : IM_COL32(60, 60, 70, 255));
-            const bool clicked = ImGui::Button(id);
+                lit ? IM_COL32(240, 130, 30, 255) : IM_COL32(60, 60, 70, 255));
+            const bool clicked = ImGui::Button(lit ? "(*)" : "( )", ImVec2(28, 0));
             ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(lit
+                    ? "Stopwatch ON: value changes auto-key. Click to disable + clear."
+                    : "Stopwatch OFF: property is static. Click to enable keyframing.");
+                ImGui::EndTooltip();
+            }
             return clicked;
         };
 
-        if (kfButton("K##pos", sel->positionTrack && !sel->positionTrack->empty())) sel->KeyPosition(t);
+        // POSITION
+        if (stopwatch("SW##pos", sel->IsPositionAnimated())) sel->ToggleAnimatePosition(t);
         ImGui::SameLine();
-        ImGui::DragFloat3("Position (x,y,z)", &sel->transform.position.x, 1.0f);
+        if (ImGui::DragFloat3("Position (x,y,z)", &sel->transform.position.x, 1.0f))
+            sel->AutoKeyPositionIfEnabled(t);
 
-        if (kfButton("K##rot", sel->rotationTrack && !sel->rotationTrack->empty())) sel->KeyRotation(t);
+        // ROTATION
+        if (stopwatch("SW##rot", sel->IsRotationAnimated())) sel->ToggleAnimateRotation(t);
         ImGui::SameLine();
-        ImGui::DragFloat3("Rotation (deg)",   &sel->transform.rotation.x, 0.5f);
+        if (ImGui::DragFloat3("Rotation (deg)",   &sel->transform.rotation.x, 0.5f))
+            sel->AutoKeyRotationIfEnabled(t);
 
-        if (kfButton("K##scl", sel->scaleTrack && !sel->scaleTrack->empty())) sel->KeyScale(t);
+        // SCALE
+        if (stopwatch("SW##scl", sel->IsScaleAnimated())) sel->ToggleAnimateScale(t);
         ImGui::SameLine();
-        ImGui::DragFloat3("Scale",            &sel->transform.scale.x,    0.01f, -10.0f, 10.0f);
+        if (ImGui::DragFloat3("Scale",            &sel->transform.scale.x,    0.01f, -10.0f, 10.0f))
+            sel->AutoKeyScaleIfEnabled(t);
 
         ImGui::DragFloat2("Anchor (0..1)",    &sel->transform.anchorPoint.x, 0.01f, 0.0f, 1.0f);
         ImGui::DragFloat2("Size (px)",        &sel->transform.sizePixels.x,  1.0f, 1.0f, 4096.0f);
         ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
 
-        if (kfButton("K##op", sel->opacityTrack && !sel->opacityTrack->empty())) sel->KeyOpacity(t);
+        // OPACITY
+        if (stopwatch("SW##op", sel->IsOpacityAnimated())) sel->ToggleAnimateOpacity(t);
         ImGui::SameLine();
-        ImGui::SliderFloat("Opacity", &sel->transform.opacity, 0.0f, 1.0f);
+        if (ImGui::SliderFloat("Opacity", &sel->transform.opacity, 0.0f, 1.0f))
+            sel->AutoKeyOpacityIfEnabled(t);
+
+        // Task 5.0: help hint so users don't need to guess the workflow.
+        ImGui::TextDisabled("To animate: click the stopwatch, move the playhead,");
+        ImGui::TextDisabled("change the value. Repeat for each keyframe.");
 
         // Task 4.5: quick "Alight-style HUD attachment" toggle when using
         // the Alight camera style. Grayed out under AE style.
@@ -1876,6 +1900,26 @@ void RenderEngine::DrawRenderQueuePanel() {
         std::snprintf(ffmpegBuf, sizeof(ffmpegBuf), "%s", pendingExport.ffmpegPath.c_str());
         if (ImGui::InputText("FFmpeg path", ffmpegBuf, sizeof(ffmpegBuf))) {
             pendingExport.ffmpegPath = ffmpegBuf;
+        }
+
+        // Task 5.0: one-click FFmpeg diagnostic. Runs `<ffmpegPath> -version`
+        // and shows what came back. Green = ffmpeg found. Red = install it or
+        // fix the path field above.
+        if (ImGui::Button("Test FFmpeg")) {
+            ffmpegTestOk = ExportEngine::TestFfmpegBinary(pendingExport.ffmpegPath,
+                                                          ffmpegTestResult);
+        }
+        if (!ffmpegTestResult.empty()) {
+            const ImVec4 col = ffmpegTestOk ? ImVec4(0.4f, 1.0f, 0.6f, 1.0f)
+                                            : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+            ImGui::TextColored(col, ffmpegTestOk ? "FFmpeg OK:" : "FFmpeg problem:");
+            ImGui::TextWrapped("%s", ffmpegTestResult.c_str());
+            if (!ffmpegTestOk) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+                    "Get ffmpeg.exe from https://ffmpeg.org/download.html "
+                    "(Windows builds). Place it in your PATH or set the full "
+                    "path in the field above (e.g. C:\\\\ffmpeg\\\\bin\\\\ffmpeg.exe).");
+            }
         }
 
         ImGui::Separator();

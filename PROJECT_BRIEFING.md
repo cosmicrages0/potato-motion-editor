@@ -74,6 +74,18 @@ potato-motion-editor/
 - **Correct matrix order** `world = parent * local` (column-vector convention)
 - Delete/Backspace keyboard shortcut
 
+### ✅ Task 5.0-a — Stopwatch Keyframes + FFmpeg Diagnostic (done, patch commit)
+
+User feedback on the Task 5.0 build: (a) keyframes weren't animating because the K button dropped ONE keyframe and users didn't know they needed at least two at different times, (b) export failed with "pipe closed unexpectedly" — 90 % likely ffmpeg wasn't installed. This patch commit addresses both:
+
+- **AE-style stopwatch on every Transform property.** `PropertyTrack` gains an `enabled` flag ("stopwatch is lit"). Click the small orange dot next to Position / Rotation / Scale / Opacity to enable keyframing on that property. Once enabled, ANY value change auto-creates a keyframe at the current comp time. Click the stopwatch again to disable and clear all keys. Hover the button for a tooltip explaining the workflow. Text hint under the Transform section: *"To animate: click the stopwatch, move the playhead, change the value. Repeat for each keyframe."*
+- **`SampleTracks` now respects `enabled`** — a disabled track is ignored even if it has leftover keys.
+- **"Test FFmpeg" button** in the Render Queue panel. Runs `<ffmpegPath> -version 2>&1` via `_popen("r")`, captures the output (first ~300 chars), and shows it inline: green "FFmpeg OK: ffmpeg version 6.1.1 ..." or red "FFmpeg problem: No output from ffmpeg. It's probably not installed..." with a follow-up hint linking to https://ffmpeg.org/download.html and reminding the user they can set an absolute path in the FFmpeg path field above.
+
+Both are one-commit fixes that don't rework any of the Task 5.0 architecture; they just make the existing systems usable.
+
+---
+
 ### ✅ Task 5.0 — Big Usability Pass (done, real user value)
 
 The pass that turns Tasks 5 and 6 from "wired but not connected" into working features, and fixes the composition-viewport bugs from the user's screenshot review.

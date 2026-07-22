@@ -111,6 +111,9 @@ private:
     float                  pendingExportSeconds = 5.0f;
     bool                   showRenderQueue = false;
     bool                   showFfmpegMissingPopup = false;
+    // Task 5.0: last "Test FFmpeg" result shown under the button.
+    std::string            ffmpegTestResult;
+    bool                   ffmpegTestOk = false;
 
     // Task 5.0: viewport-panel geometry, updated each frame in DrawViewportCanvas.
     // Used by gizmo hit-testing to convert screen pixels to composition pixels.

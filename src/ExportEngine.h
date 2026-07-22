@@ -91,6 +91,14 @@ public:
     const Status& GetStatus() const { return status_; }
     const Settings& GetSettings() const { return settings_; }
 
+    // Task 5.0 diagnostic: run `<ffmpegPath> -version` and capture the first
+    // line of output. Returns true if the binary was found and produced any
+    // output, false otherwise. Writes the captured output (or the failure
+    // reason) into `outResult` so the UI can show it verbatim.
+    // This is a synchronous call that blocks for up to ~500ms; only use from
+    // a button click, never per-frame.
+    static bool TestFfmpegBinary(const std::string& ffmpegPath, std::string& outResult);
+
 private:
     void ReleaseTextures();
     bool AllocateTextures(ID3D11Device* device);

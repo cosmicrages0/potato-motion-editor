@@ -88,6 +88,13 @@ struct Keyframe {
 
 struct PropertyTrack {
     std::vector<Keyframe> keys;
+    // Task 5.0: separate "the artist has enabled keyframing on this property"
+    // from "there are keys stored." AE's stopwatch icon reflects this bool.
+    // When enabled == true and keys.empty(), the property is animatable but
+    // has no keys yet; Evaluate() returns the fallback the caller supplies.
+    // When enabled == false, the property is static; the transform's own
+    // value wins and no auto-keying happens on drag.
+    bool enabled = false;
 
     bool empty() const { return keys.empty(); }
 
@@ -202,29 +209,75 @@ struct Layer {
     // sampling the current transform value if the track doesn't exist yet.
     void KeyPosition(float t) {
         if (!positionTrack) positionTrack = PropertyTrack{};
+        positionTrack->enabled = true;
         positionTrack->SetKey(t, transform.position);
     }
     void KeyScale(float t) {
         if (!scaleTrack) scaleTrack = PropertyTrack{};
+        scaleTrack->enabled = true;
         scaleTrack->SetKey(t, transform.scale);
     }
     void KeyRotation(float t) {
         if (!rotationTrack) rotationTrack = PropertyTrack{};
+        rotationTrack->enabled = true;
         rotationTrack->SetKey(t, transform.rotation);
     }
     void KeyOpacity(float t) {
         if (!opacityTrack) opacityTrack = PropertyTrack{};
+        opacityTrack->enabled = true;
         opacityTrack->SetKey(t, Vec3(transform.opacity, 0, 0));
     }
+
+    // Task 5.0: AE-style stopwatch API. IsAnimated == "stopwatch is lit" ==
+    // "any change to this property auto-creates a keyframe at comp time t".
+    bool IsPositionAnimated() const { return positionTrack && positionTrack->enabled; }
+    bool IsScaleAnimated()    const { return scaleTrack    && scaleTrack->enabled; }
+    bool IsRotationAnimated() const { return rotationTrack && rotationTrack->enabled; }
+    bool IsOpacityAnimated()  const { return opacityTrack  && opacityTrack->enabled; }
+
+    // Toggle the stopwatch. Turning ON drops the first keyframe at t (so a
+    // one-click stopwatch already has one anchor). Turning OFF clears the
+    // track entirely, restoring pure static values.
+    void ToggleAnimatePosition(float t) {
+        if (IsPositionAnimated()) { positionTrack.reset(); }
+        else { KeyPosition(t); }
+    }
+    void ToggleAnimateScale(float t) {
+        if (IsScaleAnimated()) { scaleTrack.reset(); }
+        else { KeyScale(t); }
+    }
+    void ToggleAnimateRotation(float t) {
+        if (IsRotationAnimated()) { rotationTrack.reset(); }
+        else { KeyRotation(t); }
+    }
+    void ToggleAnimateOpacity(float t) {
+        if (IsOpacityAnimated()) { opacityTrack.reset(); }
+        else { KeyOpacity(t); }
+    }
+
+    // Auto-keying: call after a slider changes a property. If the stopwatch
+    // is lit, records a keyframe at the current comp time. If not, no-op.
+    void AutoKeyPositionIfEnabled(float t) { if (IsPositionAnimated()) positionTrack->SetKey(t, transform.position); }
+    void AutoKeyScaleIfEnabled   (float t) { if (IsScaleAnimated())    scaleTrack->SetKey   (t, transform.scale); }
+    void AutoKeyRotationIfEnabled(float t) { if (IsRotationAnimated()) rotationTrack->SetKey(t, transform.rotation); }
+    void AutoKeyOpacityIfEnabled (float t) { if (IsOpacityAnimated())  opacityTrack->SetKey (t, Vec3(transform.opacity, 0, 0)); }
 
     // Called by the render engine at the start of each frame to bake the
     // sampled track values into the live transform so the rest of the pipeline
     // (matrix build, gizmos, hit-test) sees a single consistent state.
     void SampleTracks(float compTime) {
-        if (positionTrack && !positionTrack->empty()) transform.position = positionTrack->Evaluate(compTime);
-        if (scaleTrack    && !scaleTrack->empty())    transform.scale    = scaleTrack->Evaluate(compTime);
-        if (rotationTrack && !rotationTrack->empty()) transform.rotation = rotationTrack->Evaluate(compTime);
-        if (opacityTrack  && !opacityTrack->empty()) {
+        // Only sample tracks whose stopwatch is on (enabled) AND that have at
+        // least one keyframe. Disabled tracks are ignored so the static
+        // transform value wins, even if old keys remain from a previous
+        // stopwatch-on session (defensive: shouldn't happen because the
+        // toggle-off path clears keys, but this makes the invariant explicit).
+        if (positionTrack && positionTrack->enabled && !positionTrack->empty())
+            transform.position = positionTrack->Evaluate(compTime);
+        if (scaleTrack    && scaleTrack->enabled    && !scaleTrack->empty())
+            transform.scale    = scaleTrack->Evaluate(compTime);
+        if (rotationTrack && rotationTrack->enabled && !rotationTrack->empty())
+            transform.rotation = rotationTrack->Evaluate(compTime);
+        if (opacityTrack  && opacityTrack->enabled  && !opacityTrack->empty()) {
             const Vec3 v = opacityTrack->Evaluate(compTime);
             transform.opacity = std::clamp(v.x, 0.0f, 1.0f);
         }
