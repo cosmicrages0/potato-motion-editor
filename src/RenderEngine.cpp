@@ -707,9 +707,14 @@ void RenderEngine::DrawTimelinePanel() {
             const Layer* parent = layerManager.GetLayerById(layer.parentId);
             const char* preview = parent ? parent->name.c_str() : "(none)";
             if (ImGui::BeginCombo("##parent", preview, ImGuiComboFlags_HeightSmall)) {
+                // Task 5.3-fix-2: use SetParentPreservingWorld so the child
+                // stays visually in place when parented/re-parented, matching
+                // AE and Alight Motion behavior. Raw SetParent (which causes
+                // the child to jump) stays available for future use.
+                const float ct = animEngine.currentTime;
                 if (ImGui::Selectable("(none)", layer.parentId == -1)) {
                     MarkForSnapshot();
-                    layerManager.SetParent(layer.id, -1);
+                    layerManager.SetParentPreservingWorld(layer.id, -1, ct);
                 }
                 for (const auto& candidate : L) {
                     if (candidate.id == layer.id) continue;
@@ -718,7 +723,7 @@ void RenderEngine::DrawTimelinePanel() {
                     const bool sel = (layer.parentId == candidate.id);
                     if (ImGui::Selectable(candidate.name.c_str(), sel, flags)) {
                         MarkForSnapshot();
-                        layerManager.SetParent(layer.id, candidate.id);
+                        layerManager.SetParentPreservingWorld(layer.id, candidate.id, ct);
                     }
                 }
                 ImGui::EndCombo();

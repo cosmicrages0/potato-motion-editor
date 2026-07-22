@@ -39,7 +39,25 @@ public:
     // Parent-child hierarchy. Returns false if the operation would create a
     // cycle (A->B->A) or if either id is unknown. Passing parentId = -1
     // detaches the child from any parent.
+    //
+    // SetParent (raw): just writes child.parentId. The child's authored values
+    // stay as-is, so its VISIBLE world position generally jumps because the
+    // new world matrix = new_parent_world * child_local. Kept for internal /
+    // future use (e.g. a "keep local values" modifier); most UI callers want
+    // SetParentPreservingWorld below.
     bool SetParent(int childId, int parentId);
+
+    // Task 5.3-fix-2: change parent while preserving the child's visible
+    // world transform (position + rotation + scale). Matches AE and Alight
+    // Motion behavior. Rewrites the child's authored position/rotation/scale
+    // so that new_parent_world * new_child_local == old_child_world.
+    //
+    // For 2D layers (is3D == false) the math is a full 2D affine decompose.
+    // For 3D layers (is3D == true) we currently fall through to the raw
+    // SetParent — TODO: 3D matrix decomposition when 3D re-enters focus.
+    //
+    // Returns false on the same conditions as SetParent (cycle, unknown id).
+    bool SetParentPreservingWorld(int childId, int parentId, float compTime);
 
     // Selection is stored as a stable id, not a vector index.
     void SetSelectedId(int id) { selectedLayerId = id; }

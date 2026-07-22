@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <unordered_set>
+#include <cmath>
 
 LayerManager::LayerManager() {
     layers.reserve(32);   // small headroom; growable
@@ -143,6 +144,146 @@ bool LayerManager::SetParent(int childId, int parentId) {
     Layer* child = GetLayerById(childId);
     if (!child) return false;
     child->parentId = parentId;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Task 5.3-fix-2: preserve-world-on-parent (matches AE + Alight Motion).
+//
+// Given: child currently has authored transform Tc and world Wc = P_old * Tc
+// (where P_old is the OLD parent's world matrix, or Identity if none).
+//
+// Goal: after changing parent to newParent (with world P_new, or Identity if
+// none), the child's VISIBLE world should still equal Wc. That means we need:
+//    P_new * Tc_new = Wc          (Wc is what the user sees right now)
+//    Tc_new = inverse(P_new) * Wc
+//
+// We then DECOMPOSE Tc_new (a 2D affine 3x3) into translate + rotate + scale
+// and write those into the child's AnimatedProperty<Vec3> fields.
+//
+// Standard 2D affine decomposition (no shear):
+//    M = [ a  b  tx ]
+//        [ c  d  ty ]
+//        [ 0  0   1 ]
+//    scaleX   = sign(a) * sqrt(a*a + c*c)      (sign preserves horizontal flip)
+//    scaleY   = sign(d) * sqrt(b*b + d*d)
+//    rotation = atan2(c/|scaleX|, a/|scaleX|)  (in radians; convert to degrees)
+//    translate = (tx, ty)
+//
+// Sign-preservation on scale keeps mirror flips intact.
+//
+// For 3D layers (is3D == true) we fall through to raw SetParent for now — 3D
+// TRS decomposition is more involved and 3D isn't the current focus. Marked
+// with a TODO comment inline.
+// -----------------------------------------------------------------------------
+bool LayerManager::SetParentPreservingWorld(int childId, int parentId, float compTime) {
+    if (IndexOfId(childId) < 0) return false;
+    if (parentId != -1 && IndexOfId(parentId) < 0) return false;
+    if (WouldCreateCycle(childId, parentId)) return false;
+
+    Layer* child = GetLayerById(childId);
+    if (!child) return false;
+
+    // 3D reparenting: not yet implemented — fall back to raw for correctness
+    // (child WILL jump, but at least the parent link updates cleanly).
+    // TODO: 3D preserve-world requires full 4x4 TRS decomposition.
+    if (child->is3D) {
+        child->parentId = parentId;
+        return true;
+    }
+
+    // Capture the child's CURRENT world matrix (with its animated values baked
+    // in) BEFORE we mutate anything. This is what we're preserving.
+    // Note: GetWorldMatrix uses this manager's currentCompTime, which the
+    // caller may not have updated for this frame yet. Pass compTime through
+    // via BeginFrame's cache-reset side effect if needed — but here we just
+    // trust that currentCompTime was set at BeginFrame this frame.
+    (void)compTime;   // reserved for future when we need to sample off-clock
+    const Mat3 oldChildWorld = GetWorldMatrix(childId);
+
+    // Update the parent link, then invalidate the per-frame caches so the
+    // next GetWorldMatrix call on any layer recomputes with the new parent.
+    child->parentId = parentId;
+    frameMatrixCache.clear();
+    frameMatrix4Cache.clear();
+    frameOpacityCache.clear();
+
+    // Compute the new parent's world matrix under the updated hierarchy.
+    // Identity when detaching to root.
+    const Mat3 newParentWorld = (parentId == -1)
+                                    ? Mat3::Identity()
+                                    : GetWorldMatrix(parentId);
+
+    // Solve for the child's new LOCAL matrix that preserves world:
+    //   newChildLocal = inverse(newParentWorld) * oldChildWorld
+    const Mat3 newChildLocal = newParentWorld.InverseAffine() * oldChildWorld;
+
+    // Layer::Transform::ToLocalMatrix builds:
+    //   M = T(pos) * R(rot.z) * S(scale) * T(-anchor*size)
+    //
+    // The T(-anchor*size) part is a POST-scale offset, so extracting position
+    // from newChildLocal's raw translate gives (position - R * S * anchor_offset).
+    // We need to reverse that offset to get the pure position component.
+    //
+    // In practice: sample the child's current anchorPoint + sizePixels at t,
+    // build the anchor offset, and add it back after decomposing.
+    const Vec2 anchor = child->transform.anchorPoint.Evaluate(compTime);
+    const Vec2 size   = child->transform.sizePixels .Evaluate(compTime);
+    const float ax = anchor.x * size.x;
+    const float ay = anchor.y * size.y;
+
+    // Decompose newChildLocal (row-major mat[row][col]).
+    const float a = newChildLocal.m[0][0];
+    const float b = newChildLocal.m[0][1];
+    const float tx = newChildLocal.m[0][2];
+    const float c = newChildLocal.m[1][0];
+    const float d = newChildLocal.m[1][1];
+    const float ty = newChildLocal.m[1][2];
+
+    // Scale, with sign preservation.
+    float sx = std::sqrt(a*a + c*c);
+    float sy = std::sqrt(b*b + d*d);
+    if (a < 0) sx = -sx;
+    if (d < 0) sy = -sy;
+
+    // Rotation in radians -> degrees. Handle sx == 0 defensively.
+    float rotZDeg = 0.0f;
+    if (std::fabs(sx) > 1e-6f) {
+        const float na = a / sx;
+        const float nc = c / sx;
+        rotZDeg = std::atan2(nc, na) * (180.0f / 3.14159265358979323846f);
+    }
+
+    // Now reverse the anchor-offset baked into (tx, ty). We need:
+    //   T(pos) * R * S * T(-anchor)
+    // whose translate component is:
+    //   pos - (R * S * (anchor_x, anchor_y))
+    // Rearranging:
+    //   pos = translate + R * S * anchor_offset
+    //
+    // Rebuild R * S from the decomposed values, apply to anchor offset,
+    // and add to translate.
+    Mat3 RS = Mat3::RotationDegrees(rotZDeg) * Mat3::Scale(sx, sy);
+    const float roax = RS.m[0][0] * ax + RS.m[0][1] * ay;
+    const float roay = RS.m[1][0] * ax + RS.m[1][1] * ay;
+    const float posX = tx + roax;
+    const float posY = ty + roay;
+
+    // Read the child's current Z so we don't zero it out (2D preserves only
+    // XY on position; Z stays authored).
+    const float posZ = child->transform.position.Evaluate(compTime).z;
+
+    // Write the decomposed values into the AnimatedProperty fields.
+    // SetValue routes to either a keyframe at compTime (if stopwatch on) or
+    // to staticValue (if stopwatch off) — either way the visible frame from
+    // this reparent onward matches the pre-reparent visible world.
+    child->transform.position.SetValue(compTime, Vec3(posX, posY, posZ));
+    // Rotation: preserve X/Y (2D uses only Z), just update Z.
+    const Vec3 rotCur = child->transform.rotation.Evaluate(compTime);
+    child->transform.rotation.SetValue(compTime, Vec3(rotCur.x, rotCur.y, rotZDeg));
+    // Scale: preserve Z (unused in 2D but keeps future 3D moves clean).
+    const Vec3 sclCur = child->transform.scale.Evaluate(compTime);
+    child->transform.scale.SetValue(compTime, Vec3(sx, sy, sclCur.z));
     return true;
 }
 
