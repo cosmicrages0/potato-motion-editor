@@ -237,6 +237,78 @@ None formally. But every day this document sits unanswered is a day the user isn
 
 ---
 
+## 9. Addendum: Real user test findings (added after commit `b818be1`)
+
+Between the original RFC and now, the user ran a 47-test checklist against the shipped build. Here's the ground truth so your proposal isn't answering the wrong questions.
+
+### 9.1 What ACTUALLY works end-to-end (verified by real testing, not by CI green)
+
+- Window maximize, dock layout, 5-panel view ✅
+- All shape-add buttons (Rect / Ellipse / Null; Camera hidden by default now) ✅
+- Layer selection, delete, parent dropdown with cycle-detection greyed-out ✅
+- Bounding box appears around selected 2D layer with 4 corner + 1 center handles ✅
+- Inspector tabs `[Transform] [Effect Controls] [Global]` don't overlap or leak ✅
+- **AE-style stopwatch keyframe workflow WORKS end-to-end** — user quote: *"animation is working no doubt, i can set keyframe and forward in timeline and then change the value the second key appears, it overall good for now"* ✅
+- Timeline strip scrub, keyframe diamonds display ✅
+- imgui.ini persistence across restarts ✅
+
+### 9.2 What LOOKED like it worked in code but DOESN'T on screen
+
+- **Effects visually apply to shapes** ⚠️ User quote: *"no effects gets apply on the shape i mean it shows the parameter even i changed, nothing is applied on shape"* — the Effect Controls panel accepts input, the [FX ON] HUD appears, but the actual shape pixels don't visibly change. Strongly suspect RTV/SRV aliasing: `EffectManager::ApplyChain(compSRV, compRTV, ...)` reads from `compSRV` while `compRTV` is the output; D3D will silently unbind the SRV when its underlying texture is bound as an RTV, so the chain reads from a null SRV and writes garbage / no-op back into compTexture. Needs an intermediate ping-pong texture or a defensive copy before the chain runs.
+
+- **Graph Editor is decorative** ⚠️ User quote: *"the animation is control by the graph editor the curve its feels like a showpiece"* — the Slingshot Bezier P1/P2 handles are draggable and the curve renders and the playhead moves along it, but no keyframe interpolation actually uses that curve. All `PropertyTrack::Evaluate` does linear interpolation. The graph editor is disconnected from every real animation.
+
+- **FFmpeg export** ⚠️ User has explicitly deprioritized this. Reads "encoder died". Almost certainly ffmpeg not in PATH. Test FFmpeg button was moved to top of Render Queue as "Step 1 (click me FIRST)" but user hasn't yet installed ffmpeg to verify the underlying pipe.
+
+### 9.3 What was actually broken in the code (root cause + user-visible symptom)
+
+Fixed in commits leading up to `b818be1`:
+- **Matrix transpose bug** in `CompositionRenderer::BuildShapeMVP`. HLSL float4x4 defaults to column-major storage; C++ was writing row-major. Result: dragging the position value moved the shape in the wrong direction while the CPU-drawn bounding box moved correctly. User's exact description: *"the shape is watching the box"*.
+- **Stopwatch ID collision** in ImGui. All four Transform-tab stopwatch buttons rendered with the same label (`"( )"` or `"(*)"`), so ImGui hashed them to the same ID, triggered debug assertion popup on hover, and could route clicks to the wrong track. Fixed in the same commit as this RFC update.
+- **Tooltip crash** — separate fix, replaced BeginTooltip/EndTooltip pair with SetTooltip single-call.
+
+### 9.4 Two specific hard problems the user wants outside help on
+
+**Problem A — RTV/SRV aliasing in the effect chain.**
+The current architecture:
+```
+CompositionRenderer::RenderLayers(compRTV, ...)    // fills compTexture
+effectManager.ApplyChain(compSRV, compRTV, ...)    // reads compSRV, writes compRTV
+```
+`compSRV` and `compRTV` are two views of the SAME `compTexture`. D3D11 will not let a resource be bound simultaneously as both an SRV and an RTV. The chain silently gets a null SRV in slot 0 for its first pass and produces a black or no-op output that overwrites `compTexture`. Ping-pong buffers exist inside `EffectManager` but they only ping-pong between EACH OTHER, not between the source and them.
+
+**Question A:** What's the cleanest fix that keeps the "1080p ping-pong" VRAM budget?
+Candidate approaches:
+- **A1:** Blit compTexture to `effectManager.ping_tex_` first, run chain from ping to compRTV
+- **A2:** Add a third "composite" texture on the RenderEngine side and always double-buffer
+- **A3:** Redesign the chain to always start reading from an internal texture and end writing to the caller's RTV
+
+Which do you recommend, given the "one comp render into a texture, then filter it in-place" flow that Task 5.0 committed to?
+
+**Problem B — Graph editor disconnected from real animation.**
+Right now `AnimationEngine::currentCurve` (the slingshot Bezier) drives NOTHING except the graph editor's own preview line. `PropertyTrack::Evaluate` does linear interp between keyframes.
+
+**Question B:** What's the minimum change to make the graph curve MEAN something without a huge rewrite? Options:
+- **B1:** Global default easing — treat `AnimationEngine::currentCurve` as the easing applied to EVERY keyframe segment. 1-hour change, not AE-accurate.
+- **B2:** Per-keyframe Bezier — every `Keyframe` stores its own `outHandle` and `inHandle` (like AE). Graph editor shows/edits the curve between the currently-selected keyframe and the next. ~1-day change, AE-accurate.
+- **B3:** Per-property default easing — each `PropertyTrack` stores one Bezier that applies to all its segments. Middle-ground.
+
+Which is the right first step and why?
+
+### 9.5 What the user is NOT asking
+
+Explicitly deprioritized:
+- Export polish (comes back after ffmpeg install verified)
+- 3D features (hidden in UI via View menu; user is "2D first")
+- Anything that requires a UI rewrite
+
+### 9.6 One-paragraph gut-check request
+
+The user is a solo dev, one long session in, has just discovered that visible fidelity on the canvas is the difference between "impressive tech demo" and "usable tool." They can author animation now (huge) but effects don't visibly render (bad) and the graph editor is a lie (medium). If your original RFC answer would change based on these test findings, please revise it. If not, please explicitly say your original answer stands.
+
+---
+
 *Repo: https://github.com/cosmicrages0/potato-motion-editor*
-*Latest commit at time of writing: `888d409` (Task 5.0-a: stopwatch keyframes + Test FFmpeg)*
+*Latest commit at time of writing: `b818be1` (Task 5.0-b, plus the ID-collision fix in the commit that adds this addendum)*
 *This RFC lives at `/RFC_FOR_EXTERNAL_LLMS.md` in the repo root.*
+*Section 9 addendum added after user's 47-test checklist run.*

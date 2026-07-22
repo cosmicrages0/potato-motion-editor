@@ -732,14 +732,20 @@ void RenderEngine::DrawInspectorPanel() {
         // Colors: lit ORANGE dot when the stopwatch is on; DIM gray when off.
         const float t = animEngine.currentTime;
         auto stopwatch = [&](const char* id, bool lit) {
-            (void)id; // reserved for future per-property styling
+            // Task 5.0-c: the 'id' parameter used to be discarded, so all four
+            // stopwatch buttons ended up with the same ImGui ID (derived from
+            // the visible label). ImGui debug mode caught this and printed a
+            // "4 visible items with conflicting ID!" popup on hover, and worse,
+            // clicking any stopwatch could target the wrong track.
+            //
+            // Build the label as "<glyph>##<id>" so the visible text is just
+            // the glyph but the ID hash includes the caller's unique id string.
+            char label[16];
+            std::snprintf(label, sizeof(label), "%s##%s", lit ? "(*)" : "( )", id);
             ImGui::PushStyleColor(ImGuiCol_Button,
                 lit ? IM_COL32(240, 130, 30, 255) : IM_COL32(60, 60, 70, 255));
-            const bool clicked = ImGui::Button(lit ? "(*)" : "( )", ImVec2(28, 0));
+            const bool clicked = ImGui::Button(label, ImVec2(28, 0));
             ImGui::PopStyleColor();
-            // Task 5.0-b: use SetTooltip (single call, safer) instead of the
-            // BeginTooltip/EndTooltip pair which asserted inside some ImGui
-            // contexts when combined with SameLine and a preceding PushStyleColor.
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%s", lit
                     ? "Stopwatch ON: value changes auto-key. Click to disable + clear."
@@ -749,19 +755,19 @@ void RenderEngine::DrawInspectorPanel() {
         };
 
         // POSITION
-        if (stopwatch("SW##pos", sel->IsPositionAnimated())) sel->ToggleAnimatePosition(t);
+        if (stopwatch("pos", sel->IsPositionAnimated())) sel->ToggleAnimatePosition(t);
         ImGui::SameLine();
         if (ImGui::DragFloat3("Position (x,y,z)", &sel->transform.position.x, 1.0f))
             sel->AutoKeyPositionIfEnabled(t);
 
         // ROTATION
-        if (stopwatch("SW##rot", sel->IsRotationAnimated())) sel->ToggleAnimateRotation(t);
+        if (stopwatch("rot", sel->IsRotationAnimated())) sel->ToggleAnimateRotation(t);
         ImGui::SameLine();
         if (ImGui::DragFloat3("Rotation (deg)",   &sel->transform.rotation.x, 0.5f))
             sel->AutoKeyRotationIfEnabled(t);
 
         // SCALE
-        if (stopwatch("SW##scl", sel->IsScaleAnimated())) sel->ToggleAnimateScale(t);
+        if (stopwatch("scl", sel->IsScaleAnimated())) sel->ToggleAnimateScale(t);
         ImGui::SameLine();
         if (ImGui::DragFloat3("Scale",            &sel->transform.scale.x,    0.01f, -10.0f, 10.0f))
             sel->AutoKeyScaleIfEnabled(t);
@@ -771,7 +777,7 @@ void RenderEngine::DrawInspectorPanel() {
         ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
 
         // OPACITY
-        if (stopwatch("SW##op", sel->IsOpacityAnimated())) sel->ToggleAnimateOpacity(t);
+        if (stopwatch("op", sel->IsOpacityAnimated())) sel->ToggleAnimateOpacity(t);
         ImGui::SameLine();
         if (ImGui::SliderFloat("Opacity", &sel->transform.opacity, 0.0f, 1.0f))
             sel->AutoKeyOpacityIfEnabled(t);
