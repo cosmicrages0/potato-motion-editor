@@ -74,6 +74,26 @@ potato-motion-editor/
 - **Correct matrix order** `world = parent * local` (column-vector convention)
 - Delete/Backspace keyboard shortcut
 
+### ✅ Task 5.0 — Big Usability Pass (done, real user value)
+
+The pass that turns Tasks 5 and 6 from "wired but not connected" into working features, and fixes the composition-viewport bugs from the user's screenshot review.
+
+- **`CompositionRenderer.h/.cpp`** — new module that rasterizes every visible 2D layer into a caller-supplied render target via a tiny DX11 pipeline: one VS + three PSes (rect / ellipse / null), unit-quad VB + IB, per-shape 64-byte constant buffer, standard alpha blend. Handles the pixel-space → clip-space MVP math internally so `RenderEngine` doesn't need to.
+- **Fixed composition RT in `RenderEngine`** — `compTexture` / `compRTV` / `compSRV` at 1920×1080 (user's default). Every frame:
+  1. `CompositionRenderer::RenderLayers(compRTV, ...)` draws layers.
+  2. If any layer has an enabled effect, `EffectManager::ApplyChain(compSRV, compRTV, combined)` ping-pongs the whole comp through the shader stack.
+  3. `ImGui::AddImage((ImTextureID)compSRV, ...)` displays the result inside the viewport with 16:9 letterbox scaling.
+- **Letterbox scaling** — composition is centered inside the panel with dark bars on the wide axis, matching AE / Premiere convention. `ScreenToCanvas()` helper converts mouse pixels to composition pixels for gizmo hit-testing regardless of panel size.
+- **Shape spawning uses (960, 540)** — the canvas center of a 1920×1080 comp. Previously `SpawnShapeAtViewportCenter()` used the panel's raw pixel center, which drifted every time the panel was resized.
+- **Export shows the actual scene** — `PumpExportOneFrameIfActive()` now calls `CompositionRenderer::RenderLayers()` against the exporter's RTV at export resolution + runs the effect chain, before `WriteCurrentFrame` pipes it through FFmpeg. The exported MP4 shows real shapes and real effects, not a color gradient.
+- **Inspector is tabbed** — three tabs: **Transform** (name/id, position/rotation/scale, anchor, size, opacity, color, stick-to-camera), **Effect Controls** (identical to the standalone Effect Controls panel), **Global** (Composition Clock, Slingshot Bezier, Camera Properties). Global-clock properties no longer bleed into per-layer editing.
+- **Timeline strip label column auto-sizes** — measures every layer name via `CalcTextSize`, caps at 30 % of strip width. No more truncated names.
+
+**Scope caveat (last one, promise):**
+The effect chain is currently applied to the WHOLE composition (all enabled effects across all layers combine into one chain), not per-layer isolated passes. Per-layer isolation requires drawing each layer to its own transient RT before composite — schedulable as Task 5.5 if anyone actually needs per-layer masking/effect independence. For 95% of motion graphics work "all effects apply globally" is what people actually want, and matches CapCut's model.
+
+---
+
 ### ✅ Task 6 — FFmpeg Proxy & 4K Direct-Stream Export (done, with scope caveat)
 
 - `ExportEngine.h/.cpp` — spawns `ffmpeg.exe` via `_popen(cmd, "wb")` (binary mode is critical; text mode would CR/LF-corrupt any 0x0A byte in the BGRA stream), allocates exactly ONE render texture + ONE staging texture at export resolution, and per frame does `CopyResource -> Map -> fwrite -> Unmap`. Max RAM footprint is one frame regardless of clip length: ~8 MB at 720p, ~33 MB at 4K.

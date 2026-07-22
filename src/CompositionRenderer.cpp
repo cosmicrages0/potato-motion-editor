@@ -1,0 +1,421 @@
+#include "CompositionRenderer.h"
+
+#include <iostream>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+
+// =============================================================================
+// HLSL. Kept inline (single-file per module rule from PROJECT_BRIEFING).
+// One VS reused across all shape types; separate PS per shape so ellipse/null
+// specific math (SDF, X marker) live where they belong.
+//
+// Constant buffer layout must match ShapeCB in the header EXACTLY.
+// =============================================================================
+
+static const char* kVSSrc = R"HLSL(
+cbuffer ShapeCB : register(b0) {
+    float4x4 mvp;
+    float4   color;
+    float4   params;
+};
+struct VSIn  { float2 pos : POSITION; float2 uv : TEXCOORD0; };
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
+
+VSOut main(VSIn i) {
+    VSOut o;
+    // pos is in unit-quad space (-0.5..+0.5). mvp scales / rotates / translates
+    // to clip space directly.
+    float4 world = mul(float4(i.pos, 0.0, 1.0), mvp);
+    o.pos = world;
+    o.uv = i.uv;
+    o.color = color;
+    return o;
+}
+)HLSL";
+
+static const char* kPSRectSrc = R"HLSL(
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
+float4 main(VSOut i) : SV_TARGET { return i.color; }
+)HLSL";
+
+static const char* kPSEllipseSrc = R"HLSL(
+// SDF ellipse: uv is [0,1]x[0,1] across the quad, so center is (0.5, 0.5).
+// discard everything outside the unit circle centered on that.
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
+float4 main(VSOut i) : SV_TARGET {
+    float2 d = i.uv - float2(0.5, 0.5);
+    // 4 * (x^2 + y^2) > 1 means outside the inscribed circle.
+    if (dot(d, d) * 4.0 > 1.0) discard;
+    return i.color;
+}
+)HLSL";
+
+static const char* kPSNullSrc = R"HLSL(
+// Null marker: draw an X inside the quad. UV is [0,1]. Keep bright and thin.
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
+float4 main(VSOut i) : SV_TARGET {
+    float2 uv = i.uv;
+    // Two diagonal bars ~2% thick, plus a subtle box outline.
+    float d1 = abs(uv.x - uv.y);
+    float d2 = abs(uv.x + uv.y - 1.0);
+    float bar = min(d1, d2);
+    if (bar > 0.03) {
+        // Box outline
+        float border = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+        if (border > 0.02) discard;
+    }
+    return float4(0.75, 0.75, 0.75, 1.0);
+}
+)HLSL";
+
+// Unit quad centered on origin, UVs 0..1 across the face.
+struct QVert { float x, y; float u, v; };
+static const QVert kQuadVerts[4] = {
+    { -0.5f, -0.5f, 0.0f, 0.0f },
+    {  0.5f, -0.5f, 1.0f, 0.0f },
+    {  0.5f,  0.5f, 1.0f, 1.0f },
+    { -0.5f,  0.5f, 0.0f, 1.0f },
+};
+static const unsigned short kQuadIndices[6] = { 0, 1, 2, 0, 2, 3 };
+
+// =============================================================================
+CompositionRenderer::CompositionRenderer() {}
+CompositionRenderer::~CompositionRenderer() { Shutdown(); }
+
+static ID3DBlob* CompileHLSL(const char* src, const char* entry, const char* profile) {
+    ID3DBlob* blob = nullptr;
+    ID3DBlob* err  = nullptr;
+    HRESULT hr = D3DCompile(src, std::strlen(src), entry, nullptr, nullptr,
+                            entry, profile,
+                            D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &err);
+    if (FAILED(hr)) {
+        if (err) {
+            std::cerr << "[CompositionRenderer] Compile failed (" << profile
+                      << "/" << entry << "): "
+                      << (const char*)err->GetBufferPointer() << std::endl;
+            err->Release();
+        }
+        if (blob) blob->Release();
+        return nullptr;
+    }
+    if (err) err->Release();
+    return blob;
+}
+
+bool CompositionRenderer::CreateShaders() {
+    // Vertex shader + input layout
+    ID3DBlob* vsBlob = CompileHLSL(kVSSrc, "main", "vs_4_0");
+    if (!vsBlob) return false;
+    HRESULT hr = device_->CreateVertexShader(vsBlob->GetBufferPointer(),
+                                             vsBlob->GetBufferSize(),
+                                             nullptr, &vs_);
+    if (FAILED(hr)) { vsBlob->Release(); return false; }
+
+    const D3D11_INPUT_ELEMENT_DESC ied[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    hr = device_->CreateInputLayout(ied, 2,
+                                    vsBlob->GetBufferPointer(),
+                                    vsBlob->GetBufferSize(),
+                                    &layout_);
+    vsBlob->Release();
+    if (FAILED(hr)) return false;
+
+    // Pixel shaders per shape family
+    auto makePS = [&](const char* src, ID3D11PixelShader** out) -> bool {
+        ID3DBlob* b = CompileHLSL(src, "main", "ps_4_0");
+        if (!b) return false;
+        HRESULT h = device_->CreatePixelShader(b->GetBufferPointer(),
+                                               b->GetBufferSize(),
+                                               nullptr, out);
+        b->Release();
+        return SUCCEEDED(h);
+    };
+    if (!makePS(kPSRectSrc,    &ps_rect_))    return false;
+    if (!makePS(kPSEllipseSrc, &ps_ellipse_)) return false;
+    if (!makePS(kPSNullSrc,    &ps_null_))    return false;
+    return true;
+}
+
+bool CompositionRenderer::CreateBuffers() {
+    // Constant buffer (dynamic, updated per shape)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth      = sizeof(ShapeCB);
+        bd.Usage          = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(device_->CreateBuffer(&bd, nullptr, &cb_shape_))) return false;
+    }
+    // Immutable quad VB
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = sizeof(kQuadVerts);
+        bd.Usage     = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = kQuadVerts;
+        if (FAILED(device_->CreateBuffer(&bd, &sd, &vb_quad_))) return false;
+    }
+    // Immutable quad IB
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = sizeof(kQuadIndices);
+        bd.Usage     = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = kQuadIndices;
+        if (FAILED(device_->CreateBuffer(&bd, &sd, &ib_quad_))) return false;
+    }
+    // Standard alpha blend
+    {
+        D3D11_BLEND_DESC bd = {};
+        bd.RenderTarget[0].BlendEnable    = TRUE;
+        bd.RenderTarget[0].SrcBlend       = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend      = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp        = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(device_->CreateBlendState(&bd, &blend_alpha_))) return false;
+    }
+    return true;
+}
+
+bool CompositionRenderer::Initialize(ID3D11Device* device, ID3D11DeviceContext* context) {
+    if (!device || !context) return false;
+    device_  = device;
+    context_ = context;
+    if (!CreateShaders()) return false;
+    if (!CreateBuffers()) return false;
+    initialized_ = true;
+    return true;
+}
+
+void CompositionRenderer::ReleaseAll() {
+    if (blend_alpha_) { blend_alpha_->Release(); blend_alpha_ = nullptr; }
+    if (ib_quad_)     { ib_quad_->Release();     ib_quad_     = nullptr; }
+    if (vb_quad_)     { vb_quad_->Release();     vb_quad_     = nullptr; }
+    if (cb_shape_)    { cb_shape_->Release();    cb_shape_    = nullptr; }
+    if (layout_)      { layout_->Release();      layout_      = nullptr; }
+    if (ps_null_)     { ps_null_->Release();     ps_null_     = nullptr; }
+    if (ps_ellipse_)  { ps_ellipse_->Release();  ps_ellipse_  = nullptr; }
+    if (ps_rect_)     { ps_rect_->Release();     ps_rect_     = nullptr; }
+    if (vs_)          { vs_->Release();          vs_          = nullptr; }
+}
+
+void CompositionRenderer::Shutdown() {
+    ReleaseAll();
+    device_ = nullptr;
+    context_ = nullptr;
+    initialized_ = false;
+}
+
+// -----------------------------------------------------------------------------
+// Build MVP for a shape:
+//   Layer world matrix is in COMPOSITION PIXEL coords (0..W, 0..H top-left).
+//   We need clip space (-1..+1, +1..-1 top-left).
+//
+// The unit quad is centered on origin sized 1x1, so we first scale by the
+// layer's size, then apply the layer's world matrix (which already includes
+// scale/rotate/translate + anchor offset done in Layer::ToLocalMatrix). Then
+// we convert composition pixels to NDC.
+// -----------------------------------------------------------------------------
+static void BuildShapeMVP(const Mat3& world, const Vec2& size,
+                          UINT targetW, UINT targetH, float outRow[16]) {
+    // We want: clip = P * world * S * quadVert
+    //   where S scales the unit quad from [-0.5, +0.5] to layer local (0..w, 0..h)
+    //   AND translates the origin (so the quad's origin sits at (w/2, h/2), matching
+    //   the layer's local top-left-at-origin convention).
+    //
+    // Local vertex v_local in [-0.5,+0.5]^2 -> layer-local (0..w, 0..h):
+    //     v = (v_local + 0.5) * size
+    //
+    // Then world matrix transforms to composition-pixel space:
+    //     v_comp = world * v
+    //
+    // Then map pixels to NDC:
+    //     ndc.x =  (v_comp.x / W) * 2 - 1
+    //     ndc.y = -(v_comp.y / H) * 2 + 1
+    //
+    // We fold all of this into a single 4x4. Because size, world, and the
+    // ortho projection all commute nicely (all affine 2D), we can just
+    // compute the full 3x3 transform in pixel space and then apply ortho.
+
+    // Step 1: quad -> layer local (scale + translate)
+    // Represented as a 3x3:
+    //   [sx  0  tx]     sx = size.x, tx = size.x * 0.5
+    //   [ 0 sy  ty]     sy = size.y, ty = size.y * 0.5
+    //   [ 0  0   1]
+    Mat3 quadToLocal;
+    quadToLocal.m[0][0] = size.x;  quadToLocal.m[0][2] = size.x * 0.5f;
+    quadToLocal.m[1][1] = size.y;  quadToLocal.m[1][2] = size.y * 0.5f;
+
+    // Step 2: layer local -> composition pixels
+    Mat3 quadToComp = world * quadToLocal;
+
+    // Step 3: composition pixels -> NDC (baked into row-major 4x4).
+    // For a vertex v = (x, y, 0, 1) in comp-pixel space:
+    //   ndc.x =  (a x + b y + c) * (2/W) - 1
+    //   ndc.y = -(d x + e y + f) * (2/H) + 1
+    // where (a,b,c) is row 0 of quadToComp and (d,e,f) is row 1.
+    const float invW = (targetW > 0) ? (2.0f / (float)targetW) : 0.0f;
+    const float invH = (targetH > 0) ? (2.0f / (float)targetH) : 0.0f;
+
+    const float a = quadToComp.m[0][0], b = quadToComp.m[0][1], c = quadToComp.m[0][2];
+    const float d = quadToComp.m[1][0], e = quadToComp.m[1][1], f = quadToComp.m[1][2];
+
+    // HLSL is mul(v, mvp) with row vectors in our VS => mvp is row-major
+    // and each output component is a row (rows are treated as columns of the
+    // transposed transform). Actually with mul(v, m) HLSL treats v as row and
+    // m as row-major, computing v * m. So m[i][j] is (row i, col j) and:
+    //   out.x = v.x*m[0][0] + v.y*m[1][0] + v.z*m[2][0] + v.w*m[3][0]
+    // We want: out.x =  a*v.x + b*v.y + 0*v.z + c*v.w, then scaled by invW - 1*v.w
+    //          = (a*invW)*v.x + (b*invW)*v.y + 0 + (c*invW - 1)*v.w
+    // So the first COLUMN (m[.][0]) is (a*invW, b*invW, 0, c*invW - 1).
+    //
+    // For out.y: -(d*v.x + e*v.y + f*v.w)*invH + v.w
+    //          = (-d*invH)*v.x + (-e*invH)*v.y + 0 + (-f*invH + 1)*v.w
+    // Column 1 is (-d*invH, -e*invH, 0, -f*invH + 1).
+    //
+    // out.z = 0 (we don't care about depth in 2D)
+    // out.w = 1 (passthrough)
+    float mvp[4][4] = {0};
+    // Column 0
+    mvp[0][0] =  a * invW;
+    mvp[1][0] =  b * invW;
+    mvp[3][0] =  c * invW - 1.0f;
+    // Column 1
+    mvp[0][1] = -d * invH;
+    mvp[1][1] = -e * invH;
+    mvp[3][1] = -f * invH + 1.0f;
+    // Column 2
+    mvp[2][2] = 1.0f;
+    // Column 3 (w passthrough)
+    mvp[3][3] = 1.0f;
+
+    // Flatten row-major for the CB upload.
+    for (int r = 0; r < 4; ++r)
+        for (int col = 0; col < 4; ++col)
+            outRow[r * 4 + col] = mvp[r][col];
+}
+
+static void UnpackABGRToRGBAf(unsigned int abgr, float out[4]) {
+    // IM_COL32 packs as (a<<24)|(b<<16)|(g<<8)|(r), matching D3D R8G8B8A8_UNORM
+    // byte order (R lowest). Our shader wants RGBA in 0..1.
+    out[0] = ((abgr >>  0) & 0xFF) / 255.0f;
+    out[1] = ((abgr >>  8) & 0xFF) / 255.0f;
+    out[2] = ((abgr >> 16) & 0xFF) / 255.0f;
+    out[3] = ((abgr >> 24) & 0xFF) / 255.0f;
+}
+
+void CompositionRenderer::DrawRect(const Mat3& world, const Vec2& size,
+                                   unsigned int color,
+                                   UINT targetW, UINT targetH) {
+    if (!context_ || !ps_rect_) return;
+    ShapeCB cb{};
+    BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
+    UnpackABGRToRGBAf(color, cb.color);
+    cb.params[0] = 0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        std::memcpy(ms.pData, &cb, sizeof(cb));
+        context_->Unmap(cb_shape_, 0);
+    }
+    context_->PSSetShader(ps_rect_, nullptr, 0);
+    context_->DrawIndexed(6, 0, 0);
+}
+
+void CompositionRenderer::DrawEllipse(const Mat3& world, const Vec2& size,
+                                      unsigned int color,
+                                      UINT targetW, UINT targetH) {
+    if (!context_ || !ps_ellipse_) return;
+    ShapeCB cb{};
+    BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
+    UnpackABGRToRGBAf(color, cb.color);
+    cb.params[0] = 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        std::memcpy(ms.pData, &cb, sizeof(cb));
+        context_->Unmap(cb_shape_, 0);
+    }
+    context_->PSSetShader(ps_ellipse_, nullptr, 0);
+    context_->DrawIndexed(6, 0, 0);
+}
+
+void CompositionRenderer::DrawNullMarker(const Mat3& world, const Vec2& size,
+                                         UINT targetW, UINT targetH) {
+    if (!context_ || !ps_null_) return;
+    ShapeCB cb{};
+    BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
+    cb.color[0] = cb.color[1] = cb.color[2] = 0.75f;
+    cb.color[3] = 1.0f;
+    cb.params[0] = 2.0f;
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        std::memcpy(ms.pData, &cb, sizeof(cb));
+        context_->Unmap(cb_shape_, 0);
+    }
+    context_->PSSetShader(ps_null_, nullptr, 0);
+    context_->DrawIndexed(6, 0, 0);
+}
+
+void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
+                                       UINT targetW, UINT targetH,
+                                       LayerManager& layerManager,
+                                       const float bgColor[4]) {
+    if (!initialized_ || !context_ || !targetRTV) return;
+    if (targetW == 0 || targetH == 0) return;
+
+    // Bind target + viewport + clear
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)targetW, (float)targetH, 0.0f, 1.0f };
+    context_->RSSetViewports(1, &vp);
+    context_->OMSetRenderTargets(1, &targetRTV, nullptr);
+    context_->ClearRenderTargetView(targetRTV, bgColor);
+
+    // Pipeline state (set once for all shapes)
+    const float blendFactor[4] = { 0, 0, 0, 0 };
+    context_->OMSetBlendState(blend_alpha_, blendFactor, 0xFFFFFFFF);
+    context_->IASetInputLayout(layout_);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const UINT stride = sizeof(QVert);
+    const UINT offset = 0;
+    context_->IASetVertexBuffers(0, 1, &vb_quad_, &stride, &offset);
+    context_->IASetIndexBuffer(ib_quad_, DXGI_FORMAT_R16_UINT, 0);
+    context_->VSSetShader(vs_, nullptr, 0);
+    context_->VSSetConstantBuffers(0, 1, &cb_shape_);
+    context_->PSSetConstantBuffers(0, 1, &cb_shape_);
+
+    // Draw every visible 2D layer in timeline order (later = on top).
+    // 3D layers, Camera, and Null are handled elsewhere (Null has its own
+    // draw here since it lives in 2D composition space).
+    for (auto& layer : layerManager.Layers()) {
+        if (!layer.isVisible) continue;
+        if (layer.is3D)       continue;
+        if (layer.type == ShapeType::Camera) continue;
+
+        const Mat3 wm = layerManager.GetWorldMatrix(layer.id);
+        const Vec2 sz = layer.transform.sizePixels;
+
+        // Bake per-layer opacity into the color's alpha channel.
+        const float layerOp = layerManager.GetWorldOpacity(layer.id);
+        unsigned int color = layer.fillColor;
+        unsigned int a = (color >> 24) & 0xFFu;
+        a = (unsigned int)std::clamp((int)((float)a * layerOp), 0, 255);
+        color = (color & 0x00FFFFFFu) | (a << 24);
+
+        switch (layer.type) {
+            case ShapeType::Rectangle:  DrawRect      (wm, sz, color, targetW, targetH); break;
+            case ShapeType::Ellipse:    DrawEllipse   (wm, sz, color, targetW, targetH); break;
+            case ShapeType::CustomPath: DrawEllipse   (wm, sz, color, targetW, targetH); break; // stub
+            case ShapeType::Null:       DrawNullMarker(wm, sz,        targetW, targetH); break;
+            case ShapeType::Camera:     break;
+        }
+    }
+}

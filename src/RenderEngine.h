@@ -23,6 +23,7 @@
 #include "EffectManager.h"
 #include "ExportEngine.h"
 #include "AlightXmlImporter.h"
+#include "CompositionRenderer.h"
 
 class RenderEngine {
 public:
@@ -92,12 +93,38 @@ private:
     EffectManager  effectManager;   // Task 5: HLSL shader stack owner
     ExportEngine   exportEngine;    // Task 6: FFmpeg direct-stream exporter
     AlightXmlImporter xmlImporter;  // Task 6: Alight Motion .xml curve parser
+    CompositionRenderer compRenderer; // Task 5.0: rasterizes layers to compRTV
+
+    // Task 5.0: fixed-size composition render target. Every 2D layer draws
+    // into this each frame; the ping-pong effect chain runs against it; the
+    // viewport panel displays it via ImGui::Image(); ExportEngine copies from
+    // it into its staging texture. Resolution is user-configurable at Comp
+    // Settings time (default 1920x1080 per user's Task 4.5 decision).
+    ID3D11Texture2D*          compTexture = nullptr;
+    ID3D11RenderTargetView*   compRTV     = nullptr;
+    ID3D11ShaderResourceView* compSRV     = nullptr;
+    UINT compTextureWidth  = 0;
+    UINT compTextureHeight = 0;
 
     // Task 6: Render Queue panel state (settings edited in UI live here)
     ExportEngine::Settings pendingExport;
     float                  pendingExportSeconds = 5.0f;
     bool                   showRenderQueue = false;
     bool                   showFfmpegMissingPopup = false;
+
+    // Task 5.0: viewport-panel geometry, updated each frame in DrawViewportCanvas.
+    // Used by gizmo hit-testing to convert screen pixels to composition pixels.
+    ImVec2 lastCanvasLetterboxOrigin = ImVec2(0, 0);
+    ImVec2 lastCanvasLetterboxSize   = ImVec2(1920, 1080);
+    // Cached per-frame effect flags so we can decide whether to run the chain
+    // (skipping it entirely is faster than running an empty chain).
+    bool   anyLayerHasEffects = false;
+
+    bool CreateCompositionRT(UINT width, UINT height);
+    void ReleaseCompositionRT();
+    // Convert a viewport-panel screen point to composition-canvas pixels
+    // (0..compWidth, 0..compHeight). Returns (0,0) if letterbox is degenerate.
+    Vec2 ScreenToCanvas(ImVec2 screen) const;
 
     // Task 5: composition resolution. Fixed centered canvas uses this in the
     // deferred Task 5.0 usability pass. For now it drives the size of the
