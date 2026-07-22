@@ -297,10 +297,17 @@ static void BuildShapeMVP(const Mat3& world, const Vec2& size,
     // Column 3 (w passthrough)
     mvp[3][3] = 1.0f;
 
-    // Flatten row-major for the CB upload.
+    // Flatten for the CB upload.
+    //
+    // BUG-FIX: HLSL float4x4 defaults to COLUMN-MAJOR storage. If we upload
+    // rows sequentially it would end up transposed inside the shader,
+    // producing a mirrored/rotated transform where dragging position moved
+    // the shape in the wrong direction (this was the "shape watches the
+    // bounding box move" bug in tests 3.2 / 5 / 10). We fix by writing the
+    // matrix TRANSPOSED to the buffer: element (r,c) goes to slot [c*4 + r].
     for (int r = 0; r < 4; ++r)
         for (int col = 0; col < 4; ++col)
-            outRow[r * 4 + col] = mvp[r][col];
+            outRow[col * 4 + r] = mvp[r][col];
 }
 
 static void UnpackABGRToRGBAf(unsigned int abgr, float out[4]) {

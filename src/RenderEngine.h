@@ -51,6 +51,7 @@ private:
     void DrawEffectControlsPanel(); // Task 5: active effects on selected layer
     void DrawRenderQueuePanel();    // Task 6: FFmpeg export UI
     void PumpExportOneFrameIfActive(); // Task 6: called each frame during export
+    void DrawDebugPanel();          // Task 5.0-b: live diagnostic overlay
     void DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                         float worldOpacity, ImVec2 canvasOrigin,
                         ImDrawList* drawList);
@@ -114,6 +115,14 @@ private:
     // Task 5.0: last "Test FFmpeg" result shown under the button.
     std::string            ffmpegTestResult;
     bool                   ffmpegTestOk = false;
+    // Task 5.0-b: 2D-first UX. 3D controls (Timeline [3D] column, Camera
+    // buttons, Camera Properties tab, orbit/pan HUD) stay in the binary but
+    // are hidden from the UI until the user opts in via View menu.
+    bool                   show3DFeatures = false;
+    // Task 5.0-b: dev diagnostic panel toggle. Shows live mouse-canvas coord,
+    // selected layer transform values, and drag state so the user can screenshot
+    // any weird behavior and I can debug from the numbers instead of guessing.
+    bool                   showDebugPanel = false;
 
     // Task 5.0: viewport-panel geometry, updated each frame in DrawViewportCanvas.
     // Used by gizmo hit-testing to convert screen pixels to composition pixels.

@@ -353,11 +353,19 @@ void RenderEngine::RenderAEDockingLayout() {
             if (ImGui::MenuItem("New Rectangle")) SpawnShapeAtViewportCenter(ShapeType::Rectangle);
             if (ImGui::MenuItem("New Ellipse"))   SpawnShapeAtViewportCenter(ShapeType::Ellipse);
             if (ImGui::MenuItem("New Null Object")) SpawnShapeAtViewportCenter(ShapeType::Null, "Null");
-            if (ImGui::MenuItem("New Camera"))    SpawnShapeAtViewportCenter(ShapeType::Camera,  "Camera");
+            if (show3DFeatures) {
+                if (ImGui::MenuItem("New Camera"))    SpawnShapeAtViewportCenter(ShapeType::Camera,  "Camera");
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Delete Selected", "Del")) {
                 if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
             }
+            ImGui::EndMenu();
+        }
+        // Task 5.0-b: View menu with 2D/3D visibility toggle + debug panel.
+        if (ImGui::BeginMenu("View")) {
+            ImGui::MenuItem("Show 3D Features", nullptr, &show3DFeatures);
+            ImGui::MenuItem("Show Debug Panel", nullptr, &showDebugPanel);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Composition")) {
@@ -415,6 +423,14 @@ void RenderEngine::RenderAEDockingLayout() {
     if (showRenderQueue) {
         DrawRenderQueuePanel();
     }
+
+    // Task 5.0-b: Debug diagnostic panel. Off by default; toggled via
+    // View -> Show Debug Panel. Prints live mouse-canvas coords, selected
+    // layer transform values, and drag state so the user can screenshot any
+    // odd behavior and the maintainer can debug from the numbers.
+    if (showDebugPanel) {
+        DrawDebugPanel();
+    }
 }
 
 // =============================================================================
@@ -440,14 +456,25 @@ void RenderEngine::DrawTimelinePanel() {
     if (ImGui::Button("+ Ellipse")) SpawnShapeAtViewportCenter(ShapeType::Ellipse);
     ImGui::SameLine();
     if (ImGui::Button("+ Null"))    SpawnShapeAtViewportCenter(ShapeType::Null,   "Null");
-    ImGui::SameLine();
-    if (ImGui::Button("+ Camera"))  SpawnShapeAtViewportCenter(ShapeType::Camera, "Camera");
+    if (show3DFeatures) {
+        ImGui::SameLine();
+        if (ImGui::Button("+ Camera"))  SpawnShapeAtViewportCenter(ShapeType::Camera, "Camera");
+    }
     ImGui::SameLine();
     if (ImGui::Button("Delete Selected")) {
         if (layerManager.GetSelectedId() != -1) layerManager.DeleteLayerById(layerManager.GetSelectedId());
     }
     ImGui::SameLine();
     ImGui::Checkbox("Slingshot -> Selected Scale", &applySlingshotToSelected);
+
+    // Task 5.0-b: composition duration is now editable directly from the
+    // timeline panel (was previously buried in the Global tab). Users hit
+    // the end of the strip almost immediately at the 1-second default and
+    // couldn't extend it.
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::SliderFloat("Duration (s)##tl", &animEngine.duration, 0.5f, 60.0f, "%.2f s");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(scrub playhead or drag it below)");
 
     ImGui::Separator();
 
@@ -456,10 +483,15 @@ void RenderEngine::DrawTimelinePanel() {
 
     ImGui::Separator();
 
-    if (ImGui::BeginTable("LayerTable", 5,
+    // Task 5.0-b: 3D column only appears when 3D features are enabled.
+    const int  colCount = show3DFeatures ? 5 : 4;
+    const int  nameCol  = show3DFeatures ? 2 : 1;
+    const int  typeCol  = show3DFeatures ? 3 : 2;
+    const int  parentCol= show3DFeatures ? 4 : 3;
+    if (ImGui::BeginTable("LayerTable", colCount,
         ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("Vis", ImGuiTableColumnFlags_WidthFixed, 32.0f);
-        ImGui::TableSetupColumn("3D",  ImGuiTableColumnFlags_WidthFixed, 28.0f);
+        if (show3DFeatures) ImGui::TableSetupColumn("3D",  ImGuiTableColumnFlags_WidthFixed, 28.0f);
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableSetupColumn("Parent", ImGuiTableColumnFlags_WidthFixed, 110.0f);
@@ -475,12 +507,14 @@ void RenderEngine::DrawTimelinePanel() {
             ImGui::TableSetColumnIndex(0);
             ImGui::Checkbox("##vis", &layer.isVisible);
 
-            // 3D toggle (reserved; visible now so users see the roadmap)
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Checkbox("##3d", &layer.is3D);
+            // 3D toggle (only when 3D features enabled)
+            if (show3DFeatures) {
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Checkbox("##3d", &layer.is3D);
+            }
 
             // Selectable name (with [fx] badge if the layer has any enabled effects)
-            ImGui::TableSetColumnIndex(2);
+            ImGui::TableSetColumnIndex(nameCol);
             const bool isSelected = (layer.id == layerManager.GetSelectedId());
             char label[160];
             const bool fx = layer.HasAnyEnabledEffect();
@@ -492,7 +526,7 @@ void RenderEngine::DrawTimelinePanel() {
             }
 
             // Type (read-only column)
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(typeCol);
             const char* typeName = "Rect";
             switch (layer.type) {
                 case ShapeType::Rectangle:  typeName = "Rectangle"; break;
@@ -504,7 +538,7 @@ void RenderEngine::DrawTimelinePanel() {
             ImGui::TextUnformatted(typeName);
 
             // Parent dropdown
-            ImGui::TableSetColumnIndex(4);
+            ImGui::TableSetColumnIndex(parentCol);
             const Layer* parent = layerManager.GetLayerById(layer.parentId);
             const char* preview = parent ? parent->name.c_str() : "(none)";
             if (ImGui::BeginCombo("##parent", preview, ImGuiComboFlags_HeightSmall)) {
@@ -698,16 +732,18 @@ void RenderEngine::DrawInspectorPanel() {
         // Colors: lit ORANGE dot when the stopwatch is on; DIM gray when off.
         const float t = animEngine.currentTime;
         auto stopwatch = [&](const char* id, bool lit) {
+            (void)id; // reserved for future per-property styling
             ImGui::PushStyleColor(ImGuiCol_Button,
                 lit ? IM_COL32(240, 130, 30, 255) : IM_COL32(60, 60, 70, 255));
             const bool clicked = ImGui::Button(lit ? "(*)" : "( )", ImVec2(28, 0));
             ImGui::PopStyleColor();
+            // Task 5.0-b: use SetTooltip (single call, safer) instead of the
+            // BeginTooltip/EndTooltip pair which asserted inside some ImGui
+            // contexts when combined with SameLine and a preceding PushStyleColor.
             if (ImGui::IsItemHovered()) {
-                ImGui::BeginTooltip();
-                ImGui::TextUnformatted(lit
+                ImGui::SetTooltip("%s", lit
                     ? "Stopwatch ON: value changes auto-key. Click to disable + clear."
                     : "Stopwatch OFF: property is static. Click to enable keyframing.");
-                ImGui::EndTooltip();
             }
             return clicked;
         };
@@ -795,7 +831,7 @@ void RenderEngine::DrawInspectorPanel() {
         ImGui::SameLine();
         if (ImGui::Button("Reset")) animEngine.Reset();
         ImGui::Checkbox("Loop", &animEngine.isLooping);
-        ImGui::SliderFloat("Duration (s)", &animEngine.duration, 0.1f, 5.0f);
+        ImGui::SliderFloat("Duration (s)", &animEngine.duration, 0.1f, 60.0f);
         ImGui::Value("Time (s)", animEngine.currentTime);
     }
 
@@ -806,11 +842,11 @@ void RenderEngine::DrawInspectorPanel() {
     }
 
     // -----------------------------------------------------------------------
-    // Camera Properties (Task 4). Shown when the selected layer is the Camera,
-    // or unconditionally at the bottom so users can always tweak the view.
+    // Camera Properties (Task 4). Only shown when View -> Show 3D Features
+    // is enabled (2D-first UX as of Task 5.0-b).
     // -----------------------------------------------------------------------
     const bool cameraSelected = (sel->type == ShapeType::Camera);
-    if (ImGui::CollapsingHeader(cameraSelected ? "Camera Properties (Active)" : "Camera Properties",
+    if (show3DFeatures && ImGui::CollapsingHeader(cameraSelected ? "Camera Properties (Active)" : "Camera Properties",
                                 cameraSelected ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
         const int camLayerId = layerManager.FindActiveCameraLayerId();
         if (camLayerId >= 0) {
@@ -1335,25 +1371,39 @@ void RenderEngine::DrawViewportCanvas() {
     // -------------------------------------------------------------------
     // 7) Camera navigation (orbit/pan/zoom). Uses the letterbox rect so
     //    RMB/MMB drags only fire when the mouse is inside the composition.
+    //    Task 5.0-b: 2D-first UX; camera controls only run when 3D is on.
     // -------------------------------------------------------------------
-    HandleCameraControls(lbOrigin, lbSize);
+    if (show3DFeatures) {
+        HandleCameraControls(lbOrigin, lbSize);
+    }
 
     // -------------------------------------------------------------------
     // 8) HUD overlay (top-left of the panel, above the letterbox).
+    //    Task 5.0-b: minimal HUD in 2D-first mode; full 3D HUD only when
+    //    3D features are enabled.
     // -------------------------------------------------------------------
-    const int camLayer = layerManager.FindActiveCameraLayerId();
     char hud[192];
-    std::snprintf(hud, sizeof(hud),
-        "Canvas %u x %u   FOV=%.1f   Cam=(%.0f, %.0f, %.0f)%s%s",
-        compTextureWidth, compTextureHeight,
-        camera.fov, camera.position.x, camera.position.y, camera.position.z,
-        (camLayer >= 0) ? "  (from Camera layer)" : "",
-        anyLayerHasEffects ? "  [FX ON]" : "");
-    draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 4),
-        IM_COL32(200, 220, 255, 255), hud);
-    draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 20),
-        IM_COL32(160, 160, 170, 255),
-        "RMB: Orbit   MMB: Pan   Wheel: Zoom");
+    if (show3DFeatures) {
+        const int camLayer = layerManager.FindActiveCameraLayerId();
+        std::snprintf(hud, sizeof(hud),
+            "Canvas %u x %u   FOV=%.1f   Cam=(%.0f, %.0f, %.0f)%s%s",
+            compTextureWidth, compTextureHeight,
+            camera.fov, camera.position.x, camera.position.y, camera.position.z,
+            (camLayer >= 0) ? "  (from Camera layer)" : "",
+            anyLayerHasEffects ? "  [FX ON]" : "");
+        draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 4),
+            IM_COL32(200, 220, 255, 255), hud);
+        draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 20),
+            IM_COL32(160, 160, 170, 255),
+            "RMB: Orbit   MMB: Pan   Wheel: Zoom");
+    } else {
+        std::snprintf(hud, sizeof(hud),
+            "Canvas %u x %u%s",
+            compTextureWidth, compTextureHeight,
+            anyLayerHasEffects ? "   [FX ON]" : "");
+        draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 4),
+            IM_COL32(200, 220, 255, 255), hud);
+    }
 }
 
 // =============================================================================
@@ -1624,9 +1674,7 @@ void RenderEngine::DrawEffectsPalettePanel() {
             sel->AddEffect(factory());
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(desc);
-            ImGui::EndTooltip();
+            ImGui::SetTooltip("%s", desc);
         }
         ImGui::PopID();
     };
@@ -1856,6 +1904,34 @@ void RenderEngine::DrawRenderQueuePanel() {
         }
     } else {
         // Idle mode — full settings UI.
+        // Task 5.0-b: put the FFmpeg diagnostic block AT THE TOP so users
+        // discover it before hitting Start Export and getting a cryptic
+        // "encoder died" pipe error.
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+            "Step 1: Verify FFmpeg is installed and reachable.");
+        if (ImGui::Button("Test FFmpeg (click me FIRST)", ImVec2(-1, 28))) {
+            ffmpegTestOk = ExportEngine::TestFfmpegBinary(pendingExport.ffmpegPath,
+                                                          ffmpegTestResult);
+        }
+        if (!ffmpegTestResult.empty()) {
+            const ImVec4 col = ffmpegTestOk ? ImVec4(0.4f, 1.0f, 0.6f, 1.0f)
+                                            : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+            ImGui::TextColored(col, ffmpegTestOk ? "OK:" : "Problem:");
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", ffmpegTestResult.c_str());
+            if (!ffmpegTestOk) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+                    "Get ffmpeg.exe from https://ffmpeg.org/download.html "
+                    "(pick a Windows build). Extract it, then either add it "
+                    "to your system PATH, or paste the full path (e.g. "
+                    "C:\\\\ffmpeg\\\\bin\\\\ffmpeg.exe) into the FFmpeg path "
+                    "field below and hit Test again.");
+            }
+        }
+        ImGui::Separator();
+
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
+            "Step 2: Configure the export.");
         // Preset dropdown
         static const char* kPresets[] = { "720p HD (1280x720)",
                                           "1080p Full HD (1920x1080)",
@@ -1902,25 +1978,8 @@ void RenderEngine::DrawRenderQueuePanel() {
             pendingExport.ffmpegPath = ffmpegBuf;
         }
 
-        // Task 5.0: one-click FFmpeg diagnostic. Runs `<ffmpegPath> -version`
-        // and shows what came back. Green = ffmpeg found. Red = install it or
-        // fix the path field above.
-        if (ImGui::Button("Test FFmpeg")) {
-            ffmpegTestOk = ExportEngine::TestFfmpegBinary(pendingExport.ffmpegPath,
-                                                          ffmpegTestResult);
-        }
-        if (!ffmpegTestResult.empty()) {
-            const ImVec4 col = ffmpegTestOk ? ImVec4(0.4f, 1.0f, 0.6f, 1.0f)
-                                            : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-            ImGui::TextColored(col, ffmpegTestOk ? "FFmpeg OK:" : "FFmpeg problem:");
-            ImGui::TextWrapped("%s", ffmpegTestResult.c_str());
-            if (!ffmpegTestOk) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
-                    "Get ffmpeg.exe from https://ffmpeg.org/download.html "
-                    "(Windows builds). Place it in your PATH or set the full "
-                    "path in the field above (e.g. C:\\\\ffmpeg\\\\bin\\\\ffmpeg.exe).");
-            }
-        }
+        // Task 5.0-b: the Test FFmpeg block moved to the TOP of the panel
+        // (see Step 1). This spot used to duplicate it.
 
         ImGui::Separator();
 
@@ -1965,6 +2024,91 @@ void RenderEngine::DrawRenderQueuePanel() {
 // purpose (see ExportEngine.h header comment for why) but is cheap enough
 // that the ImGui UI keeps ticking between frames.
 // -----------------------------------------------------------------------------
+// =============================================================================
+// Debug diagnostic panel (Task 5.0-b)
+//
+// Prints every value that would need to be inspected to diagnose a "shape
+// doesn't move / gizmo is off / transform is weird" bug. Meant to be
+// screenshot-able so remote debugging works even when the user can't share
+// their PC. Off by default; toggled via View -> Show Debug Panel.
+// =============================================================================
+void RenderEngine::DrawDebugPanel() {
+    ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Debug", &showDebugPanel)) { ImGui::End(); return; }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const Vec2   canvasMouse = ScreenToCanvas(mouse);
+
+    ImGui::TextDisabled("--- Viewport geometry ---");
+    ImGui::Text("Panel size: (%.0f x %.0f)", lastViewportSize.x, lastViewportSize.y);
+    ImGui::Text("Letterbox origin: (%.1f, %.1f)",
+                lastCanvasLetterboxOrigin.x, lastCanvasLetterboxOrigin.y);
+    ImGui::Text("Letterbox size:   (%.1f x %.1f)",
+                lastCanvasLetterboxSize.x, lastCanvasLetterboxSize.y);
+    ImGui::Text("Comp texture:     (%u x %u)", compTextureWidth, compTextureHeight);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("--- Mouse ---");
+    ImGui::Text("Screen: (%.1f, %.1f)", mouse.x, mouse.y);
+    ImGui::Text("Canvas: (%.1f, %.1f)", canvasMouse.x, canvasMouse.y);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("--- Comp clock ---");
+    ImGui::Text("Time: %.3f s   Duration: %.3f s   %s%s",
+                animEngine.currentTime, animEngine.duration,
+                animEngine.isPlaying ? "PLAYING" : "PAUSED",
+                animEngine.isLooping ? "  LOOP" : "");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("--- Selected layer ---");
+    Layer* sel = layerManager.GetSelectedLayer();
+    if (!sel) {
+        ImGui::TextDisabled("(none)");
+    } else {
+        ImGui::Text("id=%d  parent=%d  '%s'", sel->id, sel->parentId, sel->name.c_str());
+        ImGui::Text("Position:  (%.2f, %.2f, %.2f)",
+                    sel->transform.position.x, sel->transform.position.y, sel->transform.position.z);
+        ImGui::Text("Rotation:  (%.2f, %.2f, %.2f)",
+                    sel->transform.rotation.x, sel->transform.rotation.y, sel->transform.rotation.z);
+        ImGui::Text("Scale:     (%.3f, %.3f, %.3f)",
+                    sel->transform.scale.x, sel->transform.scale.y, sel->transform.scale.z);
+        ImGui::Text("Anchor:    (%.2f, %.2f)   Size: (%.0f, %.0f)",
+                    sel->transform.anchorPoint.x, sel->transform.anchorPoint.y,
+                    sel->transform.sizePixels.x, sel->transform.sizePixels.y);
+        ImGui::Text("Opacity:   %.3f", sel->transform.opacity);
+        ImGui::Text("Stopwatches: pos=%d  rot=%d  scl=%d  op=%d",
+                    (int)sel->IsPositionAnimated(),
+                    (int)sel->IsRotationAnimated(),
+                    (int)sel->IsScaleAnimated(),
+                    (int)sel->IsOpacityAnimated());
+        ImGui::Text("Effects: %zu  (%d enabled)",
+                    sel->effects.size(),
+                    (int)std::count_if(sel->effects.begin(), sel->effects.end(),
+                                       [](const Effect& e){ return e.enabled; }));
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("--- Gizmo drag state ---");
+    const char* modeName = "None";
+    switch (activeGizmo) {
+        case GizmoMode::None:    modeName = "None"; break;
+        case GizmoMode::Move:    modeName = "Move"; break;
+        case GizmoMode::ScaleNW: modeName = "ScaleNW"; break;
+        case GizmoMode::ScaleNE: modeName = "ScaleNE"; break;
+        case GizmoMode::ScaleSW: modeName = "ScaleSW"; break;
+        case GizmoMode::ScaleSE: modeName = "ScaleSE"; break;
+    }
+    ImGui::Text("Active: %s   Drag layer id: %d", modeName, dragLayerId);
+    ImGui::Text("Drag start mouse (canvas): (%.1f, %.1f)",
+                dragStartMouseLocal.x, dragStartMouseLocal.y);
+    ImGui::Text("Drag start position:       (%.2f, %.2f)",
+                dragStartPosition.x, dragStartPosition.y);
+    ImGui::Text("Drag start scale:          (%.3f, %.3f, %.3f)",
+                dragStartScale.x, dragStartScale.y, dragStartScale.z);
+
+    ImGui::End();
+}
+
 void RenderEngine::PumpExportOneFrameIfActive() {
     if (!context) return;
     const auto& st = exportEngine.GetStatus();
