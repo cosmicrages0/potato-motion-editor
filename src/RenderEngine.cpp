@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
+
+// Task 5.2: save/load
+#include "Serialization.h"
 
 // =============================================================================
 // Lifecycle
@@ -278,7 +282,64 @@ void RenderEngine::BeginFrame() {
 // =============================================================================
 // Docking layout + main menu
 // =============================================================================
-void RenderEngine::RenderUI() { RenderAEDockingLayout(); }
+void RenderEngine::RenderUI() {
+    // Task 5.2: global keyboard shortcuts. Checked once per frame before any
+    // panel gets to consume the keypress. WantTextInput guard means Ctrl+S
+    // while typing in a text field falls through to the field's own binding
+    // (which is what the user expects).
+    const ImGuiIO& io = ImGui::GetIO();
+    if (!io.WantTextInput && io.KeyCtrl) {
+        // Ctrl+S = Save (or Save As if no path yet); Ctrl+Shift+S = Save As
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+            std::string p = (io.KeyShift || lastSavePath.empty())
+                                ? OpenSaveFileDialog("scene.pmge", true)
+                                : lastSavePath;
+            if (!p.empty()) {
+                AppState st{ &layerManager, &camera, &animEngine,
+                             compositionWidth, compositionHeight,
+                             (int)cameraStyle, show3DFeatures };
+                std::string err;
+                if (SaveProject(st, p, &err)) {
+                    lastSavePath = p;
+                    SetStatus("Saved: " + p, false);
+                } else {
+                    SetStatus("Save failed: " + err, true);
+                }
+            }
+        }
+        // Ctrl+O = Open
+        if (ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+            const std::string p = OpenSaveFileDialog("scene.pmge", false);
+            if (!p.empty()) {
+                AppState st{ &layerManager, &camera, &animEngine,
+                             compositionWidth, compositionHeight,
+                             (int)cameraStyle, show3DFeatures };
+                std::string err;
+                if (LoadProject(st, p, &err)) {
+                    compositionWidth  = st.compositionWidth;
+                    compositionHeight = st.compositionHeight;
+                    cameraStyle       = (st.cameraStyleInt == 1)
+                                            ? CameraStyle::AlightMotion
+                                            : CameraStyle::AfterEffects;
+                    show3DFeatures    = st.show3DFeatures;
+                    if (compTextureWidth != (UINT)compositionWidth ||
+                        compTextureHeight != (UINT)compositionHeight) {
+                        ReleaseCompositionRT();
+                        CreateCompositionRT((UINT)compositionWidth,
+                                            (UINT)compositionHeight);
+                        effectManager.Resize((UINT)compositionWidth,
+                                             (UINT)compositionHeight);
+                    }
+                    lastSavePath = p;
+                    SetStatus("Loaded: " + p, false);
+                } else {
+                    SetStatus("Load failed: " + err, true);
+                }
+            }
+        }
+    }
+    RenderAEDockingLayout();
+}
 
 void RenderEngine::RenderAEDockingLayout() {
     static ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_None;
@@ -327,9 +388,70 @@ void RenderEngine::RenderAEDockingLayout() {
 
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            ImGui::MenuItem("New Composition");
-            ImGui::MenuItem("Open...");
-            ImGui::MenuItem("Save");
+            ImGui::MenuItem("New Composition");   // still a stub; wired in a later commit
+            if (ImGui::MenuItem("Open...", "Ctrl+O")) {
+                const std::string p = OpenSaveFileDialog("scene.pmge", false);
+                if (!p.empty()) {
+                    AppState st{ &layerManager, &camera, &animEngine,
+                                 compositionWidth, compositionHeight,
+                                 (int)cameraStyle, show3DFeatures };
+                    std::string err;
+                    if (LoadProject(st, p, &err)) {
+                        // Apply the loaded scalar members back to RenderEngine.
+                        compositionWidth  = st.compositionWidth;
+                        compositionHeight = st.compositionHeight;
+                        cameraStyle       = (st.cameraStyleInt == 1)
+                                                ? CameraStyle::AlightMotion
+                                                : CameraStyle::AfterEffects;
+                        show3DFeatures    = st.show3DFeatures;
+                        // Resize the composition RT if the loaded comp size differs.
+                        if (compTextureWidth != (UINT)compositionWidth ||
+                            compTextureHeight != (UINT)compositionHeight) {
+                            ReleaseCompositionRT();
+                            CreateCompositionRT((UINT)compositionWidth,
+                                                (UINT)compositionHeight);
+                            effectManager.Resize((UINT)compositionWidth,
+                                                 (UINT)compositionHeight);
+                        }
+                        lastSavePath = p;
+                        SetStatus("Loaded: " + p, false);
+                    } else {
+                        SetStatus("Load failed: " + err, true);
+                    }
+                }
+            }
+            const bool haveSavePath = !lastSavePath.empty();
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, haveSavePath || true)) {
+                std::string p = lastSavePath;
+                if (p.empty()) p = OpenSaveFileDialog("scene.pmge", true);
+                if (!p.empty()) {
+                    AppState st{ &layerManager, &camera, &animEngine,
+                                 compositionWidth, compositionHeight,
+                                 (int)cameraStyle, show3DFeatures };
+                    std::string err;
+                    if (SaveProject(st, p, &err)) {
+                        lastSavePath = p;
+                        SetStatus("Saved: " + p, false);
+                    } else {
+                        SetStatus("Save failed: " + err, true);
+                    }
+                }
+            }
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) {
+                const std::string p = OpenSaveFileDialog("scene.pmge", true);
+                if (!p.empty()) {
+                    AppState st{ &layerManager, &camera, &animEngine,
+                                 compositionWidth, compositionHeight,
+                                 (int)cameraStyle, show3DFeatures };
+                    std::string err;
+                    if (SaveProject(st, p, &err)) {
+                        lastSavePath = p;
+                        SetStatus("Saved: " + p, false);
+                    } else {
+                        SetStatus("Save failed: " + err, true);
+                    }
+                }
+            }
             ImGui::Separator();
             // Task 6: Alight Motion XML curve import. Reads the FIRST curve's
             // (p1, p2) segment and drops it into the global slingshot Bezier
@@ -341,8 +463,11 @@ void RenderEngine::RenderAEDockingLayout() {
                     animEngine.currentCurve.P2 = keys[0].p2;
                     std::cerr << "[Import] Loaded " << keys.size()
                               << " keys from import.xml" << std::endl;
+                    SetStatus("Imported " + std::to_string(keys.size()) +
+                              " keyframes from import.xml", false);
                 } else {
                     std::cerr << "[Import] " << xmlImporter.LastError() << std::endl;
+                    SetStatus("Import failed: " + xmlImporter.LastError(), true);
                 }
             }
             ImGui::EndMenu();
@@ -1453,6 +1578,30 @@ void RenderEngine::DrawViewportCanvas() {
         draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 4),
             IM_COL32(200, 220, 255, 255), hud);
     }
+
+    // Task 5.2: status banner (Save/Load feedback). Bottom-center of the
+    // viewport panel; auto-expires. Red on error, green on success.
+    if (!statusMessage.empty()) {
+        const Uint64 freq = SDL_GetPerformanceFrequency();
+        const Uint64 now  = SDL_GetPerformanceCounter();
+        const float  nowSec = (freq > 0) ? (float)((double)now / (double)freq) : 0.0f;
+        if (nowSec < statusMessageExpiresAt) {
+            const ImU32 col = statusIsError
+                ? IM_COL32(255, 90, 90, 240)
+                : IM_COL32(90, 255, 130, 240);
+            const ImVec2 sz = ImGui::CalcTextSize(statusMessage.c_str());
+            const float pad = 8.0f;
+            const ImVec2 bgTL(panelOrigin.x + (panelSize.x - sz.x) * 0.5f - pad,
+                              panelOrigin.y + panelSize.y - sz.y - 3.0f * pad);
+            const ImVec2 bgBR(bgTL.x + sz.x + 2.0f * pad,
+                              bgTL.y + sz.y + 2.0f * pad);
+            draw_list->AddRectFilled(bgTL, bgBR, IM_COL32(20, 20, 30, 220), 4.0f);
+            draw_list->AddText(ImVec2(bgTL.x + pad, bgTL.y + pad),
+                               col, statusMessage.c_str());
+        } else {
+            statusMessage.clear();
+        }
+    }
 }
 
 // =============================================================================
@@ -2359,6 +2508,67 @@ Vec2 RenderEngine::ScreenToCanvas(ImVec2 screen) const {
     const float v = (screen.y - lastCanvasLetterboxOrigin.y) / lastCanvasLetterboxSize.y;
     return Vec2(u * (float)compTextureWidth,
                 v * (float)compTextureHeight);
+}
+
+// =============================================================================
+// Task 5.2: Win32 file dialog wrapper + status banner
+// =============================================================================
+//
+// Uses classic Windows GetOpenFileNameA / GetSaveFileNameA from <commdlg.h>
+// (linked via Comdlg32.lib in CMake). Feels native, zero new dependency, no
+// COM initialization required. Filter string uses the classic double-null-
+// terminated format: "Description\0*.ext\0". Returned path is empty on cancel.
+//
+// Native Windows dialogs pop up MODAL — they block the app's message loop
+// until the user picks or cancels. For a save/open workflow that's what users
+// expect, so we don't attempt any async trickery here.
+#include <commdlg.h>
+
+std::string RenderEngine::OpenSaveFileDialog(const char* defaultName, bool save) {
+    char buffer[MAX_PATH] = {0};
+    if (defaultName && *defaultName) {
+        std::snprintf(buffer, sizeof(buffer), "%s", defaultName);
+    }
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = hwnd;
+    ofn.lpstrFilter = "Potato Motion Editor project (*.pmge)\0*.pmge\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile   = buffer;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrDefExt = "pmge";
+    ofn.Flags       = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST |
+                      (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+
+    const BOOL ok = save ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn);
+    if (!ok) return std::string{};   // user cancelled or error
+    return std::string(buffer);
+}
+
+void RenderEngine::SetStatus(const std::string& msg, bool isError, float durationSeconds) {
+    statusMessage = msg;
+    statusIsError = isError;
+    // Use SDL performance counter for a wall-clock-independent timer.
+    const Uint64 freq = SDL_GetPerformanceFrequency();
+    const Uint64 now  = SDL_GetPerformanceCounter();
+    const float  nowSec = (freq > 0) ? (float)((double)now / (double)freq) : 0.0f;
+    statusMessageExpiresAt = nowSec + durationSeconds;
+    // Also log to console so failures aren't invisible if the banner scrolls off.
+    std::cerr << "[Status] " << msg << std::endl;
+
+    // Task 5.2: keep the window title in sync with the currently-open file.
+    // Extract the leaf filename from lastSavePath for a cleaner title.
+    if (window) {
+        std::string title = "Potato Motion Graphics Editor - x64";
+        if (!lastSavePath.empty()) {
+            const size_t slash = lastSavePath.find_last_of("\\/");
+            const std::string leaf = (slash == std::string::npos)
+                                         ? lastSavePath
+                                         : lastSavePath.substr(slash + 1);
+            title += " - " + leaf;
+        }
+        SDL_SetWindowTitle(window, title.c_str());
+    }
 }
 
 void RenderEngine::Shutdown() {

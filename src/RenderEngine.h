@@ -112,6 +112,16 @@ private:
     float                  pendingExportSeconds = 5.0f;
     bool                   showRenderQueue = false;
     bool                   showFfmpegMissingPopup = false;
+
+    // Task 5.2: save/load state.
+    std::string            lastSavePath;                  // "" until first save/load
+    std::string            statusMessage;                 // shown at bottom of viewport
+    float                  statusMessageExpiresAt = 0.0f; // seconds (comp-clock-independent)
+    bool                   statusIsError = false;
+    // Wrap a Win32 OPENFILENAMEA into a portable helper. Empty return = cancel.
+    // filterDesc example: "Potato Motion Editor (*.pmge)\0*.pmge\0" (double NUL terminator).
+    std::string OpenSaveFileDialog(const char* defaultName, bool save);
+    void SetStatus(const std::string& msg, bool isError = false, float durationSeconds = 4.0f);
     // Task 5.0: last "Test FFmpeg" result shown under the button.
     std::string            ffmpegTestResult;
     bool                   ffmpegTestOk = false;

@@ -7,6 +7,19 @@ LayerManager::LayerManager() {
     layers.reserve(32);   // small headroom; growable
 }
 
+// Task 5.2: wipe everything back to empty state. LoadProject calls this
+// before deserializing so nothing from the previous session leaks through.
+void LayerManager::Clear() {
+    layers.clear();
+    idToIndex.clear();
+    frameMatrixCache.clear();
+    frameMatrix4Cache.clear();
+    frameOpacityCache.clear();
+    nextId = 1;
+    selectedLayerId = -1;
+    currentCompTime = 0.0f;
+}
+
 void LayerManager::RebuildIndex() {
     idToIndex.clear();
     idToIndex.reserve(layers.size() * 2);

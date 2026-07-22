@@ -27,6 +27,15 @@ public:
     int  AddLayer(ShapeType type, const std::string& nameHint = "");
     bool DeleteLayerById(int id);
 
+    // Task 5.2: wipe all layers and reset id counter / selection. Called by
+    // LoadProject before deserializing a saved file so the loaded scene
+    // doesn't collide with whatever was in memory.
+    void Clear();
+
+    // Task 5.2: called by LoadProject to bump nextId past any restored ids.
+    void SetNextId(int nextId) { this->nextId = nextId; }
+    int  GetNextId() const     { return this->nextId; }
+
     // Parent-child hierarchy. Returns false if the operation would create a
     // cycle (A->B->A) or if either id is unknown. Passing parentId = -1
     // detaches the child from any parent.

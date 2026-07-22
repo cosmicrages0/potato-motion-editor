@@ -22,16 +22,29 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
+# Task 5.2: JSON for save/load. Header-only, INTERFACE target -- only adds
+# an include path, no linker cost. #included ONLY in src/Serialization.cpp
+# so template instantiation bloat stays isolated to that one translation
+# unit (~120KB with /GL /LTCG per external LLM analysis).
+FetchContent_Declare(
+    json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+FetchContent_MakeAvailable(json)
+
 file(GLOB_RECURSE SOURCES "src/*.cpp" "src/*.h")
 
 add_executable(${PROJECT_NAME} WIN32 ${SOURCES})
 
-target_link_libraries(${PROJECT_NAME} PRIVATE 
+target_link_libraries(${PROJECT_NAME} PRIVATE
     SDL2::SDL2main
-    SDL2::SDL2 
-    d3d11 
-    dxgi 
+    SDL2::SDL2
+    d3d11
+    dxgi
     d3dcompiler
+    Comdlg32               # Task 5.2: Win32 GetOpenFileName/GetSaveFileName
+    nlohmann_json::nlohmann_json
 )
 
 target_sources(${PROJECT_NAME} PRIVATE
