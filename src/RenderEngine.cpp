@@ -800,6 +800,10 @@ void RenderEngine::DrawTimelineStrip() {
 
     // Per-layer rows with keyframe diamonds
     const int selectedId = layerManager.GetSelectedId();
+    // Task 5.3-fix: precompute playhead X once so per-diamond render code can
+    // highlight keys that are near the playhead.
+    const float playheadX = TimeToX(animEngine.currentTime);
+    constexpr float kNearPlayheadPixels = 10.0f;
     for (size_t i = 0; i < layers.size(); ++i) {
         const Layer& layer = layers[i];
         const float rowY0 = origin.y + rulerH + rowH * (float)i;
@@ -846,14 +850,28 @@ void RenderEngine::DrawTimelineStrip() {
                      (contextDiamond.layerId == layer.id &&
                       (int)contextDiamond.which == (int)which &&
                       contextDiamond.keyIndex == (int)ki));
-                dl->AddConvexPolyFilled(tri, 4, isTarget ? IM_COL32(255,255,255,255) : col);
+                // Task 5.3-fix: also highlight when the playhead is within
+                // ~10px. Combined with the scrub-snap below, this makes it
+                // obvious which key you'd be editing if you scrubbed to here.
+                const bool nearPlayhead = std::fabs(p.x - playheadX) < kNearPlayheadPixels;
+                ImU32 diamondCol = col;
+                if (isTarget)          diamondCol = IM_COL32(255, 255, 255, 255);
+                else if (nearPlayhead) diamondCol = IM_COL32(255, 220, 100, 255);   // warm yellow-glow
+                dl->AddConvexPolyFilled(tri, 4, diamondCol);
+                if (nearPlayhead) {
+                    // Small halo ring around the near-playhead diamond so it
+                    // stands out even against a busy row.
+                    dl->AddCircle(p, r + 3.0f, IM_COL32(255, 220, 100, 180), 12, 1.2f);
+                }
 
                 // Hit-test: 6px square around the diamond center.
                 if (std::fabs(mp.x - p.x) <= r + 1.0f &&
                     std::fabs(mp.y - p.y) <= r + 1.0f) {
-                    // Left-click begins a drag.
+                    // Left-click begins a drag. Task 5.3-fix: snapshot BEFORE
+                    // the drag starts so Ctrl+Z rewinds to the pre-drag time.
                     if (!diamondDragActive &&
                         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                        MarkForSnapshot();
                         diamondDragActive = true;
                         draggedDiamond.layerId  = layer.id;
                         draggedDiamond.which    = which;
@@ -943,33 +961,56 @@ void RenderEngine::DrawTimelineStrip() {
             case DiamondProperty::Opacity:  moveKey(dl_layer->transform.opacity);  break;
             }
         } else {
-            // Mouse released -> end drag and record undo.
-            MarkForSnapshot();
+            // Mouse released -> end drag. No snapshot here — we already
+            // snapshotted BEFORE the drag started (see IsMouseClicked block
+            // above), so Ctrl+Z rewinds to the pre-drag keyframe time.
             diamondDragActive = false;
             draggedDiamond.clear();
         }
     }
 
     // Playhead
-    const float phX = TimeToX(animEngine.currentTime);
-    dl->AddLine(ImVec2(phX, origin.y),
-                ImVec2(phX, origin.y + totalH),
+    // playheadX already computed at the top of this function.
+    dl->AddLine(ImVec2(playheadX, origin.y),
+                ImVec2(playheadX, origin.y + totalH),
                 IM_COL32(255, 60, 60, 255), 2.0f);
     dl->AddTriangleFilled(
-        ImVec2(phX - 5.0f, origin.y),
-        ImVec2(phX + 5.0f, origin.y),
-        ImVec2(phX,        origin.y + 8.0f),
+        ImVec2(playheadX - 5.0f, origin.y),
+        ImVec2(playheadX + 5.0f, origin.y),
+        ImVec2(playheadX,        origin.y + 8.0f),
         IM_COL32(255, 60, 60, 255));
 
     // Interaction: click / drag anywhere in the strip below the ruler to
     // scrub. Suppressed while a keyframe diamond is being dragged so the
     // two interactions don't fight over the same mouse events.
+    //
+    // Task 5.3-fix: playhead SNAPS to nearby keyframes on scrub. When the
+    // mouse is within 8px of any diamond's X, the playhead's time snaps to
+    // that diamond's exact time. Makes it easy to land ON a keyframe when
+    // editing rather than at some arbitrary time next to it.
     ImGui::SetCursorScreenPos(origin);
     ImGui::InvisibleButton("TimelineStripHit", ImVec2(stripW, totalH));
     if (!diamondDragActive && ImGui::IsItemActive()) {
         const ImVec2 mp2 = ImGui::GetIO().MousePos;
         if (mp2.x >= trackX0 && mp2.x <= trackX1) {
-            animEngine.currentTime = XToTime(mp2.x);
+            float snappedTime = XToTime(mp2.x);
+            constexpr float kSnapPixels = 8.0f;
+            float bestDx = kSnapPixels + 1.0f;
+            // Scan all keyframes across all visible layers for a close match.
+            for (const auto& L : layerManager.Layers()) {
+                if (!L.isVisible) continue;
+                auto scan = [&](const auto& prop) {
+                    for (const auto& k : prop.keyframes) {
+                        const float dx = std::fabs(TimeToX(k.time) - mp2.x);
+                        if (dx < bestDx) { bestDx = dx; snappedTime = k.time; }
+                    }
+                };
+                scan(L.transform.position);
+                scan(L.transform.rotation);
+                scan(L.transform.scale);
+                scan(L.transform.opacity);
+            }
+            animEngine.currentTime = snappedTime;
             animEngine.isPlaying   = false; // scrubbing pauses playback
         }
     }
@@ -1043,11 +1084,12 @@ void RenderEngine::DrawInspectorPanel() {
         // the user sees on screen — killing the "field says 423 but I
         // typed 500" confusion of the previous architecture.
 
-        // Task 5.3: every stopwatch toggle and every completed slider drag
-        // records an undo snapshot. Live drag mutations DO NOT snapshot per
-        // frame (that would fill the stack with 60 identical-ish states);
-        // instead we call MarkForSnapshot on IsItemDeactivatedAfterEdit,
-        // which fires exactly once when the slider is released.
+        // Task 5.3-fix: snapshot when the slider is ACTIVATED (first click),
+        // not when it's deactivated. Snapshotting after-edit recorded the
+        // post-edit state so the first Ctrl+Z looked like a no-op ("nothing
+        // changed") and the user had to press it twice. IsItemActivated
+        // fires the single frame the widget goes from inactive to active,
+        // which is when the "before" state is still intact.
 
         // POSITION (Vec3)
         if (stopwatch("pos", sel->transform.position.HasStopwatch())) {
@@ -1058,7 +1100,7 @@ void RenderEngine::DrawInspectorPanel() {
         Vec3 pos = sel->transform.position.Evaluate(t);
         if (ImGui::DragFloat3("Position (x,y,z)", &pos.x, 1.0f))
             sel->transform.position.SetValue(t, pos);
-        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // ROTATION (Vec3, degrees)
         if (stopwatch("rot", sel->transform.rotation.HasStopwatch())) {
@@ -1069,7 +1111,7 @@ void RenderEngine::DrawInspectorPanel() {
         Vec3 rot = sel->transform.rotation.Evaluate(t);
         if (ImGui::DragFloat3("Rotation (deg)", &rot.x, 0.5f))
             sel->transform.rotation.SetValue(t, rot);
-        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // SCALE (Vec3)
         if (stopwatch("scl", sel->transform.scale.HasStopwatch())) {
@@ -1080,19 +1122,19 @@ void RenderEngine::DrawInspectorPanel() {
         Vec3 scl = sel->transform.scale.Evaluate(t);
         if (ImGui::DragFloat3("Scale", &scl.x, 0.01f, -10.0f, 10.0f))
             sel->transform.scale.SetValue(t, scl);
-        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // ANCHOR (Vec2) — animatable but no stopwatch UI for it in Task 5.1
         Vec2 anchor = sel->transform.anchorPoint.Evaluate(t);
         if (ImGui::DragFloat2("Anchor (0..1)", &anchor.x, 0.01f, 0.0f, 1.0f))
             sel->transform.anchorPoint.SetValue(t, anchor);
-        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // SIZE (Vec2)
         Vec2 size = sel->transform.sizePixels.Evaluate(t);
         if (ImGui::DragFloat2("Size (px)", &size.x, 1.0f, 1.0f, 4096.0f))
             sel->transform.sizePixels.SetValue(t, size);
-        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
         ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
 
         // OPACITY (float)
@@ -1104,7 +1146,7 @@ void RenderEngine::DrawInspectorPanel() {
         float op = sel->transform.opacity.Evaluate(t);
         if (ImGui::SliderFloat("Opacity", &op, 0.0f, 1.0f))
             sel->transform.opacity.SetValue(t, op);
-        if (ImGui::IsItemDeactivatedAfterEdit()) MarkForSnapshot();
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // Task 5.0: help hint so users don't need to guess the workflow.
         ImGui::TextDisabled("To animate: click the stopwatch, move the playhead,");
@@ -1388,6 +1430,12 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
             }
         }
         if (mode != GizmoMode::None) {
+            // Task 5.3-fix: snapshot BEFORE the drag starts so Ctrl+Z jumps
+            // back to the pre-drag state on the first press. Snapshotting
+            // AFTER the drag ended (previous behavior) recorded the same
+            // state Ctrl+Z would target, making the first Ctrl+Z look like
+            // a no-op and requiring two presses to visibly rewind.
+            MarkForSnapshot();
             activeGizmo         = mode;
             dragLayerId         = layer.id;
             dragStartMouseLocal = mouseCanvas;
@@ -1438,11 +1486,9 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
         }
     }
 
-    // End drag on release
+    // End drag on release. Task 5.3-fix: no snapshot here — we already
+    // snapshotted BEFORE the drag started, so Ctrl+Z rewinds to pre-drag.
     if (activeGizmo != GizmoMode::None && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        // Task 5.3: one snapshot per drag (mouse-up), NOT one per frame during
-        // the drag. Coalescing via MarkForSnapshot ensures this.
-        MarkForSnapshot();
         activeGizmo = GizmoMode::None;
         dragLayerId = -1;
     }
