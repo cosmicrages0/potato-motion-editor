@@ -1324,7 +1324,7 @@ void RenderEngine::DrawInspectorPanel() {
                 // AE-native mapping: influence % = (1 - handle.x) * 100 for
                 // each side; speed left at zero for a classic ease shape.
                 // Users can then drag handles in the graph to add overshoot
-                // via non-zero speed. This is the same recipe F9 Easy Ease
+                // via non-zero speed. This is the same recipe AE's Easy Ease
                 // uses (speed=0, influence=33.33%) just parameterized from
                 // the demo curve's P1/P2 handles.
                 const Vec2 p1 = animEngine.currentCurve.P1;
@@ -2914,22 +2914,31 @@ void RenderEngine::DrawGraphEditor() {
         dl->AddText(ImVec2(x - 14, g_max.y + 3), IM_COL32(140, 140, 140, 255), buf);
     }
 
-    // Mode / axis label at top-left.
-    dl->AddText(ImVec2(canvas_p0.x + 4, canvas_p0.y + 2),
-        (graphMode == GraphMode::Value) ? IM_COL32(180, 220, 255, 255)
-                                        : IM_COL32(255, 200, 120, 255),
-        (graphMode == GraphMode::Value) ? "value" : "speed (u/s)");
-    // Dim legend in value mode.
+    // Mode / axis label — parked at the top-right INSIDE the plot area so it
+    // never collides with the leftmost Y-axis numeric label (Task 5.4-fix-2).
+    {
+        const char* modeLbl = (graphMode == GraphMode::Value) ? "value" : "speed (u/s)";
+        const ImU32 modeCol = (graphMode == GraphMode::Value)
+                                ? IM_COL32(180, 220, 255, 255)
+                                : IM_COL32(255, 200, 120, 255);
+        const ImVec2 lblSz = ImGui::CalcTextSize(modeLbl);
+        dl->AddText(ImVec2(g_max.x - lblSz.x - 4.0f, g_min.y + 2.0f),
+                    modeCol, modeLbl);
+    }
+    // Dim legend in value mode — kept at top-left area BUT below the axis
+    // label row (y offset bumped so the color swatches don't stack with the
+    // Y-axis numbers that sit at y - 7 relative to each grid line).
     if (graphMode == GraphMode::Value && nDims > 1) {
-        float lx = canvas_p0.x + 44.0f;
+        float lx = g_min.x + 4.0f;   // just inside the plot's left edge
+        const float ly = g_min.y + 2.0f;
         for (int d = 0; d < nDims; ++d) {
             const bool isFocus = (d == graphFocusDim);
             const ImU32 col = dimColor[d];
-            dl->AddRectFilled(ImVec2(lx, canvas_p0.y + 3),
-                              ImVec2(lx + 10, canvas_p0.y + 13), col);
+            dl->AddRectFilled(ImVec2(lx, ly + 1),
+                              ImVec2(lx + 10, ly + 11), col);
             char buf[8];
             std::snprintf(buf, sizeof(buf), "%s%s", dimName[d], isFocus ? "*" : " ");
-            dl->AddText(ImVec2(lx + 13, canvas_p0.y + 2), col, buf);
+            dl->AddText(ImVec2(lx + 13, ly), col, buf);
             lx += 32.0f;
         }
     }
@@ -2973,11 +2982,80 @@ void RenderEngine::DrawGraphEditor() {
     }
 
     // ---------------------------- key dots + handles -------------------------
-    // Track handle screen positions on the FOCUSED dim of the selected key so
-    // drag hit-testing works.
+    // Task 5.4-fix-2: handles work in BOTH Value and Speed modes now.
+    // Handle Y in Value mode = key.value + speed * dt * inf/100.
+    // Handle Y in Speed mode = |speed| (per-dim scalar magnitude).
+    // Handle X (both modes) = key.time +/- dt * inf/100.
     ImVec2 selKeyPos(0, 0), selInHandlePos(0, 0), selOutHandlePos(0, 0);
     bool   selHasInHandle = false, selHasOutHandle = false;
-    const bool interactive = (graphMode == GraphMode::Value);
+    // Both modes are interactive now — the mode gate is gone.
+    const bool interactive = true;
+
+    // Auto-expand accumulator (see Task 5.4-fix-2 design section 2). We
+    // gather any selected-key handle Y positions in yData-space so we can
+    // widen yMin/yMax BEFORE final coord mapping. Because Y bounds have
+    // already been computed above, we track "widening" here and apply a
+    // one-shot rescale before drawing anything Y-sensitive.
+    // Implementation: we redraw key dots + handles with the CURRENT yMin/yMax,
+    // AND simultaneously accumulate expansion. If expansion happened, we
+    // simply recompute those positions with the widened range. The graph
+    // curves themselves were already drawn with the old range — that's ok
+    // for one frame; the next frame the sample-based bounds will include
+    // the new handle Y and everything self-corrects.
+    // Cheaper single-pass approach: peek at the selected key's handle Y
+    // BEFORE we draw anything, expand, then draw. We do that below.
+
+    // Peek: if there's a selected key with any Bezier side, compute handle Y
+    // in the current mode and widen bounds before drawing.
+    if (graphSelectedKeyIndex >= 0 && graphSelectedKeyIndex < nKeys) {
+        const int  i    = graphSelectedKeyIndex;
+        for (int d = 0; d < nDims; ++d) {
+            const auto& acc = accs[d];
+            const int outMode = acc.readOutMode(acc.prop, i);
+            const int inMode  = acc.readInMode (acc.prop, i);
+            const float kt = acc.readTime (acc.prop, i);
+            const float kv = acc.readValue(acc.prop, i);
+            auto expand = [&](float y) {
+                if (y < yMin) yMin = y;
+                if (y > yMax) yMax = y;
+            };
+            const bool outBez = (outMode == (int)InterpMode::Bezier ||
+                                 outMode == (int)InterpMode::ContinuousBezier ||
+                                 outMode == (int)InterpMode::AutoBezier);
+            if (outBez && i + 1 < nKeys) {
+                const float dtSeg = acc.readTime(acc.prop, i + 1) - kt;
+                const float inf   = std::clamp(acc.readOutInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
+                const float spd   = acc.readOutSpeed(acc.prop, i);
+                float hy = (graphMode == GraphMode::Speed) ? std::fabs(spd)
+                                                           : (kv + spd * (dtSeg * inf));
+                expand(hy);
+            }
+            const bool inBez  = (inMode == (int)InterpMode::Bezier ||
+                                 inMode == (int)InterpMode::ContinuousBezier ||
+                                 inMode == (int)InterpMode::AutoBezier);
+            if (inBez && i > 0) {
+                const float dtSeg = kt - acc.readTime(acc.prop, i - 1);
+                const float inf   = std::clamp(acc.readInInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
+                const float spd   = acc.readInSpeed(acc.prop, i);
+                float hy = (graphMode == GraphMode::Speed) ? std::fabs(spd)
+                                                           : (kv - spd * (dtSeg * inf));
+                expand(hy);
+            }
+            // In Speed mode, one iteration is enough — handles map to the
+            // scalar the user is editing on the focused dim.
+            if (graphMode == GraphMode::Speed) break;
+        }
+        // Re-pad after expansion so handles never touch the panel edge.
+        const float pad2 = (yMax - yMin) * 0.1f + 1e-3f;
+        yMin -= pad2 * 0.5f;
+        yMax += pad2 * 0.5f;
+    }
+
+    // NB: because Y bounds changed after we drew the value/speed curves above,
+    // those curves may look slightly compressed for ONE frame after a handle
+    // pushes the bounds. Next frame the sample loop sees the new bounds and
+    // everything is consistent. This is intentional — avoids a two-pass
+    // sample loop just to handle the rare expansion case.
 
     for (int i = 0; i < nKeys; ++i) {
         for (int d = 0; d < nDims; ++d) {
@@ -2994,7 +3072,6 @@ void RenderEngine::DrawGraphEditor() {
                     if (sampleTime[s] >= kt) { sv = spdSamples[s]; break; }
                 }
                 kp = ToScreen(kt, sv);
-                // Only draw one dot per key in speed mode; break after d=0.
             }
 
             const bool isSel      = (i == graphSelectedKeyIndex);
@@ -3029,10 +3106,8 @@ void RenderEngine::DrawGraphEditor() {
                 selKeyPos = kp;
             }
 
-            // Handles: only on selected key AND on the FOCUSED dim (Value mode).
+            // Handles: on the selected key's focused dim, in BOTH modes.
             if (interactive && isSel && isFocusDim) {
-                // Outgoing handle: shown if outgoing side is any Bezier variant
-                // AND there's a next key (nowhere for the handle to go otherwise).
                 const bool outBez = (outMode == (int)InterpMode::Bezier ||
                                      outMode == (int)InterpMode::ContinuousBezier ||
                                      outMode == (int)InterpMode::AutoBezier);
@@ -3042,7 +3117,9 @@ void RenderEngine::DrawGraphEditor() {
                     const float inf   = std::clamp(acc.readOutInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
                     const float spd   = acc.readOutSpeed(acc.prop, i);
                     const float ht    = kt + dtSeg * inf;
-                    const float hv    = kv + spd * (dtSeg * inf);
+                    const float hv    = (graphMode == GraphMode::Speed)
+                                          ? std::fabs(spd)
+                                          : (kv + spd * (dtSeg * inf));
                     const ImVec2 hp   = ToScreen(ht, hv);
                     const ImU32 hcol  = (outMode == (int)InterpMode::AutoBezier)
                                         ? IM_COL32(180, 180, 180, 160)
@@ -3060,7 +3137,9 @@ void RenderEngine::DrawGraphEditor() {
                     const float inf   = std::clamp(acc.readInInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
                     const float spd   = acc.readInSpeed(acc.prop, i);
                     const float ht    = kt - dtSeg * inf;
-                    const float hv    = kv - spd * (dtSeg * inf);
+                    const float hv    = (graphMode == GraphMode::Speed)
+                                          ? std::fabs(spd)
+                                          : (kv - spd * (dtSeg * inf));
                     const ImVec2 hp   = ToScreen(ht, hv);
                     const ImU32 hcol  = (inMode == (int)InterpMode::AutoBezier)
                                         ? IM_COL32(180, 180, 180, 160)
@@ -3130,6 +3209,9 @@ void RenderEngine::DrawGraphEditor() {
     }
 
     // Drag: recover (speed, influence) from the mouse position and store.
+    // Works in BOTH Value and Speed modes now. The Y axis of the handle
+    // means different things per mode, but the X axis always means
+    // influence. Shift = influence-only, Alt = speed-only.
     if (interactive && graphDraggedTangent != GraphTangent::None &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
         graphSelectedKeyIndex >= 0 && graphSelectedKeyIndex < nKeys) {
@@ -3138,33 +3220,49 @@ void RenderEngine::DrawGraphEditor() {
         const float kt  = acc.readTime (acc.prop, i);
         const float kv  = acc.readValue(acc.prop, i);
         const ImVec2 tv = ScreenToVal(mp);
-        const bool  isOut = (graphDraggedTangent == GraphTangent::Out);
+        const bool  isOut     = (graphDraggedTangent == GraphTangent::Out);
+        const bool  shiftHeld = ImGui::GetIO().KeyShift;
+        const bool  altHeld   = ImGui::GetIO().KeyAlt;
+        const bool  isSpeed   = (graphMode == GraphMode::Speed);
 
-        // AE-native decomposition: the dragged handle is at
-        //   ht = kt + dtSeg * inf         (out; -dtSeg for in)
-        //   hv = kv + speed * (dtSeg * inf)
-        // Inverting:
-        //   inf   = (ht - kt) / dtSeg   (clamp to [0..1])
-        //   speed = (hv - kv) / (dtSeg * inf)    when inf > 0
-        // With Shift: horizontal-only (influence only). With Alt: vertical-only
-        // (speed only, using CURRENT influence to keep handle X pinned).
-        const bool shiftHeld = ImGui::GetIO().KeyShift;
-        const bool altHeld   = ImGui::GetIO().KeyAlt;
+        // Helper: from the target speed magnitude tv.y, produce a scalar
+        // speed value that preserves the sign of the old scalar. Falls back
+        // to +magnitude when the old scalar is 0.
+        auto rebuildSignedSpeed = [](float oldSpd, float newMag) -> float {
+            newMag = (newMag > 0.0f) ? newMag : 0.0f;
+            if (oldSpd < 0.0f) return -newMag;
+            return  newMag;
+        };
 
         if (isOut && i + 1 < nKeys) {
             const float nextT = acc.readTime(acc.prop, i + 1);
             const float dtSeg = nextT - kt;
             if (dtSeg > 1e-6f) {
-                float newInf = altHeld ? acc.readOutInf(acc.prop, i)
-                                       : std::clamp((tv.x - kt) / dtSeg * 100.0f, 0.0f, 100.0f);
-                float newSpd = shiftHeld ? acc.readOutSpeed(acc.prop, i)
-                                         : ((newInf > 0.1f)
-                                              ? (tv.y - kv) / (dtSeg * newInf * 0.01f)
-                                              : 0.0f);
+                const float oldInf = acc.readOutInf(acc.prop, i);
+                const float oldSpd = acc.readOutSpeed(acc.prop, i);
+
+                float newInf;
+                if (altHeld) {
+                    newInf = oldInf;
+                } else {
+                    newInf = std::clamp((tv.x - kt) / dtSeg * 100.0f, 0.0f, 100.0f);
+                }
+
+                float newSpd;
+                if (shiftHeld) {
+                    newSpd = oldSpd;
+                } else if (isSpeed) {
+                    // In Speed mode, mouse Y directly IS the speed magnitude.
+                    newSpd = rebuildSignedSpeed(oldSpd, tv.y);
+                } else {
+                    // Value mode: invert kv + speed*dt*inf/100 = mouse_y.
+                    newSpd = (newInf > 0.1f)
+                               ? (tv.y - kv) / (dtSeg * newInf * 0.01f)
+                               : 0.0f;
+                }
+
                 acc.writeOutInf  (acc.prop, i, newInf);
                 acc.writeOutSpeed(acc.prop, i, newSpd);
-                // ContinuousBezier: mirror in/out (equal influence, opposite-sign
-                // full-vector speed on the incoming side).
                 if (acc.readOutMode(acc.prop, i) == (int)InterpMode::ContinuousBezier) {
                     acc.writeInMode  (acc.prop, i, (int)InterpMode::ContinuousBezier);
                     acc.writeInInf   (acc.prop, i, newInf);
@@ -3175,12 +3273,28 @@ void RenderEngine::DrawGraphEditor() {
             const float prevT = acc.readTime(acc.prop, i - 1);
             const float dtSeg = kt - prevT;
             if (dtSeg > 1e-6f) {
-                float newInf = altHeld ? acc.readInInf(acc.prop, i)
-                                       : std::clamp((kt - tv.x) / dtSeg * 100.0f, 0.0f, 100.0f);
-                float newSpd = shiftHeld ? acc.readInSpeed(acc.prop, i)
-                                         : ((newInf > 0.1f)
-                                              ? (kv - tv.y) / (dtSeg * newInf * 0.01f)
-                                              : 0.0f);
+                const float oldInf = acc.readInInf(acc.prop, i);
+                const float oldSpd = acc.readInSpeed(acc.prop, i);
+
+                float newInf;
+                if (altHeld) {
+                    newInf = oldInf;
+                } else {
+                    newInf = std::clamp((kt - tv.x) / dtSeg * 100.0f, 0.0f, 100.0f);
+                }
+
+                float newSpd;
+                if (shiftHeld) {
+                    newSpd = oldSpd;
+                } else if (isSpeed) {
+                    // Speed mode: mouse Y IS the speed magnitude.
+                    newSpd = rebuildSignedSpeed(oldSpd, tv.y);
+                } else {
+                    newSpd = (newInf > 0.1f)
+                               ? (kv - tv.y) / (dtSeg * newInf * 0.01f)
+                               : 0.0f;
+                }
+
                 acc.writeInInf  (acc.prop, i, newInf);
                 acc.writeInSpeed(acc.prop, i, newSpd);
                 if (acc.readInMode(acc.prop, i) == (int)InterpMode::ContinuousBezier) {
@@ -3250,7 +3364,7 @@ void RenderEngine::DrawGraphEditor() {
                 }
             };
             if (ImGui::MenuItem("Set to Linear"))            setMode(InterpMode::Linear);
-            if (ImGui::MenuItem("Set to Bezier (F9 Easy Ease)")) setMode(InterpMode::Bezier);
+            if (ImGui::MenuItem("Set to Bezier (Easy Ease)"))    setMode(InterpMode::Bezier);
             if (ImGui::MenuItem("Set to Continuous Bezier")) setMode(InterpMode::ContinuousBezier);
             if (ImGui::MenuItem("Set to Auto Bezier"))       setMode(InterpMode::AutoBezier);
             if (ImGui::MenuItem("Set to Hold"))              setMode(InterpMode::Hold);
