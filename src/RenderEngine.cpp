@@ -1374,6 +1374,47 @@ void RenderEngine::DrawInspectorPanel() {
                 (int)(rgba[2] * 255.0f),
                 (int)(rgba[3] * 255.0f));
         }
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+    }
+
+    // Task 5.7: Stroke controls. Live for every shape type. Setting width
+    // to 0 (default) reproduces the pre-5.7 no-stroke look. MarkForSnapshot
+    // fires on IsItemActivated (mouse-down) of each widget so Ctrl+Z
+    // rewinds each tweak cleanly. Matches the Transform inspector's pattern.
+    if (ImGui::CollapsingHeader("Stroke", ImGuiTreeNodeFlags_DefaultOpen)) {
+        unsigned int sc = sel->strokeColor;
+        float srgba[4] = {
+            ((sc >>  0) & 0xFF) / 255.0f,
+            ((sc >>  8) & 0xFF) / 255.0f,
+            ((sc >> 16) & 0xFF) / 255.0f,
+            ((sc >> 24) & 0xFF) / 255.0f,
+        };
+        if (ImGui::ColorEdit4("Stroke Color", srgba)) {
+            sel->strokeColor = IM_COL32(
+                (int)(srgba[0] * 255.0f),
+                (int)(srgba[1] * 255.0f),
+                (int)(srgba[2] * 255.0f),
+                (int)(srgba[3] * 255.0f));
+        }
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+
+        ImGui::SliderFloat("Stroke Width (px)", &sel->strokeWidth, 0.0f, 64.0f, "%.1f");
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+    }
+
+    // Task 5.7: Corner radius. Rectangle only — hide for other shapes since
+    // the shader ignores it there anyway. Slider max = min(w,h)/2 evaluated
+    // at the current comp time so the slider adapts to animated size (pre-go
+    // review #2: UI-side dynamic clamp; shader also clamps for safety).
+    if (sel->type == ShapeType::Rectangle &&
+        ImGui::CollapsingHeader("Corners", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const Vec2 sz = sel->transform.sizePixels.Evaluate(animEngine.currentTime);
+        const float maxR = std::max(0.5f, std::min(sz.x, sz.y) * 0.5f);
+        ImGui::SliderFloat("Radius (px)", &sel->cornerRadius, 0.0f, maxR, "%.1f");
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+        // Belt-and-braces: clamp again after the slider write in case
+        // sizePixels shrinks in a later frame while radius stayed large.
+        sel->cornerRadius = std::clamp(sel->cornerRadius, 0.0f, maxR);
     }
 
         ImGui::EndTabItem();

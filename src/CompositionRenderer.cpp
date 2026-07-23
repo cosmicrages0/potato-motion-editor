@@ -34,20 +34,74 @@ VSOut main(VSIn i) {
 }
 )HLSL";
 
-static const char* kPSRectSrc = R"HLSL(
+// Task 5.7: consolidated shape SDF pixel shader.
+//
+// Handles both Rectangle (params.x < 0.5) and Ellipse (params.x >= 0.5),
+// with fill + optional stroke + rounded corners (rect only).
+//
+//   params.x   = shape type (0 = rect, 1 = ellipse)
+//   params.y   = stroke width in pixels (0 = no stroke)
+//   params.z   = corner radius in pixels (rect only)
+//   params2.xy = half-extent in pixels (matches the shape's world-pixel size)
+//
+// Both edges are anti-aliased via smoothstep over a 2-pixel window (aa = 1).
+// Outer edge is faded with alpha instead of hard `discard` so the shape
+// silhouette is smooth at low zoom (pre-go review #1).
+//
+// Corner radius is clamped in-shader to min(halfExtent.x, halfExtent.y)
+// so a corrupt file or mid-animation size change can't push the SDF into
+// the pinched/inverted regime (pre-go review #2 belt-and-braces).
+//
+// Rounded-rect SDF is Iñigo Quílez's classic formulation. Ellipse SDF is
+// the fast `length(p/e) - 1` approximation — sharp for circles, slightly
+// distorted for extreme aspect ratios (documented tradeoff in design
+// section 7). Good enough for stroke widths well under the shorter radius.
+static const char* kPSShapeSDFSrc = R"HLSL(
+cbuffer ShapeCB : register(b0) {
+    float4x4 mvp;
+    float4   color;   // fill  RGBA
+    float4   stroke;  // stroke RGBA
+    float4   params;  // (type, strokeWidth, cornerRadius, unused)
+    float4   params2; // (halfExtentX, halfExtentY, unused, unused)
+};
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
-float4 main(VSOut i) : SV_TARGET { return i.color; }
-)HLSL";
 
-static const char* kPSEllipseSrc = R"HLSL(
-// SDF ellipse: uv is [0,1]x[0,1] across the quad, so center is (0.5, 0.5).
-// discard everything outside the unit circle centered on that.
-struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
 float4 main(VSOut i) : SV_TARGET {
-    float2 d = i.uv - float2(0.5, 0.5);
-    // 4 * (x^2 + y^2) > 1 means outside the inscribed circle.
-    if (dot(d, d) * 4.0 > 1.0) discard;
-    return i.color;
+    // Convert UV (0..1) to centered pixel-space coordinates so all
+    // subsequent SDF math is in real pixels.
+    float2 halfExtent = params2.xy;
+    float2 p          = (i.uv - 0.5) * 2.0 * halfExtent;
+
+    float d;
+    if (params.x < 0.5) {
+        // Rounded rectangle SDF. Clamp radius to what fits.
+        float r  = min(params.z, min(halfExtent.x, halfExtent.y));
+        r        = max(r, 0.0);
+        float2 q = abs(p) - halfExtent + r;
+        d        = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+    } else {
+        // Fast ellipse SDF approximation.
+        float2 e = halfExtent;
+        d = length(p / e) - 1.0;
+        d *= min(e.x, e.y);  // rough conversion back to pixels
+    }
+
+    // Outer edge anti-aliasing: fade alpha across a 2-pixel window.
+    float aa = 1.0;
+    float outerAlpha = 1.0 - smoothstep(-aa, aa, d);
+    if (outerAlpha <= 0.001) discard;
+
+    float4 result = color;   // fill baseline
+    float sw = params.y;
+    if (sw > 0.0) {
+        // -d is how many pixels INSIDE the shape we are (>=0 when inside).
+        // strokeMix goes 0 near the edge (stroke) -> 1 deeper in (fill),
+        // with a 2-pixel soft transition so the stroke/fill boundary AAs.
+        float strokeMix = smoothstep(sw - aa, sw + aa, -d);
+        result = lerp(stroke, color, strokeMix);
+    }
+    result.a *= outerAlpha;
+    return result;
 }
 )HLSL";
 
@@ -135,9 +189,9 @@ bool CompositionRenderer::CreateShaders() {
         b->Release();
         return SUCCEEDED(h);
     };
-    if (!makePS(kPSRectSrc,    &ps_rect_))    return false;
-    if (!makePS(kPSEllipseSrc, &ps_ellipse_)) return false;
-    if (!makePS(kPSNullSrc,    &ps_null_))    return false;
+    // Task 5.7: one SDF pixel shader for both Rect and Ellipse.
+    if (!makePS(kPSShapeSDFSrc, &ps_shape_sdf_)) return false;
+    if (!makePS(kPSNullSrc,     &ps_null_))      return false;
     return true;
 }
 
@@ -201,9 +255,10 @@ void CompositionRenderer::ReleaseAll() {
     if (vb_quad_)     { vb_quad_->Release();     vb_quad_     = nullptr; }
     if (cb_shape_)    { cb_shape_->Release();    cb_shape_    = nullptr; }
     if (layout_)      { layout_->Release();      layout_      = nullptr; }
-    if (ps_null_)     { ps_null_->Release();     ps_null_     = nullptr; }
-    if (ps_ellipse_)  { ps_ellipse_->Release();  ps_ellipse_  = nullptr; }
-    if (ps_rect_)     { ps_rect_->Release();     ps_rect_     = nullptr; }
+    if (ps_null_)      { ps_null_->Release();      ps_null_      = nullptr; }
+    // Task 5.7: single consolidated SDF pixel shader replaced the old
+    // rect + ellipse pair. Both former pointers are gone from the header.
+    if (ps_shape_sdf_) { ps_shape_sdf_->Release(); ps_shape_sdf_ = nullptr; }
     if (vs_)          { vs_->Release();          vs_          = nullptr; }
 }
 
@@ -319,39 +374,63 @@ static void UnpackABGRToRGBAf(unsigned int abgr, float out[4]) {
     out[3] = ((abgr >> 24) & 0xFF) / 255.0f;
 }
 
+// Task 5.7: DrawRect + DrawEllipse now share ps_shape_sdf_. Both take
+// stroke color + stroke width; DrawRect also takes corner radius (ignored
+// by the ellipse branch of the shader). halfExtent is written into
+// params2.xy so the shader can do pixel-space SDF math regardless of the
+// baked-in MVP scaling. Passing strokeWidth = 0 reproduces the pre-5.7
+// unstroked look; passing radius = 0 reproduces sharp corners.
 void CompositionRenderer::DrawRect(const Mat3& world, const Vec2& size,
-                                   unsigned int color,
+                                   unsigned int fillColor, unsigned int strokeColor,
+                                   float strokeWidth, float cornerRadius,
                                    UINT targetW, UINT targetH) {
-    if (!context_ || !ps_rect_) return;
+    if (!context_ || !ps_shape_sdf_) return;
     ShapeCB cb{};
     BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
-    UnpackABGRToRGBAf(color, cb.color);
-    cb.params[0] = 0.0f;
+    UnpackABGRToRGBAf(fillColor,   cb.color);
+    UnpackABGRToRGBAf(strokeColor, cb.stroke);
+    cb.params[0]  = 0.0f;                      // shape type = rect
+    cb.params[1]  = std::max(0.0f, strokeWidth);
+    cb.params[2]  = std::max(0.0f, cornerRadius);
+    cb.params[3]  = 0.0f;
+    cb.params2[0] = size.x * 0.5f;             // half-extent X (pixels)
+    cb.params2[1] = size.y * 0.5f;             // half-extent Y (pixels)
+    cb.params2[2] = 0.0f;
+    cb.params2[3] = 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         std::memcpy(ms.pData, &cb, sizeof(cb));
         context_->Unmap(cb_shape_, 0);
     }
-    context_->PSSetShader(ps_rect_, nullptr, 0);
+    context_->PSSetShader(ps_shape_sdf_, nullptr, 0);
     context_->DrawIndexed(6, 0, 0);
 }
 
 void CompositionRenderer::DrawEllipse(const Mat3& world, const Vec2& size,
-                                      unsigned int color,
+                                      unsigned int fillColor, unsigned int strokeColor,
+                                      float strokeWidth,
                                       UINT targetW, UINT targetH) {
-    if (!context_ || !ps_ellipse_) return;
+    if (!context_ || !ps_shape_sdf_) return;
     ShapeCB cb{};
     BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
-    UnpackABGRToRGBAf(color, cb.color);
-    cb.params[0] = 1.0f;
+    UnpackABGRToRGBAf(fillColor,   cb.color);
+    UnpackABGRToRGBAf(strokeColor, cb.stroke);
+    cb.params[0]  = 1.0f;                      // shape type = ellipse
+    cb.params[1]  = std::max(0.0f, strokeWidth);
+    cb.params[2]  = 0.0f;                      // radius ignored for ellipse
+    cb.params[3]  = 0.0f;
+    cb.params2[0] = size.x * 0.5f;
+    cb.params2[1] = size.y * 0.5f;
+    cb.params2[2] = 0.0f;
+    cb.params2[3] = 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         std::memcpy(ms.pData, &cb, sizeof(cb));
         context_->Unmap(cb_shape_, 0);
     }
-    context_->PSSetShader(ps_ellipse_, nullptr, 0);
+    context_->PSSetShader(ps_shape_sdf_, nullptr, 0);
     context_->DrawIndexed(6, 0, 0);
 }
 
@@ -414,18 +493,30 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
         const Vec2 sz = layer.transform.sizePixels.Evaluate(compT);
 
         // Bake per-layer opacity into the color's alpha channel.
+        // Task 5.7: apply the same opacity multiply to the stroke color so
+        // stroke and fill fade together when the layer opacity animates.
         const float layerOp = layerManager.GetWorldOpacity(layer.id);
-        unsigned int color = layer.fillColor;
-        unsigned int a = (color >> 24) & 0xFFu;
-        a = (unsigned int)std::clamp((int)((float)a * layerOp), 0, 255);
-        color = (color & 0x00FFFFFFu) | (a << 24);
+        auto applyOp = [&](unsigned int c) -> unsigned int {
+            unsigned int a = (c >> 24) & 0xFFu;
+            a = (unsigned int)std::clamp((int)((float)a * layerOp), 0, 255);
+            return (c & 0x00FFFFFFu) | (a << 24);
+        };
+        const unsigned int fillC   = applyOp(layer.fillColor);
+        const unsigned int strokeC = applyOp(layer.strokeColor);
+        const float sw = layer.strokeWidth;
+        const float cr = layer.cornerRadius;
 
         switch (layer.type) {
-            case ShapeType::Rectangle:  DrawRect      (wm, sz, color, targetW, targetH); break;
-            case ShapeType::Ellipse:    DrawEllipse   (wm, sz, color, targetW, targetH); break;
-            case ShapeType::CustomPath: DrawEllipse   (wm, sz, color, targetW, targetH); break; // stub
-            case ShapeType::Null:       DrawNullMarker(wm, sz,        targetW, targetH); break;
-            case ShapeType::Camera:     break;
+            case ShapeType::Rectangle:
+                DrawRect(wm, sz, fillC, strokeC, sw, cr, targetW, targetH); break;
+            case ShapeType::Ellipse:
+                DrawEllipse(wm, sz, fillC, strokeC, sw, targetW, targetH); break;
+            case ShapeType::CustomPath:
+                DrawEllipse(wm, sz, fillC, strokeC, sw, targetW, targetH); break; // stub
+            case ShapeType::Null:
+                DrawNullMarker(wm, sz, targetW, targetH); break;
+            case ShapeType::Camera:
+                break;
         }
     }
 }

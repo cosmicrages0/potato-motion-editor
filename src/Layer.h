@@ -109,6 +109,19 @@ struct Layer {
     Transform   transform;
     unsigned int fillColor    = 0xFFCCCC00; // ABGR little-endian (matches IM_COL32 layout on x86)
 
+    // Task 5.7: stroke + rounded corners. Drawn by the CompositionRenderer's
+    // consolidated SDF pixel shader (no CPU tessellation). Strokes are drawn
+    // INSIDE the shape boundary (Figma default) so a 100x100 rect with a
+    // 4px stroke still occupies exactly 100x100 pixels. cornerRadius applies
+    // only to Rectangle; Ellipse/Null/Camera ignore it.
+    //
+    // Not (yet) an AnimatedProperty: stroke color is a styling choice, not
+    // an animation target in typical motion graphics. Trivially promotable
+    // later if a user asks.
+    unsigned int strokeColor  = 0xFF000000; // ABGR; opaque black by default
+    float        strokeWidth  = 0.0f;       // pixels; 0 => no stroke
+    float        cornerRadius = 0.0f;       // pixels; 0 => sharp corners (Rect only)
+
     // Task 5: ordered stack of post-processing effects. Reserved so add/remove
     // never allocates inside the frame loop for typical projects.
     std::vector<Effect> effects;

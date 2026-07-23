@@ -286,20 +286,51 @@ which mitigates this. Acceptable for a v1.
 
 ---
 
-## 9. Questions before I execute
+## 10. Pre-go review adjustments (locked)
 
-None strictly blocking. Two optional style choices:
+**#1 Outer edge AA** — the design's `discard` at `d > 0` gives a hard 1-px
+jagged edge at low zoom. Fix: replace the discard with an outer-edge
+alpha smoothstep. Pixel goes fully transparent 1 px outside the SDF,
+fully opaque 1 px inside, blends across the 2-px window.
 
-**Q1.** Stroke placement — **inside** the shape boundary (Figma default,
-my rec — makes a 4px stroke on a 100px square still fill exactly
-100×100 pixels), or **centered** on the boundary (SVG default — adds
-2px around the shape), or **outside** (unusual). I'm going with
-**inside** because it plays nicer with layout: users size a box
-knowing its outer dimensions won't change when they add a stroke.
+Revised HLSL (final):
 
-**Q2.** Corner radius clamp — hard clamp to `min(width, height) / 2`
-(prevents visual pinching) or allow bigger values (rendering degrades
-into an ellipse-ish blob but user has explicit control). I'm going
-with the **clamp**; that's what every editor does.
+```hlsl
+// d < 0 = inside, d > 0 = outside, in pixels.
+float aa = 1.0;                         // 1-pixel soft edge
+float outerAlpha = 1.0 - smoothstep(-aa, aa, d);
+if (outerAlpha <= 0.001) discard;       // still discard fully-outside frags
 
-Say **"go single commit"** to execute with both my-rec defaults.
+float4 result = color;                  // fill
+if (params.y > 0.0) {                   // stroke width in pixels
+    float sw = params.y;
+    float strokeMix = smoothstep(sw - aa, sw + aa, -d); // -d = pixels inside
+    result = lerp(stroke, color, strokeMix);
+}
+result.a *= outerAlpha;                 // fade the outer 1 px band
+return result;
+```
+
+**#2 Corner clamp — both UI AND shader** —
+
+UI: `ImGui::SliderFloat("Radius", &r, 0.0f, std::min(w,h) * 0.5f);`
+so the slider max moves with the current size.
+
+Shader: `float r = min(params.z, min(halfExtent.x, halfExtent.y));`
+right before feeding it to the SDF. Belt-and-braces so a corrupt file or
+mid-animation size change can't push the SDF into the pinched/inverted
+regime.
+
+**#3, #4 already correct.** Design's final CB layout uses `params2.xy`
+for halfExtent (no `params.w` hack). Stroke color uses the same
+`UnpackABGRToRGBAf` helper as fillColor — no channel-swap surprise.
+
+**Preview vs Composition split** noted for a follow-up (Task 5.8). Every
+comment about "shape goes invisible at low res" traces to the fact that
+we're rendering directly at composition resolution and letterbox-scaling
+in ImGui. A dedicated preview scale would let users work at 1/2 or 1/4
+res for perf without changing the export resolution. Not this commit.
+
+## 11. Go
+
+All fixes above merged into the plan. Executing single commit.

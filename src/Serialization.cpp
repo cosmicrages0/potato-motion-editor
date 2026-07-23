@@ -340,6 +340,11 @@ json WriteLayer(const Layer& L) {
     out["is3D"]          = L.is3D;
     out["stickToCamera"] = L.stickToCamera;
     out["fillColor"]     = FillColorToHex(L.fillColor);
+    // Task 5.7: stroke + rounded corners. Emit unconditionally so users
+    // hand-editing a .pmge see the schema; defaults keep the payload tiny.
+    out["strokeColor"]   = FillColorToHex(L.strokeColor);
+    out["strokeWidth"]   = L.strokeWidth;
+    out["cornerRadius"]  = L.cornerRadius;
     out["transform"]     = WriteTransform(L.transform);
     json effects = json::array();
     for (const auto& e : L.effects) effects.push_back(WriteEffect(e));
@@ -360,6 +365,11 @@ Layer ReadLayer(const json& j) {
     L.is3D          = j.value("is3D", false);
     L.stickToCamera = j.value("stickToCamera", false);
     L.fillColor     = FillColorFromHex(j.value("fillColor", std::string("0xFFCCCC00")), 0xFFCCCC00u);
+    // Task 5.7: stroke + corner radius are optional (pre-5.7 files miss
+    // them entirely) — defaults reproduce the old no-stroke sharp-corner look.
+    L.strokeColor   = FillColorFromHex(j.value("strokeColor", std::string("0xFF000000")), 0xFF000000u);
+    L.strokeWidth   = j.value("strokeWidth",  0.0f);
+    L.cornerRadius  = j.value("cornerRadius", 0.0f);
     if (j.contains("transform")) ReadTransform(j["transform"], L.transform);
     if (j.contains("effects") && j["effects"].is_array()) {
         for (const auto& ej : j["effects"]) L.effects.push_back(ReadEffect(ej));
