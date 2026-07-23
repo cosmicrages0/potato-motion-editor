@@ -92,7 +92,7 @@ Fixed the "encoder died?" ghost:
 - Bonus: export pump now honors the user's bgColor (was still using
   the hard-coded pre-5.6 dark gray).
 
-### `??????` — Task 5.6-fix-2: Undo preserves layer selection
+### `1c5edd6` — Task 5.6-fix-2: Undo preserves layer selection
 - Bug: pressing Ctrl+Z on the top layer (Ellipse) reset selection to
   the bottom layer (Rectangle).
 - Root cause: `selectedLayerId` was never serialized, so every undo
@@ -147,7 +147,7 @@ snap to nearest frame boundary when comp fps > 0.
 
 ## Sleep well. Repo state:
 - Branch: `main`
-- Last commit: `??????` (Task 5.6-fix-2, TBD when this pushes)
+- Last commit: `1c5edd6` (Task 5.6-fix-2)
 - Artifact: ~1.16 MB
 - All CI runs green today
 - Design docs added: 5 (COMMIT6-11)
