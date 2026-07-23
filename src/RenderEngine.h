@@ -164,6 +164,39 @@ private:
     // Right-click context menu target (persisted across frames because ImGui
     // popups open on the frame AFTER the click).
     DiamondHit  contextDiamond;
+
+    // -------------------------------------------------------------------------
+    // Task 5.4: Graph Editor state.
+    //
+    // The graph editor shows ONE scalar dimension of ONE property of the
+    // selected layer at a time. This matches AE's "Separate Dimensions"
+    // convention — every property.channel gets its own graph.
+    //
+    // GraphChannel enumerates the scalar dimensions we can plot.
+    // GraphMode toggles the Value curve vs Speed (velocity) view — same
+    // underlying keys, different visualization.
+    //
+    // graphSelectedKey identifies the currently-selected keyframe for handle
+    // dragging + context menu. draggedTangent flags which of the two tangents
+    // on that key the user is currently dragging.
+    // -------------------------------------------------------------------------
+    enum class GraphChannel : int {
+        PositionX = 0, PositionY, PositionZ,
+        RotationZ,
+        ScaleX, ScaleY,
+        Opacity,
+        COUNT
+    };
+    enum class GraphMode : int { Value = 0, Speed = 1 };
+    enum class GraphTangent : int { None = 0, In = 1, Out = 2 };
+    GraphMode    graphMode              = GraphMode::Value;
+    GraphChannel graphChannel           = GraphChannel::PositionX;
+    bool         graphChannelAutoPicked = false;  // stops us re-picking after user chose
+    int          graphSelectedLayerId   = -1;
+    int          graphSelectedKeyIndex  = -1;
+    GraphTangent graphDraggedTangent    = GraphTangent::None;
+    // Right-click context menu target for the graph editor.
+    int          graphContextKeyIndex   = -1;
     // Task 5.0: last "Test FFmpeg" result shown under the button.
     std::string            ffmpegTestResult;
     bool                   ffmpegTestOk = false;

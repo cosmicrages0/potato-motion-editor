@@ -63,6 +63,22 @@ template <> float ReadValueT<float>(const json& j) { return j.is_number() ? j.ge
 template <> Vec2  ReadValueT<Vec2>(const json& j)  { return ReadVec2(j); }
 template <> Vec3  ReadValueT<Vec3>(const json& j)  { return ReadVec3(j); }
 
+// Task 5.4: serialize per-side interpolation mode as a short string so the
+// .pmge file stays human-readable. Unknown / missing => Linear.
+inline const char* InterpModeToString(InterpMode m) {
+    switch (m) {
+        case InterpMode::Bezier: return "bezier";
+        case InterpMode::Hold:   return "hold";
+        case InterpMode::Linear:
+        default:                 return "linear";
+    }
+}
+inline InterpMode InterpModeFromString(const std::string& s) {
+    if (s == "bezier") return InterpMode::Bezier;
+    if (s == "hold")   return InterpMode::Hold;
+    return InterpMode::Linear;
+}
+
 template <typename T>
 json WriteAnimatedProperty(const AnimatedProperty<T>& p) {
     json out;
@@ -70,7 +86,25 @@ json WriteAnimatedProperty(const AnimatedProperty<T>& p) {
     out["static"] = WriteValueT(p.staticValue);
     json keys = json::array();
     for (const auto& k : p.keyframes) {
-        keys.push_back({ {"t", k.time}, {"v", WriteValueT(k.value)} });
+        json kj;
+        kj["t"] = k.time;
+        kj["v"] = WriteValueT(k.value);
+        // Task 5.4: only emit tangent / mode fields when they carry non-default
+        // information. Keeps files small AND identical to Task 5.2 output for
+        // purely-linear animations.
+        if (k.incomingMode != InterpMode::Linear)
+            kj["im"] = InterpModeToString(k.incomingMode);
+        if (k.outgoingMode != InterpMode::Linear)
+            kj["om"] = InterpModeToString(k.outgoingMode);
+        if (k.inTangentTime != 0.0f)  kj["it"] = k.inTangentTime;
+        if (k.outTangentTime != 0.0f) kj["ot"] = k.outTangentTime;
+        // Value-side tangents: emit only if the incoming/outgoing mode is
+        // Bezier — a Linear key never uses value offsets.
+        if (k.incomingMode == InterpMode::Bezier)
+            kj["iv"] = WriteValueT(k.inTangentValue);
+        if (k.outgoingMode == InterpMode::Bezier)
+            kj["ov"] = WriteValueT(k.outTangentValue);
+        keys.push_back(std::move(kj));
     }
     out["keys"] = std::move(keys);
     return out;
@@ -89,6 +123,16 @@ AnimatedProperty<T> ReadAnimatedProperty(const json& j, const T& fallbackStatic)
             Keyframe<T> k;
             k.time  = kj.value("t", 0.0f);
             if (kj.contains("v")) k.value = ReadValueT<T>(kj["v"]);
+            // Task 5.4: tangents + modes are optional. Absent => Linear + zero
+            // (bit-identical to Task 5.2 files).
+            if (kj.contains("im") && kj["im"].is_string())
+                k.incomingMode = InterpModeFromString(kj["im"].get<std::string>());
+            if (kj.contains("om") && kj["om"].is_string())
+                k.outgoingMode = InterpModeFromString(kj["om"].get<std::string>());
+            if (kj.contains("it") && kj["it"].is_number()) k.inTangentTime  = kj["it"].get<float>();
+            if (kj.contains("ot") && kj["ot"].is_number()) k.outTangentTime = kj["ot"].get<float>();
+            if (kj.contains("iv")) k.inTangentValue  = ReadValueT<T>(kj["iv"]);
+            if (kj.contains("ov")) k.outTangentValue = ReadValueT<T>(kj["ov"]);
             p.keyframes.push_back(k);
         }
     }
