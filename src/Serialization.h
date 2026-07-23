@@ -29,6 +29,10 @@ struct AppState {
     int              compositionHeight = 1080;
     int              cameraStyleInt    = 0;   // 0 = AfterEffects, 1 = AlightMotion
     bool             show3DFeatures    = false;
+    // Task 5.6: composition-wide framerate + background color. Missing from
+    // pre-5.6 .pmge files; defaults keep old files loading identically.
+    int              compositionFps    = 30;
+    float            bgColor[4]        = { 0.08f, 0.08f, 0.10f, 1.0f };
 };
 
 // Current on-disk schema version. Bump when the JSON layout changes

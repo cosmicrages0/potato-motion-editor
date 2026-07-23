@@ -451,6 +451,12 @@ bool AppStateToJson(const AppState& state, json& outRoot, std::string* outError)
     comp["height"]         = state.compositionHeight;
     comp["cameraStyle"]    = (state.cameraStyleInt == 1) ? "AlightMotion" : "AfterEffects";
     comp["show3DFeatures"] = state.show3DFeatures;
+    // Task 5.6: comp-wide framerate + background color. Whatever value the
+    // user set (including a custom 25 or 29.97) is written verbatim — no
+    // snap to the preset list. Reader restores it as-is.
+    comp["fps"]            = state.compositionFps;
+    comp["bgColor"]        = json::array({ state.bgColor[0], state.bgColor[1],
+                                           state.bgColor[2], state.bgColor[3] });
     outRoot["composition"] = std::move(comp);
 
     outRoot["camera"]    = WriteCamera(*state.camera);
@@ -487,6 +493,16 @@ bool JsonToAppState(const json& root, AppState& state, std::string* outError) {
         std::string style       = comp.value("cameraStyle", std::string("AfterEffects"));
         state.cameraStyleInt    = (style == "AlightMotion") ? 1 : 0;
         state.show3DFeatures    = comp.value("show3DFeatures", state.show3DFeatures);
+        // Task 5.6: fps + bgColor. Missing => keep defaults from AppState.
+        state.compositionFps    = comp.value("fps", state.compositionFps);
+        if (comp.contains("bgColor") && comp["bgColor"].is_array() &&
+            comp["bgColor"].size() >= 4) {
+            for (int i = 0; i < 4; ++i) {
+                if (comp["bgColor"][i].is_number()) {
+                    state.bgColor[i] = comp["bgColor"][i].get<float>();
+                }
+            }
+        }
     }
     if (root.contains("camera"))    ReadCamera(root["camera"], *state.camera);
     if (root.contains("animation")) ReadAnim(root["animation"], *state.animEngine);

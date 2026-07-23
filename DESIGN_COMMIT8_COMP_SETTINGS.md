@@ -229,27 +229,79 @@ Net ~+160 LOC. Binary impact negligible (~+2 KB after LTCG).
 
 ---
 
-## 10. Questions before I execute
+## 10. Pre-go review adjustments (locked)
 
-**Q1.** For W/H clamps I picked `[16, 8192]`. AE goes down to 4 and up
-to 30720. 8192 keeps us safe on integrated GPUs (a 30720×17280 comp RT
-is ~2 GB and would immediately crash a potato). Accept the tighter
-limit, or want wider?
+Reviewer flagged four issues before go. All applied to this design.
 
-**My rec: keep [16, 8192].** Integrated GPUs choke past 8K anyway.
+**#1 W/H clamp** was `[16, 8192]`. Raised floor to `[64, 8192]` — 16×16
+breaks the letterbox math (division by tiny numbers) and produces an
+unusable panel. 64 keeps geometry sane, 8192 keeps iGPU alive.
 
-**Q2.** Reset Layout — I want a small confirmation (`"Reset all panel
-positions?"` yes/no popup) or fire-and-forget? Fire-and-forget matches
-Blender; confirmation matches Photoshop.
+**#2 Snapshot timing bug** — this is a real latent bug, not just an
+Apply-modal issue. `MarkForSnapshot()` sets a flag consumed at top of
+next frame via `FlushPendingSnapshot`. For continuous drags this
+captures pre-drag state correctly (mouse-down flags, mutation happens
+across later frames, next frame's snapshot = pre-drag). For **atomic
+ops in a single frame** (Apply button, "Delete Keyframe", "Set to
+Bezier"), the mutation happens in-frame; the snapshot at frame N+1
+captures the POST-mutation state → Ctrl+Z becomes a no-op.
 
-**My rec: fire-and-forget** with Ctrl+Z as escape (though undo of layout
-state isn't wired yet — Reset Layout is not undoable in this commit).
+Fix: rework `MarkForSnapshot()` to push **synchronously** the first
+time it's called each frame, with a per-frame-number guard for
+coalescing. Continuous drags still coalesce (all frame-N marks pre-
+drag collapse into one), atomic ops now snapshot pre-mutation
+correctly.
 
-**Q3.** Timeline tick spacing driven by FPS — bundle in this commit or
-defer to a follow-up?
+Code shape:
+```cpp
+uint64_t lastSnapshotFrame = 0;   // new member
+uint64_t currentFrameNumber = 0;  // bumped at start of BeginFrame
 
-**My rec: defer.** Ruler drawing has some heuristics that need care.
-Ship the modal first, timeline sync next commit.
+void MarkForSnapshot() {
+    if (currentFrameNumber != 0 && currentFrameNumber == lastSnapshotFrame)
+        return;  // already snapshotted this frame — coalesce
+    AppState st{}; BuildAppState(st);
+    undoStack.PushSnapshot(st);
+    lastSnapshotFrame = currentFrameNumber;
+}
+```
 
-Say **"go single commit"** to execute all three my-rec defaults, or
-tell me to adjust.
+`FlushPendingSnapshot()` becomes a no-op and its call site is removed
+(or kept as dead code with a comment for one commit, then removed
+next). The `pendingSnapshot` bool goes away.
+
+This fixes Apply-modal undo AND retroactively fixes Delete Keyframe,
+Set to Bezier, and every other atomic op that ships MarkForSnapshot.
+
+**#3 FPS custom-value preservation** — Combo is 24/30/60 only. If a
+loaded .pmge has `fps=25` or `fps=29.97`, previous design would snap
+it to 30 on next save → silently destroys user's setting.
+
+Fix: on modal open, if `compositionFps` is not in `[24, 30, 60]`, show
+a leading "Custom: X fps" entry in the combo. Selecting a preset
+replaces the value normally. Not selecting = keep the custom value
+intact. On save, we always write whatever `compositionFps` holds (no
+snap in Serialization.cpp).
+
+**#4 Staging init** — already right in the design (section 2 lists
+pendingBgColor etc. and section 4 says "opens with current values
+populated"). Adding a defensive one-liner comment in the code that the
+copy from live→pending happens at modal-open time so a future refactor
+can't forget it.
+
+## 11. Reset Layout — no confirmation, fire-and-forget
+
+Matches Blender. `View → Reset Layout` immediately nukes the dock node
+and re-runs the initial builder next frame. Not undoable (layout state
+isn't in AppState). If users want an escape, they can drag panels back
+manually.
+
+## 12. Timeline FPS ticks — deferred to next commit
+
+Ruler drawing has heuristics that break at extreme FPS. Ship the modal
+first, timeline sync follow-up. Export queue default FPS = comp FPS
+ships THIS commit (one line).
+
+## 13. Go
+
+All fixes above merged into the plan. Executing single commit.

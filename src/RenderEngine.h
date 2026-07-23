@@ -133,14 +133,22 @@ private:
     std::string OpenSaveFileDialog(const char* defaultName, bool save);
     void SetStatus(const std::string& msg, bool isError = false, float durationSeconds = 4.0f);
 
-    // Task 5.3: undo/redo. See DESIGN_COMMIT3_UNDO_KEYFRAMES_PARENT.md for the
-    // coalescing model. MarkForSnapshot() sets a flag; the actual PushSnapshot
-    // happens once at the top of the next BeginFrame, so multiple marks in one
-    // frame collapse to one undo entry.
-    UndoStack   undoStack;
-    bool        pendingSnapshot = false;
-    void MarkForSnapshot() { pendingSnapshot = true; }
-    // Called from BeginFrame BEFORE user input is processed.
+    // Task 5.3 / Task 5.6 revision: undo/redo. See
+    // DESIGN_COMMIT3_UNDO_KEYFRAMES_PARENT.md for the original coalescing
+    // model. Original impl deferred snapshots to the top of the NEXT frame,
+    // which captured post-mutation state for atomic operations (Apply modal,
+    // Delete Keyframe, Set to Bezier) so Ctrl+Z became a no-op for them.
+    //
+    // Task 5.6 fix: MarkForSnapshot pushes SYNCHRONOUSLY the first time
+    // it's called in a given frame. A per-frame-number guard preserves the
+    // coalescing behavior for continuous drags (all frame-N marks pre-drag
+    // collapse into one push). FlushPendingSnapshot is now a no-op kept as
+    // a compatibility symbol; callers can be removed in a follow-up.
+    UndoStack undoStack;
+    uint64_t  currentFrameNumber = 0;    // bumped at top of BeginFrame
+    uint64_t  lastSnapshotFrame  = 0;    // frame number of most recent push
+    void MarkForSnapshot();
+    // Retained for one commit for source compatibility; body does nothing.
     void FlushPendingSnapshot();
     // Build the AppState aggregate that undo/save/load all consume.
     void BuildAppState(struct AppState& out);
@@ -232,6 +240,30 @@ private:
     // EffectManager's ping-pong render targets.
     int   compositionWidth  = 1920;
     int   compositionHeight = 1080;
+
+    // Task 5.6: composition framerate + background color. Framerate defaults
+    // to 30 fps (matches Adobe / social-media convention). Custom values
+    // (25, 29.97 etc.) load and save intact through Serialization.cpp; the
+    // Comp Settings modal presets are just shortcuts, not clamps.
+    int   compositionFps    = 30;
+    float bgColor[4]        = { 0.08f, 0.08f, 0.10f, 1.0f };
+
+    // Task 5.6: Composition Settings modal state. Edits go to `pending*`
+    // fields first so Cancel really cancels. Apply copies pending -> real
+    // and (if W/H changed) rebuilds the composition RT and effect ping-pong
+    // RTs. `showCompSettingsModal` opens the modal on the next frame.
+    bool  showCompSettingsModal = false;
+    int   pendingCompW    = 1920;
+    int   pendingCompH    = 1080;
+    int   pendingCompFps  = 30;
+    float pendingCompDur  = 5.0f;
+    float pendingBgColor[4] = { 0.08f, 0.08f, 0.10f, 1.0f };
+    void  OpenCompSettingsModal();   // seed pending* from live values + open
+    void  DrawCompSettingsModal();   // per-frame; no-op if not open
+
+    // Task 5.6: Reset Layout. Sets the flag; next-frame RenderAEDockingLayout
+    // detects a null dock node and re-runs the initial AE builder.
+    bool  pendingResetLayout = false;
 
     // Task 4.5: composition-wide setting for how the camera relates to layers.
     // AE mode = camera is a normal layer, parented freely (default).

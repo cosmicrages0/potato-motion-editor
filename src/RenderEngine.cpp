@@ -251,9 +251,14 @@ void RenderEngine::BeginFrame() {
     lastTime = now;
     if (deltaTime > 0.25f) deltaTime = 0.25f;
 
-    // Task 5.3: coalesce any snapshots requested during the previous frame
-    // into a single undo entry BEFORE the new frame's input runs. Guarantees
-    // that a mouse-move-heavy drag records only one undo state per drag.
+    // Task 5.6: bump the per-frame counter FIRST so any MarkForSnapshot()
+    // call made during this frame's UI + input pass can coalesce correctly.
+    // Wrap at max uint64 is a non-issue (billions of years of 60 FPS use).
+    ++currentFrameNumber;
+    if (currentFrameNumber == 0) currentFrameNumber = 1; // avoid the "0 = always push" sentinel
+
+    // Task 5.3 -> Task 5.6: FlushPendingSnapshot is now a no-op stub. Kept
+    // as a call for one commit for source compatibility; will be removed.
     FlushPendingSnapshot();
 
     animEngine.Update(deltaTime);
@@ -417,6 +422,12 @@ void RenderEngine::RenderAEDockingLayout() {
     ImGui::PopStyleVar(3);
 
     ImGuiID dockspace_id = ImGui::GetID("MyDockSpace");
+    // Task 5.6: View -> Reset Layout consumer. Nuking the node makes the
+    // null-check below fall through to the initial-layout builder.
+    if (pendingResetLayout) {
+        pendingResetLayout = false;
+        ImGui::DockBuilderRemoveNode(dockspace_id);
+    }
     if (ImGui::DockBuilderGetNode(dockspace_id) == nullptr) {
         ImGui::DockBuilderRemoveNode(dockspace_id);
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
@@ -552,10 +563,20 @@ void RenderEngine::RenderAEDockingLayout() {
         if (ImGui::BeginMenu("View")) {
             ImGui::MenuItem("Show 3D Features", nullptr, &show3DFeatures);
             ImGui::MenuItem("Show Debug Panel", nullptr, &showDebugPanel);
+            ImGui::Separator();
+            // Task 5.6: recover the default AE dock. Fire-and-forget per
+            // design section 11 — no confirmation popup (Blender convention).
+            // Consumed at the top of the next RenderAEDockingLayout() call.
+            if (ImGui::MenuItem("Reset Layout")) {
+                pendingResetLayout = true;
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Composition")) {
-            ImGui::MenuItem("Composition Settings...");
+            // Task 5.6: wired to open the settings modal (was a stub).
+            if (ImGui::MenuItem("Composition Settings...")) {
+                OpenCompSettingsModal();
+            }
             ImGui::Separator();
             ImGui::TextDisabled("Camera Style");
             bool ae     = (cameraStyle == CameraStyle::AfterEffects);
@@ -611,6 +632,10 @@ void RenderEngine::RenderAEDockingLayout() {
     if (showRenderQueue) {
         DrawRenderQueuePanel();
     }
+
+    // Task 5.6: Composition Settings modal. Body is a no-op unless
+    // `showCompSettingsModal` is true; opened via Composition -> Settings...
+    DrawCompSettingsModal();
 
     // Task 5.0-b: Debug diagnostic panel. Off by default; toggled via
     // View -> Show Debug Panel. Prints live mouse-canvas coords, selected
@@ -1732,9 +1757,11 @@ void RenderEngine::DrawViewportCanvas() {
     //    The renderer clears to the composition background color first.
     // -------------------------------------------------------------------
     if (compRTV && compRenderer.IsReady()) {
-        const float bg[4] = { 0.08f, 0.08f, 0.10f, 1.0f };
+        // Task 5.6: bgColor is now a user-editable member driven by the
+        // Comp Settings modal (Composition -> Settings...). Old hard-coded
+        // dark-gray value is now the initial default.
         compRenderer.RenderLayers(compRTV, compTextureWidth, compTextureHeight,
-                                  layerManager, bg);
+                                  layerManager, bgColor);
 
         // 2) If ANY layer has an enabled effect, run its chain against the
         //    whole composition. NOTE: this is a composition-wide effect model
@@ -3947,6 +3974,9 @@ void RenderEngine::BuildAppState(AppState& out) {
     out.compositionHeight = compositionHeight;
     out.cameraStyleInt    = (int)cameraStyle;
     out.show3DFeatures    = show3DFeatures;
+    // Task 5.6: fps + bgColor.
+    out.compositionFps    = compositionFps;
+    for (int i = 0; i < 4; ++i) out.bgColor[i] = bgColor[i];
 }
 
 void RenderEngine::ApplyLoadedScalars(const AppState& st) {
@@ -3955,6 +3985,9 @@ void RenderEngine::ApplyLoadedScalars(const AppState& st) {
     cameraStyle       = (st.cameraStyleInt == 1) ? CameraStyle::AlightMotion
                                                  : CameraStyle::AfterEffects;
     show3DFeatures    = st.show3DFeatures;
+    // Task 5.6: fps + bgColor propagate from load / undo.
+    compositionFps    = st.compositionFps;
+    for (int i = 0; i < 4; ++i) bgColor[i] = st.bgColor[i];
     if (compTextureWidth  != (UINT)compositionWidth ||
         compTextureHeight != (UINT)compositionHeight) {
         ReleaseCompositionRT();
@@ -3963,13 +3996,201 @@ void RenderEngine::ApplyLoadedScalars(const AppState& st) {
     }
 }
 
-void RenderEngine::FlushPendingSnapshot() {
-    if (!pendingSnapshot) return;
-    pendingSnapshot = false;
+// Task 5.6: MarkForSnapshot now pushes SYNCHRONOUSLY the first time it's
+// called in a given frame, guarded by lastSnapshotFrame == currentFrameNumber
+// so continuous drags (which mark on mouse-down then mutate over many
+// following frames) still coalesce into a single undo entry.
+//
+// Old model (pendingSnapshot flag + FlushPendingSnapshot at top of next frame)
+// was correct for drags but broken for atomic ops in one frame: the snapshot
+// captured POST-mutation state so Ctrl+Z was a no-op. Reworked here.
+void RenderEngine::MarkForSnapshot() {
+    // Same-frame guard: coalesce multiple marks per frame into one push.
+    // currentFrameNumber == 0 only during Initialize/pre-first-frame; treat
+    // that as "always push" to be safe.
+    if (currentFrameNumber != 0 && currentFrameNumber == lastSnapshotFrame) {
+        return;
+    }
     AppState st{};
     BuildAppState(st);
-    // Silent on success (undo works transparently). Log on failure only.
     undoStack.PushSnapshot(st);
+    lastSnapshotFrame = currentFrameNumber;
+}
+
+// Legacy no-op kept as a symbol for source compatibility with the previous
+// coalescing model. Every caller can be removed in a follow-up commit; this
+// stub keeps the current call sites compiling without change.
+void RenderEngine::FlushPendingSnapshot() {
+    // Intentionally empty. See MarkForSnapshot() above.
+}
+
+// =============================================================================
+// Task 5.6: Composition Settings modal
+// =============================================================================
+// OpenCompSettingsModal seeds the staging (pending*) fields from the CURRENT
+// live values and sets the show flag so the modal opens on the next frame.
+// This is the ONE place these values get copied — DrawCompSettingsModal treats
+// them as read/write scratch space and only propagates back on Apply.
+void RenderEngine::OpenCompSettingsModal() {
+    pendingCompW     = compositionWidth;
+    pendingCompH     = compositionHeight;
+    pendingCompFps   = compositionFps;
+    pendingCompDur   = animEngine.duration;
+    for (int i = 0; i < 4; ++i) pendingBgColor[i] = bgColor[i];
+    showCompSettingsModal = true;
+}
+
+void RenderEngine::DrawCompSettingsModal() {
+    if (!showCompSettingsModal) return;
+
+    // ImGui popup lifetime: we call OpenPopup once (guarded), then BeginPopupModal
+    // handles show/hide from there.
+    static const char* kModalId = "Composition Settings##CompSet";
+    ImGui::OpenPopup(kModalId);
+
+    // Center the modal on the main viewport.
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Appearing);
+
+    if (ImGui::BeginPopupModal(kModalId, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+
+        // -------- Resolution ---------------------------------------------
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Resolution");
+        ImGui::Separator();
+        // Task 5.6 pre-go review #1: floor is 64px, not 16, to keep letterbox
+        // math sane and ImGui::Image() from choking on sub-pixel divisions.
+        // Ceiling is 8192 for iGPU safety (larger allocations OOM on potato).
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::InputInt("Width##compW",  &pendingCompW,  0, 0);
+        pendingCompW = std::clamp(pendingCompW, 64, 8192);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::InputInt("Height##compH", &pendingCompH, 0, 0);
+        pendingCompH = std::clamp(pendingCompH, 64, 8192);
+
+        // Preset dropdown — just fills the W/H fields; user still Applies.
+        static const struct { const char* label; int w, h; } kPresets[] = {
+            { "1920 x 1080 (16:9 HD)",     1920, 1080 },
+            { "1080 x 1920 (9:16 vertical)", 1080, 1920 },
+            { "1080 x 1080 (square)",      1080, 1080 },
+            { "3840 x 2160 (4K UHD)",      3840, 2160 },
+            { "1280 x 720  (720p HD)",     1280, 720  },
+            { "640 x 360   (proxy)",       640,  360  },
+        };
+        const int nPresets = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
+        int presetIdx = -1;
+        for (int i = 0; i < nPresets; ++i) {
+            if (pendingCompW == kPresets[i].w && pendingCompH == kPresets[i].h) {
+                presetIdx = i; break;
+            }
+        }
+        ImGui::SetNextItemWidth(250.0f);
+        if (ImGui::BeginCombo("Preset##compPreset",
+                              (presetIdx >= 0) ? kPresets[presetIdx].label : "(custom)")) {
+            for (int i = 0; i < nPresets; ++i) {
+                const bool sel = (i == presetIdx);
+                if (ImGui::Selectable(kPresets[i].label, sel)) {
+                    pendingCompW = kPresets[i].w;
+                    pendingCompH = kPresets[i].h;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::Dummy(ImVec2(0, 6));
+
+        // -------- Timing -------------------------------------------------
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Timing");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::InputFloat("Duration (s)##compDur", &pendingCompDur, 0.0f, 0.0f, "%.2f");
+        pendingCompDur = std::clamp(pendingCompDur, 0.1f, 3600.0f);
+
+        // FPS combo with Custom preservation (pre-go review #3).
+        static const int   kFpsPresets[] = { 24, 30, 60 };
+        static const char* kFpsLabels[]  = { "24 fps", "30 fps", "60 fps" };
+        const int nFps = (int)(sizeof(kFpsPresets) / sizeof(kFpsPresets[0]));
+        int fpsIdx = -1;
+        for (int i = 0; i < nFps; ++i) {
+            if (pendingCompFps == kFpsPresets[i]) { fpsIdx = i; break; }
+        }
+        char customLbl[32];
+        std::snprintf(customLbl, sizeof(customLbl), "Custom: %d fps", pendingCompFps);
+        const char* preview = (fpsIdx >= 0) ? kFpsLabels[fpsIdx] : customLbl;
+
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::BeginCombo("Frame Rate##compFps", preview)) {
+            // If we currently hold a custom value, list it FIRST so the user
+            // can re-select it (or just close without changing).
+            if (fpsIdx < 0) {
+                if (ImGui::Selectable(customLbl, true)) { /* keep as-is */ }
+                ImGui::Separator();
+            }
+            for (int i = 0; i < nFps; ++i) {
+                const bool sel = (i == fpsIdx);
+                if (ImGui::Selectable(kFpsLabels[i], sel)) {
+                    pendingCompFps = kFpsPresets[i];
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::Dummy(ImVec2(0, 6));
+
+        // -------- Appearance ---------------------------------------------
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Appearance");
+        ImGui::Separator();
+        ImGui::ColorEdit4("Background##compBg", pendingBgColor,
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+
+        ImGui::Dummy(ImVec2(0, 10));
+        ImGui::Separator();
+
+        // -------- Buttons ------------------------------------------------
+        const float btnW = 100.0f;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        // Right-align the two buttons.
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - (btnW * 2 + 8));
+        if (ImGui::Button("Cancel##compCancel", ImVec2(btnW, 0))) {
+            showCompSettingsModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Apply##compApply", ImVec2(btnW, 0))) {
+            // Snapshot BEFORE mutations so Ctrl+Z restores the pre-Apply
+            // state. Task 5.6 MarkForSnapshot rework makes this synchronous.
+            MarkForSnapshot();
+
+            const bool sizeChanged =
+                (pendingCompW != compositionWidth ||
+                 pendingCompH != compositionHeight);
+
+            compositionWidth   = pendingCompW;
+            compositionHeight  = pendingCompH;
+            compositionFps     = pendingCompFps;
+            for (int i = 0; i < 4; ++i) bgColor[i] = pendingBgColor[i];
+            animEngine.duration = pendingCompDur;
+
+            if (sizeChanged) {
+                ReleaseCompositionRT();
+                CreateCompositionRT((UINT)compositionWidth, (UINT)compositionHeight);
+                effectManager.Resize((UINT)compositionWidth, (UINT)compositionHeight);
+            }
+
+            // Ship-this-commit-only wiring (design section 12): Export Queue
+            // default FPS follows the comp's frame rate. Deferred: timeline
+            // ruler tick spacing, snap-to-frame scrub.
+            pendingExport.fps = compositionFps;
+
+            SetStatus("Composition settings applied.");
+            showCompSettingsModal = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
 }
 
 void RenderEngine::Shutdown() {
