@@ -3820,6 +3820,34 @@ void RenderEngine::PumpExportOneFrameIfActive() {
     ID3D11RenderTargetView* rtv = exportEngine.GetRenderTargetView();
     if (!rtv) return;
 
+    // -------------------------------------------------------------------
+    // Task 6.1-fix: DETERMINISTIC comp-time advancement during export.
+    //
+    // Previously we relied on animEngine.Update(wall-clock delta) from
+    // BeginFrame to advance currentTime. Two problems with that:
+    //   1. If the user never hit Play, animEngine.isPlaying == false so
+    //      currentTime stays frozen and every exported frame is identical.
+    //      -> "the rectangle doesn't move" bug the user reported.
+    //   2. Even with Play on, real wall-clock timing means the exported
+    //      animation runs at real time (correct only if export FPS matches
+    //      render FPS exactly, which almost never happens on potato HW).
+    //
+    // Fix: derive comp time from the frame index directly:
+    //      t = frameIndex / fps
+    // Force it into animEngine.currentTime, then re-run layerManager.
+    // BeginFrame so every downstream AnimatedProperty<T>::Evaluate() call
+    // during the export render pass sees the correct time. isPlaying state
+    // is irrelevant — we bypass the wall-clock path entirely.
+    // -------------------------------------------------------------------
+    const int   fpsSafe    = (exportEngine.GetSettings().fps > 0)
+                              ? exportEngine.GetSettings().fps : 30;
+    const float exportTime = (float)st.frameIndex / (float)fpsSafe;
+    animEngine.currentTime = exportTime;
+    layerManager.BeginFrame(exportTime);
+    // Camera-follows-layer path also needs a re-sync at the new time so a
+    // Camera layer with animated position exports correctly.
+    SyncCameraFromLayerIfAny();
+
     // Task 5.0: the composition texture has already been drawn to during
     // DrawViewportCanvas earlier in the frame. Render the scene AGAIN at
     // export resolution into the export RT, so the MP4 shows the actual
@@ -3831,7 +3859,9 @@ void RenderEngine::PumpExportOneFrameIfActive() {
     // so red and blue would swap in the output file. We fix that by
     // pre-swapping the color channels below.)
     if (compRenderer.IsReady()) {
-        const float bg[4] = { 0.08f, 0.08f, 0.10f, 1.0f };
+        // Task 6.1: honor the user's Composition Settings background color
+        // instead of the pre-5.6 hard-coded dark gray.
+        const float* bg = bgColor;
 
         // Temporarily swap R/B in every layer's fillColor for this pass so
         // the export MP4 (BGRA) reads correctly. Since fillColor is stored
