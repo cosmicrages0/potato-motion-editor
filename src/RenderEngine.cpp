@@ -231,13 +231,87 @@ void RenderEngine::HandleEvents(bool& running) {
                 windowHeight = event.window.data2;
             }
         }
-        // Keyboard shortcuts (Delete = remove selected layer)
+        // Keyboard shortcuts.
+        // Delete / Backspace:
+        //   * If the playhead is snapped to at least one keyframe on the
+        //     selected layer (matching the timeline strip's near-playhead
+        //     highlight), delete THOSE keyframes only.
+        //   * Otherwise, delete the whole layer (original behavior).
+        // The threshold used here mirrors the visual highlight in
+        // DrawTimelineStrip (`kNearPlayheadPixels = 10.0f`). We can't reuse
+        // the pixel-space math from that function (the panel geometry isn't
+        // known here), so we convert to a time epsilon: 1% of the comp
+        // duration, clamped to a sane [0.02s, 0.5s] range. That's tight
+        // enough that only visibly-highlighted diamonds get hit at typical
+        // timeline widths.
         if (event.type == SDL_KEYDOWN && !ImGui::GetIO().WantTextInput) {
             const SDL_Keycode k = event.key.keysym.sym;
             if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
-                if (layerManager.GetSelectedId() != -1) {
-                    MarkForSnapshot();
-                    layerManager.DeleteLayerById(layerManager.GetSelectedId());
+                const int selId = layerManager.GetSelectedId();
+                if (selId != -1) {
+                    Layer* sel = layerManager.GetLayerById(selId);
+                    const float t = animEngine.currentTime;
+                    const float dur = (animEngine.duration > 0.001f)
+                                          ? animEngine.duration : 1.0f;
+                    const float eps = std::clamp(dur * 0.01f, 0.02f, 0.5f);
+
+                    // Helper: return true if any key in `prop` sits within
+                    // `eps` seconds of the playhead. Delete every such key
+                    // (multiple keys can share a time if the user really
+                    // wants it, though the same-time guard usually prevents
+                    // that from happening).
+                    auto deleteNearby = [&](auto& prop) -> int {
+                        int removed = 0;
+                        for (auto it = prop.keyframes.begin();
+                             it != prop.keyframes.end(); ) {
+                            if (std::fabs(it->time - t) <= eps) {
+                                it = prop.keyframes.erase(it);
+                                ++removed;
+                            } else {
+                                ++it;
+                            }
+                        }
+                        return removed;
+                    };
+
+                    // First pass: count matches without deleting so we know
+                    // whether to route to key-delete or layer-delete.
+                    int nearKeys = 0;
+                    if (sel) {
+                        auto countNearby = [&](const auto& prop) {
+                            for (const auto& kk : prop.keyframes) {
+                                if (std::fabs(kk.time - t) <= eps) ++nearKeys;
+                            }
+                        };
+                        countNearby(sel->transform.position);
+                        countNearby(sel->transform.rotation);
+                        countNearby(sel->transform.scale);
+                        countNearby(sel->transform.anchorPoint);
+                        countNearby(sel->transform.sizePixels);
+                        countNearby(sel->transform.opacity);
+                    }
+
+                    if (nearKeys > 0 && sel) {
+                        // Key-delete path. Snapshot BEFORE the mutation so
+                        // Ctrl+Z restores the removed keys.
+                        MarkForSnapshot();
+                        int total = 0;
+                        total += deleteNearby(sel->transform.position);
+                        total += deleteNearby(sel->transform.rotation);
+                        total += deleteNearby(sel->transform.scale);
+                        total += deleteNearby(sel->transform.anchorPoint);
+                        total += deleteNearby(sel->transform.sizePixels);
+                        total += deleteNearby(sel->transform.opacity);
+                        char msg[96];
+                        std::snprintf(msg, sizeof(msg),
+                                      "Deleted %d keyframe%s at %.3fs.",
+                                      total, (total == 1 ? "" : "s"), t);
+                        SetStatus(msg);
+                    } else {
+                        // Layer-delete path (original behavior).
+                        MarkForSnapshot();
+                        layerManager.DeleteLayerById(selId);
+                    }
                 }
             }
         }
