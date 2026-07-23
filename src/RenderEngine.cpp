@@ -3125,7 +3125,13 @@ void RenderEngine::DrawGraphEditor() {
                                         ? IM_COL32(180, 180, 180, 160)
                                         : IM_COL32(255, 200, 0, 255);
                     dl->AddLine(kp, hp, hcol, 1.5f);
-                    dl->AddCircleFilled(hp, 5.0f, hcol);
+                    // Bigger, ringed handle in Speed mode so it's obviously
+                    // draggable even when speed=0 (handle sits AT the key dot).
+                    const float hr = (graphMode == GraphMode::Speed) ? 7.0f : 5.0f;
+                    dl->AddCircleFilled(hp, hr, hcol);
+                    if (graphMode == GraphMode::Speed) {
+                        dl->AddCircle(hp, hr + 2.0f, IM_COL32(255, 255, 255, 200), 12, 1.5f);
+                    }
                     selOutHandlePos = hp; selHasOutHandle = true;
                 }
                 const bool inBez = (inMode == (int)InterpMode::Bezier ||
@@ -3145,7 +3151,11 @@ void RenderEngine::DrawGraphEditor() {
                                         ? IM_COL32(180, 180, 180, 160)
                                         : IM_COL32(255, 200, 0, 255);
                     dl->AddLine(kp, hp, hcol, 1.5f);
-                    dl->AddCircleFilled(hp, 5.0f, hcol);
+                    const float hr = (graphMode == GraphMode::Speed) ? 7.0f : 5.0f;
+                    dl->AddCircleFilled(hp, hr, hcol);
+                    if (graphMode == GraphMode::Speed) {
+                        dl->AddCircle(hp, hr + 2.0f, IM_COL32(255, 255, 255, 200), 12, 1.5f);
+                    }
                     selInHandlePos = hp; selHasInHandle = true;
                 }
             }
@@ -3178,25 +3188,47 @@ void RenderEngine::DrawGraphEditor() {
             const int inMode  = facc.readInMode (facc.prop, graphSelectedKeyIndex);
             const bool outLocked = (outMode == (int)InterpMode::AutoBezier);
             const bool inLocked  = (inMode  == (int)InterpMode::AutoBezier);
-            if (selHasOutHandle && !outLocked && dist2(mp, selOutHandlePos) < 12.0f * 12.0f) {
+            // Larger hit radius in Speed mode: handles often sit AT the X-axis
+            // (when speed is 0, |speed|=0) so they overlap with the key dot.
+            const float hitR2 = (graphMode == GraphMode::Speed) ? (18.0f * 18.0f)
+                                                                : (12.0f * 12.0f);
+            if (selHasOutHandle && !outLocked && dist2(mp, selOutHandlePos) < hitR2) {
                 graphDraggedTangent = GraphTangent::Out;
                 MarkForSnapshot();
-            } else if (selHasInHandle && !inLocked && dist2(mp, selInHandlePos) < 12.0f * 12.0f) {
+            } else if (selHasInHandle && !inLocked && dist2(mp, selInHandlePos) < hitR2) {
                 graphDraggedTangent = GraphTangent::In;
                 MarkForSnapshot();
             }
         }
         if (graphDraggedTangent == GraphTangent::None) {
+            // Key hit-testing must match how keys were DRAWN. In Value mode
+            // that's ToScreen(kt, readValue); in Speed mode it's the sampled
+            // speed curve height (see the key-dot drawing loop above).
+            // Bug in first-pass 5.4-fix-2: this loop always used readValue,
+            // so keys were unclickable in Speed mode.
             int  bestIdx = -1, bestDim = graphFocusDim;
             float bestD2 = 14.0f * 14.0f;
             for (int i = 0; i < nKeys; ++i) {
-                for (int d = 0; d < nDims; ++d) {
-                    const auto& acc = accs[d];
-                    const float kt = acc.readTime(acc.prop, i);
-                    const float kv = acc.readValue(acc.prop, i);
-                    const ImVec2 kp = ToScreen(kt, kv);
+                if (graphMode == GraphMode::Speed) {
+                    // Single dot per key in Speed mode — place at same
+                    // sampled speed height used in the draw loop.
+                    const float kt = accs[0].readTime(accs[0].prop, i);
+                    float sv = 0.0f;
+                    for (int s = 0; s < nSamples; ++s) {
+                        if (sampleTime[s] >= kt) { sv = spdSamples[s]; break; }
+                    }
+                    const ImVec2 kp = ToScreen(kt, sv);
                     const float d2 = dist2(mp, kp);
-                    if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = d; }
+                    if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = graphFocusDim; }
+                } else {
+                    for (int d = 0; d < nDims; ++d) {
+                        const auto& acc = accs[d];
+                        const float kt = acc.readTime(acc.prop, i);
+                        const float kv = acc.readValue(acc.prop, i);
+                        const ImVec2 kp = ToScreen(kt, kv);
+                        const float d2 = dist2(mp, kp);
+                        if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = d; }
+                    }
                 }
             }
             if (bestIdx >= 0) {
@@ -3309,18 +3341,30 @@ void RenderEngine::DrawGraphEditor() {
         graphDraggedTangent = GraphTangent::None;
     }
 
-    // Right-click a key -> context menu.
+    // Right-click a key -> context menu. Same mode-aware hit-testing as
+    // left-click.
     if (interactive && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         int bestIdx = -1, bestDim = graphFocusDim;
         float bestD2 = 14.0f * 14.0f;
         for (int i = 0; i < nKeys; ++i) {
-            for (int d = 0; d < nDims; ++d) {
-                const auto& acc = accs[d];
-                const float kt = acc.readTime(acc.prop, i);
-                const float kv = acc.readValue(acc.prop, i);
-                const ImVec2 kp = ToScreen(kt, kv);
+            if (graphMode == GraphMode::Speed) {
+                const float kt = accs[0].readTime(accs[0].prop, i);
+                float sv = 0.0f;
+                for (int s = 0; s < nSamples; ++s) {
+                    if (sampleTime[s] >= kt) { sv = spdSamples[s]; break; }
+                }
+                const ImVec2 kp = ToScreen(kt, sv);
                 const float d2 = dist2(mp, kp);
-                if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = d; }
+                if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = graphFocusDim; }
+            } else {
+                for (int d = 0; d < nDims; ++d) {
+                    const auto& acc = accs[d];
+                    const float kt = acc.readTime(acc.prop, i);
+                    const float kv = acc.readValue(acc.prop, i);
+                    const ImVec2 kp = ToScreen(kt, kv);
+                    const float d2 = dist2(mp, kp);
+                    if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = d; }
+                }
             }
         }
         if (bestIdx >= 0) {
