@@ -3637,28 +3637,14 @@ void RenderEngine::DrawRenderQueuePanel() {
 
         ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f),
             "Step 2: Configure the export.");
-        // Preset dropdown
-        static const char* kPresets[] = { "720p HD (1280x720)",
-                                          "1080p Full HD (1920x1080)",
-                                          "4K Ultra HD (3840x2160)",
-                                          "Custom" };
-        static int kPresetSizes[][2] = { {1280, 720}, {1920, 1080},
-                                         {3840, 2160}, {0, 0} };
-        int presetIdx = 3; // Custom by default; snap if size matches a preset
-        for (int i = 0; i < 3; ++i) {
-            if (pendingExport.width == kPresetSizes[i][0] &&
-                pendingExport.height == kPresetSizes[i][1]) {
-                presetIdx = i; break;
-            }
-        }
-        if (ImGui::Combo("Preset", &presetIdx, kPresets, 4)) {
-            if (presetIdx < 3) {
-                pendingExport.width  = kPresetSizes[presetIdx][0];
-                pendingExport.height = kPresetSizes[presetIdx][1];
-            }
-        }
-        ImGui::InputInt("Width",  &pendingExport.width);
-        ImGui::InputInt("Height", &pendingExport.height);
+        // Task 6.1: resolution is driven directly by Composition Settings
+        // (Composition -> Settings...). The old Preset + Width/Height inputs
+        // caused an export/comp size mismatch bug that killed the ffmpeg
+        // pipe when the comp was portrait and the preset was landscape.
+        // Change the comp size upstream, not here.
+        ImGui::Text("Resolution: %d x %d", compositionWidth, compositionHeight);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(from Composition Settings)");
 
         // FPS
         static const char* kFpsLabels[] = { "24", "30", "60" };
@@ -3703,6 +3689,10 @@ void RenderEngine::DrawRenderQueuePanel() {
         }
 
         if (ImGui::Button("Start Export", ImVec2(-1, 32))) {
+            // Task 6.1: force dimensions from the composition. Ignores any
+            // stale pendingExport.width/height from a pre-6.1 saved session.
+            pendingExport.width       = compositionWidth;
+            pendingExport.height      = compositionHeight;
             pendingExport.totalFrames = (int)(pendingExportSeconds *
                                               (float)pendingExport.fps);
             showFfmpegMissingPopup = false;

@@ -11,33 +11,43 @@
 #include <atomic>
 
 // -----------------------------------------------------------------------------
-// ExportEngine — zero-RAM-spike 4K MP4 exporter.
+// ExportEngine — zero-RAM-spike MP4 exporter (Windows-native CreateProcess).
 //
 // The design guarantee (from SOFTWARE_SPEC.md and PROJECT_BRIEFING Section 11):
 // no more than ONE frame of raw pixels lives in RAM at any moment, regardless
 // of clip length or resolution. Even a 4K frame is only 3840*2160*4 = 32 MB.
 //
+// Task 6.1 rework: moved off _popen("wb") and onto CreateProcess + CreatePipe
+// so we can (a) guarantee zero text-mode CR/LF munging on the raw BGRA byte
+// stream, (b) redirect ffmpeg's stderr into a log file so failures produce a
+// real diagnostic instead of the generic "encoder died?" message. The child
+// still reads its input from an anonymous pipe; our side owns the WRITE
+// handle and calls WriteFile per frame.
+//
 // How it works:
-//   1. Spawn ffmpeg.exe via _popen(..., "wb") -- BINARY mode is critical:
-//      text mode would CR/LF-corrupt any 0x0A byte in the pixel stream.
-//   2. Allocate exactly two textures at export resolution:
-//        - render target (GPU-only, RGBA/BGRA)
+//   1. CreatePipe() -> we get hChildStdIn_Write (owned), ffmpeg gets the READ
+//      end via STARTUPINFO handle inheritance.
+//   2. CreateFile(logPath, GENERIC_WRITE) for ffmpeg's stderr/stdout. Whole
+//      transcript survives across the export for post-mortem inspection.
+//   3. CreateProcessA() launches ffmpeg with CREATE_NO_WINDOW so no cmd
+//      window flashes.
+//   4. Allocate two textures at export resolution:
+//        - render target (GPU-only, BGRA)
 //        - CPU-readable staging texture (D3D11_USAGE_STAGING)
-//   3. Per frame:
+//   5. Per frame:
 //        - Rasterize the composition into the render target
 //        - CopyResource -> staging
-//        - Map -> fwrite -> Unmap
-//        The mapped pointer is written straight into the pipe. No malloc, no
-//        intermediate buffer, no memcpy into a std::vector.
-//   4. On Stop/Cancel: fflush + _pclose the pipe, release the two textures.
+//        - Map -> WriteFile the mapped pointer straight into the pipe -> Unmap
+//        No malloc, no intermediate buffer, no memcpy into a std::vector.
+//   6. On Stop/Cancel: CloseHandle(stdin write) signals EOF; wait for the
+//      process to exit; read the tail of the log for the error message if
+//      exit code != 0.
 //
-// UI responsiveness note:
+// UI responsiveness note (unchanged from Task 6.0):
 //   D3D11 immediate contexts are NOT thread-safe by default, and this app
 //   doesn't create the device with the multithread flag. So the export runs
-//   on the main thread and pumps ImGui between frames -- the progress bar
-//   ticks visibly even during a long export. Task 6.5 (post-usability-pass)
-//   can move this to a deferred-context worker if anyone actually needs
-//   faster-than-realtime exports.
+//   on the main thread and pumps ImGui between frames — the progress bar
+//   ticks visibly even during a long export.
 // -----------------------------------------------------------------------------
 
 class ExportEngine {
@@ -114,8 +124,13 @@ private:
     ID3D11ShaderResourceView* srv_      = nullptr;
     ID3D11Texture2D*         stagingTex_ = nullptr;
 
-    // Owned OS resource: pipe to ffmpeg.exe
-    FILE*    ffmpegPipe_ = nullptr;
+    // Task 6.1: Windows-native process + pipe handles. Replaces the old
+    // FILE* ffmpegPipe_ from the _popen path. All owned; released in End().
+    HANDLE       childStdIn_Write_ = nullptr;   // our write end of the pipe
+    HANDLE       ffmpegProcess_    = nullptr;   // ffmpeg.exe process handle
+    HANDLE       ffmpegThread_     = nullptr;   // main thread of ffmpeg
+    HANDLE       logFile_          = nullptr;   // ffmpeg stderr/stdout capture
+    std::string  logFilePath_;                  // absolute path to the log file
 
     Settings settings_;
     Status   status_;
