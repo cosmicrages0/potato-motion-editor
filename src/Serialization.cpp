@@ -478,6 +478,11 @@ bool AppStateToJson(const AppState& state, json& outRoot, std::string* outError)
     }
     outRoot["layers"]      = std::move(layersArr);
     outRoot["nextLayerId"] = state.layerManager->GetNextId();
+    // Task 5.6-fix-2: persist which layer is currently selected so undo/redo
+    // (and file reload) don't reset the user's focus to the front-most layer.
+    // Root-level field, not inside "composition" — selection is editor state,
+    // not a comp property. Missing on read => front-layer fallback still fires.
+    outRoot["selectedLayerId"] = state.layerManager->GetSelectedId();
     return true;
 }
 
@@ -533,6 +538,17 @@ bool JsonToAppState(const json& root, AppState& state, std::string* outError) {
     const int dummy = state.layerManager->AddLayer(ShapeType::Null, "___pmge_load_dummy___");
     state.layerManager->DeleteLayerById(dummy);
 
+    // Task 5.6-fix-2: restore the saved selection BEFORE the front-layer
+    // fallback fires. Guarded by GetLayerById so a stale ID (e.g. the
+    // selected layer was deleted between save and load, or the snapshot
+    // captured a layer that undo has since removed) falls through cleanly
+    // instead of leaving selectedLayerId pointing at nothing.
+    if (root.contains("selectedLayerId") && root["selectedLayerId"].is_number()) {
+        const int savedSel = root["selectedLayerId"].get<int>();
+        if (savedSel >= 0 && state.layerManager->GetLayerById(savedSel) != nullptr) {
+            state.layerManager->SetSelectedId(savedSel);
+        }
+    }
     if (state.layerManager->GetSelectedId() < 0 && !state.layerManager->Layers().empty()) {
         state.layerManager->SetSelectedId(state.layerManager->Layers().front().id);
     }
