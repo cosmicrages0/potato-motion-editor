@@ -166,37 +166,41 @@ private:
     DiamondHit  contextDiamond;
 
     // -------------------------------------------------------------------------
-    // Task 5.4: Graph Editor state.
+    // Task 5.4-fix: Graph Editor state (AE-accurate).
     //
-    // The graph editor shows ONE scalar dimension of ONE property of the
-    // selected layer at a time. This matches AE's "Separate Dimensions"
-    // convention — every property.channel gets its own graph.
-    //
-    // GraphChannel enumerates the scalar dimensions we can plot.
-    // GraphMode toggles the Value curve vs Speed (velocity) view — same
-    // underlying keys, different visualization.
+    // AE draws the Value graph as one curve per scalar dimension (X=red,
+    // Y=green, Z=blue) on top of each other for Vec2/Vec3 properties, and
+    // the Speed graph as ONE magnitude curve = sqrt(dx^2+dy^2+...)/dt for
+    // multi-dim properties. The property picker therefore has fewer entries
+    // than my first-pass 5.4: we pick the WHOLE property group, not one
+    // scalar channel at a time. Tangent editing still targets one "focus
+    // dim" at a time (the selectedChannelDim) because Bezier handles are
+    // scalar concepts — but all dims render simultaneously.
     //
     // graphSelectedKey identifies the currently-selected keyframe for handle
     // dragging + context menu. draggedTangent flags which of the two tangents
     // on that key the user is currently dragging.
     // -------------------------------------------------------------------------
-    enum class GraphChannel : int {
-        PositionX = 0, PositionY, PositionZ,
-        RotationZ,
-        ScaleX, ScaleY,
-        Opacity,
+    enum class GraphPropGroup : int {
+        Position = 0,   // Vec3 — X red, Y green, Z blue
+        Rotation,       // Vec3 — z channel used in 2D
+        Scale,          // Vec3 — X red, Y green (Z ignored per AE)
+        Opacity,        // float — single curve
         COUNT
     };
-    enum class GraphMode : int { Value = 0, Speed = 1 };
+    enum class GraphMode    : int { Value = 0, Speed = 1 };
     enum class GraphTangent : int { None = 0, In = 1, Out = 2 };
-    GraphMode    graphMode              = GraphMode::Value;
-    GraphChannel graphChannel           = GraphChannel::PositionX;
-    bool         graphChannelAutoPicked = false;  // stops us re-picking after user chose
-    int          graphSelectedLayerId   = -1;
-    int          graphSelectedKeyIndex  = -1;
-    GraphTangent graphDraggedTangent    = GraphTangent::None;
-    // Right-click context menu target for the graph editor.
-    int          graphContextKeyIndex   = -1;
+
+    GraphMode      graphMode              = GraphMode::Value;
+    GraphPropGroup graphPropGroup         = GraphPropGroup::Position;
+    // Which scalar dim of the group is currently the "focus" for tangent
+    // editing: 0=x, 1=y, 2=z (or 0 for float / rotation).
+    int            graphFocusDim          = 0;
+    bool           graphAutoPicked        = false;   // per-layer auto-pick guard
+    int            graphSelectedLayerId   = -1;
+    int            graphSelectedKeyIndex  = -1;
+    GraphTangent   graphDraggedTangent    = GraphTangent::None;
+    int            graphContextKeyIndex   = -1;      // right-click target
     // Task 5.0: last "Test FFmpeg" result shown under the button.
     std::string            ffmpegTestResult;
     bool                   ffmpegTestOk = false;

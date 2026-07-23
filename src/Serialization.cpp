@@ -63,20 +63,75 @@ template <> float ReadValueT<float>(const json& j) { return j.is_number() ? j.ge
 template <> Vec2  ReadValueT<Vec2>(const json& j)  { return ReadVec2(j); }
 template <> Vec3  ReadValueT<Vec3>(const json& j)  { return ReadVec3(j); }
 
-// Task 5.4: serialize per-side interpolation mode as a short string so the
+// Task 5.4-fix: serialize per-side interpolation mode as a short string so the
 // .pmge file stays human-readable. Unknown / missing => Linear.
 inline const char* InterpModeToString(InterpMode m) {
     switch (m) {
-        case InterpMode::Bezier: return "bezier";
-        case InterpMode::Hold:   return "hold";
+        case InterpMode::Bezier:           return "bezier";
+        case InterpMode::ContinuousBezier: return "continuousBezier";
+        case InterpMode::AutoBezier:       return "autoBezier";
+        case InterpMode::Hold:             return "hold";
         case InterpMode::Linear:
-        default:                 return "linear";
+        default:                           return "linear";
     }
 }
 inline InterpMode InterpModeFromString(const std::string& s) {
-    if (s == "bezier") return InterpMode::Bezier;
-    if (s == "hold")   return InterpMode::Hold;
+    if (s == "bezier")           return InterpMode::Bezier;
+    if (s == "continuousBezier") return InterpMode::ContinuousBezier;
+    if (s == "autoBezier")       return InterpMode::AutoBezier;
+    if (s == "hold")             return InterpMode::Hold;
     return InterpMode::Linear;
+}
+
+// Convert AE-native (speed, influence) tangent data <-> JSON. Speed is a
+// value in T-space (scalar for float, array for Vec2/Vec3). Influence is a
+// single float in [0,100].
+template <typename T> json WriteSpeedT(const T& v)         { return WriteValueT(v); }
+template <typename T> T    ReadSpeedT(const json& j)       { return ReadValueT<T>(j); }
+
+// Legacy converter: Task 5.4 (commit 05bfb40) stored Bezier as raw
+// (time_offset, value_offset) tangents. We convert on load so evaluator only
+// sees the AE-native (speed, influence) form. Result is bit-identical because
+// it's the same underlying math on both sides of the conversion.
+//   time_offset  -> influence = |time_offset| / segment_span * 100
+//   value_offset -> speed     = value_offset / time_offset
+// The segment span comes from the neighbor key's time. If there's no neighbor
+// (edge key), we fall back to the full comp duration or 1s so the divide is
+// non-degenerate.
+template <typename T>
+struct Task54Legacy {
+    T     inValueOffset  = T{};
+    T     outValueOffset = T{};
+    float inTimeOffset   = 0.0f;
+    float outTimeOffset  = 0.0f;
+    bool  hasAny         = false;
+};
+
+template <typename T>
+inline void ApplyTask54Legacy(Keyframe<T>& k, const Task54Legacy<T>& lg,
+                              float leftSpan, float rightSpan) {
+    if (!lg.hasAny) return;
+    // Guard degenerate spans.
+    if (leftSpan  < 1e-4f) leftSpan  = 1.0f;
+    if (rightSpan < 1e-4f) rightSpan = 1.0f;
+    // Incoming (negative time offset expected).
+    if (lg.inTimeOffset != 0.0f) {
+        k.inInfluence = std::clamp(std::fabs(lg.inTimeOffset) / leftSpan * 100.0f,
+                                   0.0f, 100.0f);
+        const float denom = lg.inTimeOffset;  // negative
+        if (std::fabs(denom) > 1e-6f) {
+            k.inSpeed = ScaleT(lg.inValueOffset, 1.0f / denom);
+        }
+    }
+    // Outgoing (positive time offset expected).
+    if (lg.outTimeOffset != 0.0f) {
+        k.outInfluence = std::clamp(lg.outTimeOffset / rightSpan * 100.0f,
+                                    0.0f, 100.0f);
+        const float denom = lg.outTimeOffset;
+        if (std::fabs(denom) > 1e-6f) {
+            k.outSpeed = ScaleT(lg.outValueOffset, 1.0f / denom);
+        }
+    }
 }
 
 template <typename T>
@@ -89,21 +144,26 @@ json WriteAnimatedProperty(const AnimatedProperty<T>& p) {
         json kj;
         kj["t"] = k.time;
         kj["v"] = WriteValueT(k.value);
-        // Task 5.4: only emit tangent / mode fields when they carry non-default
-        // information. Keeps files small AND identical to Task 5.2 output for
-        // purely-linear animations.
+        // Only emit non-default fields — purely-linear files stay short and
+        // Task 5.2 output is byte-identical.
         if (k.incomingMode != InterpMode::Linear)
             kj["im"] = InterpModeToString(k.incomingMode);
         if (k.outgoingMode != InterpMode::Linear)
             kj["om"] = InterpModeToString(k.outgoingMode);
-        if (k.inTangentTime != 0.0f)  kj["it"] = k.inTangentTime;
-        if (k.outTangentTime != 0.0f) kj["ot"] = k.outTangentTime;
-        // Value-side tangents: emit only if the incoming/outgoing mode is
-        // Bezier — a Linear key never uses value offsets.
-        if (k.incomingMode == InterpMode::Bezier)
-            kj["iv"] = WriteValueT(k.inTangentValue);
-        if (k.outgoingMode == InterpMode::Bezier)
-            kj["ov"] = WriteValueT(k.outTangentValue);
+        // Influence is only meaningful when the side is a Bezier variant.
+        if (k.incomingMode == InterpMode::Bezier ||
+            k.incomingMode == InterpMode::ContinuousBezier ||
+            k.incomingMode == InterpMode::AutoBezier) {
+            kj["ii"] = k.inInfluence;
+            kj["is"] = WriteSpeedT(k.inSpeed);
+        }
+        if (k.outgoingMode == InterpMode::Bezier ||
+            k.outgoingMode == InterpMode::ContinuousBezier ||
+            k.outgoingMode == InterpMode::AutoBezier) {
+            kj["oi"] = k.outInfluence;
+            kj["os"] = WriteSpeedT(k.outSpeed);
+        }
+        if (k.roving) kj["r"] = true;
         keys.push_back(std::move(kj));
     }
     out["keys"] = std::move(keys);
@@ -119,21 +179,43 @@ AnimatedProperty<T> ReadAnimatedProperty(const json& j, const T& fallbackStatic)
     if (j.contains("sw"))     p.stopwatchEnabled = j["sw"].get<bool>();
     if (j.contains("static")) p.staticValue      = ReadValueT<T>(j["static"]);
     if (j.contains("keys") && j["keys"].is_array()) {
+        // First pass: read everything, deferring the legacy converter until we
+        // know each key's neighbors (so segment spans are correct).
+        struct RawKey { Keyframe<T> k; Task54Legacy<T> lg; };
+        std::vector<RawKey> raws;
+        raws.reserve(j["keys"].size());
         for (const auto& kj : j["keys"]) {
-            Keyframe<T> k;
-            k.time  = kj.value("t", 0.0f);
-            if (kj.contains("v")) k.value = ReadValueT<T>(kj["v"]);
-            // Task 5.4: tangents + modes are optional. Absent => Linear + zero
-            // (bit-identical to Task 5.2 files).
+            RawKey rk;
+            rk.k.time  = kj.value("t", 0.0f);
+            if (kj.contains("v")) rk.k.value = ReadValueT<T>(kj["v"]);
+            // Modes (both old and new schemas use "im"/"om").
             if (kj.contains("im") && kj["im"].is_string())
-                k.incomingMode = InterpModeFromString(kj["im"].get<std::string>());
+                rk.k.incomingMode = InterpModeFromString(kj["im"].get<std::string>());
             if (kj.contains("om") && kj["om"].is_string())
-                k.outgoingMode = InterpModeFromString(kj["om"].get<std::string>());
-            if (kj.contains("it") && kj["it"].is_number()) k.inTangentTime  = kj["it"].get<float>();
-            if (kj.contains("ot") && kj["ot"].is_number()) k.outTangentTime = kj["ot"].get<float>();
-            if (kj.contains("iv")) k.inTangentValue  = ReadValueT<T>(kj["iv"]);
-            if (kj.contains("ov")) k.outTangentValue = ReadValueT<T>(kj["ov"]);
-            p.keyframes.push_back(k);
+                rk.k.outgoingMode = InterpModeFromString(kj["om"].get<std::string>());
+            // New-schema AE-native fields.
+            if (kj.contains("ii") && kj["ii"].is_number()) rk.k.inInfluence  = kj["ii"].get<float>();
+            if (kj.contains("oi") && kj["oi"].is_number()) rk.k.outInfluence = kj["oi"].get<float>();
+            if (kj.contains("is")) rk.k.inSpeed  = ReadSpeedT<T>(kj["is"]);
+            if (kj.contains("os")) rk.k.outSpeed = ReadSpeedT<T>(kj["os"]);
+            if (kj.contains("r"))  rk.k.roving   = kj["r"].get<bool>();
+            // Task 5.4 legacy fields (raw (time_offset, value_offset) tangents).
+            if (kj.contains("it") && kj["it"].is_number()) { rk.lg.inTimeOffset  = kj["it"].get<float>(); rk.lg.hasAny = true; }
+            if (kj.contains("ot") && kj["ot"].is_number()) { rk.lg.outTimeOffset = kj["ot"].get<float>(); rk.lg.hasAny = true; }
+            if (kj.contains("iv")) { rk.lg.inValueOffset  = ReadValueT<T>(kj["iv"]); rk.lg.hasAny = true; }
+            if (kj.contains("ov")) { rk.lg.outValueOffset = ReadValueT<T>(kj["ov"]); rk.lg.hasAny = true; }
+            raws.push_back(std::move(rk));
+        }
+        // Second pass: apply legacy converter using neighbor times as spans.
+        for (size_t i = 0; i < raws.size(); ++i) {
+            const float leftSpan  = (i > 0)
+                ? raws[i].k.time - raws[i - 1].k.time
+                : 1.0f;
+            const float rightSpan = (i + 1 < raws.size())
+                ? raws[i + 1].k.time - raws[i].k.time
+                : 1.0f;
+            ApplyTask54Legacy(raws[i].k, raws[i].lg, leftSpan, rightSpan);
+            p.keyframes.push_back(raws[i].k);
         }
     }
     return p;

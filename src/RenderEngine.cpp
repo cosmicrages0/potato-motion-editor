@@ -1321,49 +1321,36 @@ void RenderEngine::DrawInspectorPanel() {
             Layer* target = layerManager.GetLayerById(graphSelectedLayerId);
             if (target) {
                 MarkForSnapshot();
-                // Map slingshot P1/P2 (normalized 0..1 time, 0..1 value) into
-                // per-side tangent offsets in property space. We treat P1 as
-                // the outgoing tangent of the previous-key and P2 as the
-                // incoming of the current key — the standard AE "ease" recipe.
-                // For a self-contained button we apply symmetric-ish tangents
-                // to the selected key so it eases smoothly on both sides.
+                // AE-native mapping: influence % = (1 - handle.x) * 100 for
+                // each side; speed left at zero for a classic ease shape.
+                // Users can then drag handles in the graph to add overshoot
+                // via non-zero speed. This is the same recipe F9 Easy Ease
+                // uses (speed=0, influence=33.33%) just parameterized from
+                // the demo curve's P1/P2 handles.
                 const Vec2 p1 = animEngine.currentCurve.P1;
                 const Vec2 p2 = animEngine.currentCurve.P2;
                 auto applyToKey = [&](auto& prop) {
                     if (graphSelectedKeyIndex < 0 ||
                         graphSelectedKeyIndex >= (int)prop.keyframes.size()) return;
                     auto& k = prop.keyframes[graphSelectedKeyIndex];
-                    // Neighbor times to scale the normalized (0..1) handles.
-                    float leftSpan  = 0.5f, rightSpan = 0.5f;
-                    if (graphSelectedKeyIndex > 0)
-                        leftSpan  = k.time - prop.keyframes[graphSelectedKeyIndex - 1].time;
-                    if (graphSelectedKeyIndex + 1 < (int)prop.keyframes.size())
-                        rightSpan = prop.keyframes[graphSelectedKeyIndex + 1].time - k.time;
-                    // Value delta to neighbor — used only to give the tangent
-                    // a reasonable magnitude (won't overshoot naturally, but
-                    // slingshot P1.y can push above 1 to force it).
                     k.incomingMode  = InterpMode::Bezier;
                     k.outgoingMode  = InterpMode::Bezier;
-                    k.inTangentTime  = -leftSpan  * (1.0f - p2.x);
-                    k.outTangentTime =  rightSpan * (1.0f - p1.x);
-                    // Zero value offsets => "ease" (time-only) tangents.
-                    // Users can drag handles in the graph to add overshoot.
-                    using TanT = std::decay_t<decltype(k.inTangentValue)>;
-                    k.inTangentValue  = TanT{};
-                    k.outTangentValue = TanT{};
+                    // P1.x is the outgoing handle's normalized time (0..1);
+                    // its distance from the key = influence fraction.
+                    k.outInfluence  = std::clamp(p1.x * 100.0f, 0.0f, 100.0f);
+                    // P2.x is the incoming handle's normalized time; distance
+                    // from the NEXT key = (1 - p2.x). That's the influence
+                    // on the incoming side of our selected key.
+                    k.inInfluence   = std::clamp((1.0f - p2.x) * 100.0f, 0.0f, 100.0f);
+                    using SpeedT = std::decay_t<decltype(k.inSpeed)>;
+                    k.inSpeed  = SpeedT{};
+                    k.outSpeed = SpeedT{};
                 };
-                switch (graphChannel) {
-                    case GraphChannel::PositionX:
-                    case GraphChannel::PositionY:
-                    case GraphChannel::PositionZ:
-                        applyToKey(target->transform.position); break;
-                    case GraphChannel::RotationZ:
-                        applyToKey(target->transform.rotation); break;
-                    case GraphChannel::ScaleX:
-                    case GraphChannel::ScaleY:
-                        applyToKey(target->transform.scale); break;
-                    case GraphChannel::Opacity:
-                        applyToKey(target->transform.opacity); break;
+                switch (graphPropGroup) {
+                    case GraphPropGroup::Position: applyToKey(target->transform.position); break;
+                    case GraphPropGroup::Rotation: applyToKey(target->transform.rotation); break;
+                    case GraphPropGroup::Scale:    applyToKey(target->transform.scale);    break;
+                    case GraphPropGroup::Opacity:  applyToKey(target->transform.opacity);  break;
                     default: break;
                 }
                 SetStatus("Slingshot curve applied as ease to selected key.");
@@ -2377,214 +2364,280 @@ void RenderEngine::DrawEffectControlsPanel() {
 // Graph Editor (unchanged from Task 2 but with the same defensive guards)
 // =============================================================================
 // =============================================================================
-// Task 5.4: Real Graph Editor with per-keyframe Bezier easing.
+// Task 5.4-fix: AE-accurate Graph Editor.
 //
-// Design in DESIGN_COMMIT5_GRAPH_EDITOR.md. Short version:
-//   - Top toolbar: [Value][Speed] mode, property picker dropdown.
-//   - Body: one scalar channel plotted (time X, value Y). Draggable tangent
-//     handles on the selected keyframe. Right-click a key for
-//     Linear/Bezier/Hold/Delete. Playhead is a red vertical line.
-//   - Value mode = plot value(t). Speed mode = plot dv/dt (finite diff).
-//   - Backward compat: pure-Linear keys draw as straight lines and have no
-//     visible handles; the fast-path Lerp in Evaluate() still runs.
+// Design in DESIGN_COMMIT6_AE_ACCURATE_GRAPH.md. Short version:
+//   - Storage is AE-native (speed, influence) per side (see AnimatedProperty.h).
+//   - Toolbar: [Value][Speed] mode toggle, property GROUP picker
+//     (Position/Rotation/Scale/Opacity — not per-channel).
+//   - Value mode plots ALL scalar dims of the group simultaneously:
+//       X red, Y green, Z blue. Focused-dim keys render bright, others dim.
+//   - Speed mode plots ONE magnitude curve: |dv|/dt combined across dims,
+//     matching AE's Position speed = sqrt(vx^2 + vy^2 + vz^2).
+//   - Left-click a key selects it (and picks the closest dim as focus).
+//     Drag its handle: free 2D by default, Shift=influence-only,
+//     Alt=speed-only. Handle position is DERIVED from (speed, influence),
+//     not stored — dragging inverts back into the AE-native fields.
+//   - ContinuousBezier keys mirror in/out on drag (same speed magnitude,
+//     same influence).
+//   - AutoBezier keys have their tangents recomputed each frame from
+//     neighbor slopes; handles are drawn dimmed and don't respond to drag.
+//   - Right-click a key: Linear / Bezier / Continuous Bezier / Auto Bezier /
+//     Hold / Delete Keyframe.
+//   - Playhead is a red vertical line.
 // =============================================================================
 
 // Helpers scoped to this TU only.
 namespace {
 
-// Extract the currently-selected scalar channel from a Layer, returning a
-// pointer to the underlying AnimatedProperty<T> and a "which scalar index"
-// hint (0 for float / single-dim, 0..2 for X/Y/Z of Vec2/Vec3). We handle
-// the actual per-channel scalar read/write with tiny lambdas below rather
-// than exposing 6 different template overloads to the drawing code.
+// One accessor per (property-type, scalar-dim) so the drawing code can pull
+// per-dim scalars out of Vec2/Vec3 properties without templating the whole
+// draw function. C-style function pointers can't capture `dim`, so we bake
+// dim into a template instantiation.
 
-struct ChannelAccessor {
-    // Number of keys in the underlying property.
-    int  (*keyCount)(void* prop)                                = nullptr;
-    // Read scalar for key i.
-    float(*readValue)(void* prop, int i)                        = nullptr;
-    // Write scalar for key i (used by tangent drag / context menu).
-    void (*writeValue)(void* prop, int i, float v)              = nullptr;
-    // Read/write the two tangent scalars.
-    float(*readOutTanValue)(void* prop, int i)                  = nullptr;
-    void (*writeOutTanValue)(void* prop, int i, float v)        = nullptr;
-    float(*readInTanValue)(void* prop, int i)                   = nullptr;
-    void (*writeInTanValue)(void* prop, int i, float v)         = nullptr;
-    // Read key time, in/out tan times, modes.
-    float(*readTime)(void* prop, int i)                         = nullptr;
-    float(*readOutTanTime)(void* prop, int i)                   = nullptr;
-    void (*writeOutTanTime)(void* prop, int i, float v)         = nullptr;
-    float(*readInTanTime)(void* prop, int i)                    = nullptr;
-    void (*writeInTanTime)(void* prop, int i, float v)          = nullptr;
-    int  (*readInMode)(void* prop, int i)                       = nullptr;
-    int  (*readOutMode)(void* prop, int i)                      = nullptr;
-    void (*writeInMode)(void* prop, int i, int m)               = nullptr;
-    void (*writeOutMode)(void* prop, int i, int m)              = nullptr;
-    // Delete key i.
-    void (*eraseKey)(void* prop, int i)                         = nullptr;
-    // Enabled + stopwatch predicates.
-    bool (*isAnimated)(void* prop)                              = nullptr;
-
-    void* prop = nullptr;
-    const char* label = "";
-};
-
-// Build an accessor that reads scalar `dim` (0/1/2) out of a
-// AnimatedProperty<Vec3> or ...<Vec2>, or the scalar of a <float>.
-template <typename T>
-inline float PickScalar(const T& v, int dim);
-template <> inline float PickScalar<float>(const float& v, int) { return v; }
-template <> inline float PickScalar<Vec2>(const Vec2& v, int dim) {
-    return dim == 0 ? v.x : v.y;
-}
-template <> inline float PickScalar<Vec3>(const Vec3& v, int dim) {
+template <typename T> inline float PickScalar(const T& v, int dim);
+template <> inline float PickScalar<float>(const float& v, int)     { return v; }
+template <> inline float PickScalar<Vec2>(const Vec2& v, int dim)   { return dim == 0 ? v.x : v.y; }
+template <> inline float PickScalar<Vec3>(const Vec3& v, int dim)   {
     if (dim == 0) return v.x;
     if (dim == 1) return v.y;
     return v.z;
 }
-template <typename T>
-inline void PutScalar(T& v, int dim, float s);
-template <> inline void PutScalar<float>(float& v, int, float s) { v = s; }
-template <> inline void PutScalar<Vec2>(Vec2& v, int dim, float s) {
-    if (dim == 0) v.x = s; else v.y = s;
-}
-template <> inline void PutScalar<Vec3>(Vec3& v, int dim, float s) {
-    if (dim == 0) v.x = s;
-    else if (dim == 1) v.y = s;
-    else v.z = s;
+template <typename T> inline void PutScalar(T& v, int dim, float s);
+template <> inline void PutScalar<float>(float& v, int, float s)    { v = s; }
+template <> inline void PutScalar<Vec2>(Vec2& v, int dim, float s)  { if (dim == 0) v.x = s; else v.y = s; }
+template <> inline void PutScalar<Vec3>(Vec3& v, int dim, float s)  {
+    if (dim == 0) v.x = s; else if (dim == 1) v.y = s; else v.z = s;
 }
 
-// Because C-style function pointers can't capture `dim`, we generate one
-// concrete accessor per (T, dim) via a helper struct template. The DrawGraph
-// code below only calls the accessor via `dim`-parameterized dispatchers.
+// Number of scalar dims per typed property. Used to iterate curves.
+template <typename T> inline int DimCount();
+template <> inline int DimCount<float>() { return 1; }
+template <> inline int DimCount<Vec2>()  { return 2; }
+template <> inline int DimCount<Vec3>()  { return 3; }
+
+// Speed graph magnitude helper: for Vec3 we combine dx,dy,dz;
+// for Vec2 dx,dy; for float just |dv|. AE ignores Z for Scale.
+template <typename T>
+inline float MagnitudeDeltaOverDt(const T& a, const T& b, float dt, bool ignoreZ);
+template <>
+inline float MagnitudeDeltaOverDt<float>(const float& a, const float& b, float dt, bool) {
+    if (dt <= 1e-6f) return 0.0f;
+    return std::fabs(b - a) / dt;
+}
+template <>
+inline float MagnitudeDeltaOverDt<Vec2>(const Vec2& a, const Vec2& b, float dt, bool) {
+    if (dt <= 1e-6f) return 0.0f;
+    const float dx = b.x - a.x, dy = b.y - a.y;
+    return std::sqrt(dx*dx + dy*dy) / dt;
+}
+template <>
+inline float MagnitudeDeltaOverDt<Vec3>(const Vec3& a, const Vec3& b, float dt, bool ignoreZ) {
+    if (dt <= 1e-6f) return 0.0f;
+    const float dx = b.x - a.x, dy = b.y - a.y, dz = ignoreZ ? 0.0f : (b.z - a.z);
+    return std::sqrt(dx*dx + dy*dy + dz*dz) / dt;
+}
+
+// Evaluate one segment's scalar dim at time t. Rebuilds the tiny Bezier
+// inline so we can plot arbitrarily many samples per segment without going
+// through the full templated Evaluate() per sample.
+template <typename T>
+inline float EvalSegScalar(const AnimatedProperty<T>& p, int i0, int i1, int dim, float t) {
+    const auto& A = p.keyframes[i0];
+    const auto& B = p.keyframes[i1];
+    if (A.outgoingMode == InterpMode::Hold) return PickScalar<T>(A.value, dim);
+    if (A.outgoingMode == InterpMode::Linear && B.incomingMode == InterpMode::Linear) {
+        const float span = B.time - A.time;
+        const float u = (span > 1e-6f) ? (t - A.time) / span : 0.0f;
+        const float a = PickScalar<T>(A.value, dim);
+        const float b = PickScalar<T>(B.value, dim);
+        return a + (b - a) * u;
+    }
+    const BezierSegment<T> s = BuildBezierSegment(A, B);
+    const float u = SolveBezierU(s, t);
+    return PickScalar<T>(EvalBezierValueAtU(s, u), dim);
+}
+
+// Evaluate one segment's full T value at time t (used for Speed graph
+// magnitude finite differences).
+template <typename T>
+inline T EvalSegValue(const AnimatedProperty<T>& p, int i0, int i1, float t) {
+    const auto& A = p.keyframes[i0];
+    const auto& B = p.keyframes[i1];
+    if (A.outgoingMode == InterpMode::Hold) return A.value;
+    if (A.outgoingMode == InterpMode::Linear && B.incomingMode == InterpMode::Linear) {
+        const float span = B.time - A.time;
+        const float u = (span > 1e-6f) ? (t - A.time) / span : 0.0f;
+        return Lerp(A.value, B.value, u);
+    }
+    return EvaluateBezierSegment(A, B, t);
+}
+
+// Sample the full T value at any time (handles edge cases). Returns the
+// value + a bool flag indicating "clamped to edge" so speed-mode can zero.
+template <typename T>
+inline T SampleValueAt(const AnimatedProperty<T>& p, float t) {
+    const int n = (int)p.keyframes.size();
+    if (n == 0) return p.staticValue;
+    if (n == 1) return p.keyframes[0].value;
+    if (t <= p.keyframes[0].time)     return p.keyframes[0].value;
+    if (t >= p.keyframes[n-1].time)   return p.keyframes[n-1].value;
+    for (int i = 0; i + 1 < n; ++i) {
+        if (t >= p.keyframes[i].time && t <= p.keyframes[i+1].time)
+            return EvalSegValue(p, i, i+1, t);
+    }
+    return p.keyframes[n-1].value;
+}
+
+// AutoBezier tangent auto-computation. For each AutoBezier key we set
+// in/out speed = weighted average of neighbor slopes (AE's "temporal
+// auto-tangent" rule), influence stays at the AE default 16.667%.
+template <typename T>
+inline void RecomputeAutoBezierTangents(AnimatedProperty<T>& p) {
+    const int n = (int)p.keyframes.size();
+    for (int i = 0; i < n; ++i) {
+        auto& k = p.keyframes[i];
+        const bool inAuto  = (k.incomingMode == InterpMode::AutoBezier);
+        const bool outAuto = (k.outgoingMode == InterpMode::AutoBezier);
+        if (!inAuto && !outAuto) continue;
+        T slopeAvg{};
+        int contribs = 0;
+        if (i > 0) {
+            const auto& prev = p.keyframes[i - 1];
+            const float dt = k.time - prev.time;
+            if (dt > 1e-6f) {
+                slopeAvg = AddT(slopeAvg, ScaleT(SubT(k.value, prev.value), 1.0f / dt));
+                contribs++;
+            }
+        }
+        if (i + 1 < n) {
+            const auto& next = p.keyframes[i + 1];
+            const float dt = next.time - k.time;
+            if (dt > 1e-6f) {
+                slopeAvg = AddT(slopeAvg, ScaleT(SubT(next.value, k.value), 1.0f / dt));
+                contribs++;
+            }
+        }
+        if (contribs > 0) slopeAvg = ScaleT(slopeAvg, 1.0f / (float)contribs);
+        if (inAuto)  { k.inSpeed  = slopeAvg; k.inInfluence  = 16.667f; }
+        if (outAuto) { k.outSpeed = slopeAvg; k.outInfluence = 16.667f; }
+    }
+}
+
+// ChanImpl abstracts a (property-type, scalar-dim) pair behind function
+// pointers so the drawing code can uniformly read/write per-scalar values
+// AND per-scalar tangent components without templating the entire draw
+// function.
+struct ChannelAccessor {
+    int  (*keyCount)(void*)                                = nullptr;
+    float(*readValue)(void*, int)                          = nullptr;
+    void (*writeValue)(void*, int, float)                  = nullptr;
+    // Per-dim in/out speed scalar getters/setters.
+    float(*readOutSpeed)(void*, int)                       = nullptr;
+    void (*writeOutSpeed)(void*, int, float)               = nullptr;
+    float(*readInSpeed)(void*, int)                        = nullptr;
+    void (*writeInSpeed)(void*, int, float)                = nullptr;
+    // Full-vector speed getters (used for ContinuousBezier mirroring).
+    // We copy the whole T so mirroring works across all dims at once.
+    void (*copyOutSpeedToIn)(void*, int)                   = nullptr;
+    void (*copyInSpeedToOut)(void*, int)                   = nullptr;
+    // Shared per-key data.
+    float(*readTime)(void*, int)                           = nullptr;
+    float(*readOutInf)(void*, int)                         = nullptr;
+    void (*writeOutInf)(void*, int, float)                 = nullptr;
+    float(*readInInf)(void*, int)                          = nullptr;
+    void (*writeInInf)(void*, int, float)                  = nullptr;
+    int  (*readInMode)(void*, int)                         = nullptr;
+    int  (*readOutMode)(void*, int)                        = nullptr;
+    void (*writeInMode)(void*, int, int)                   = nullptr;
+    void (*writeOutMode)(void*, int, int)                  = nullptr;
+    void (*eraseKey)(void*, int)                           = nullptr;
+    void* prop = nullptr;
+    const char* label = "";
+};
+
 template <typename T, int Dim>
 struct ChanImpl {
-    static int  keyCount(void* p) { return (int)reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes.size(); }
-    static float readValue(void* p, int i) {
-        return PickScalar<T>(reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].value, Dim);
+    static AnimatedProperty<T>& P(void* p) { return *reinterpret_cast<AnimatedProperty<T>*>(p); }
+    static int  keyCount(void* p) { return (int)P(p).keyframes.size(); }
+    static float readValue(void* p, int i)          { return PickScalar<T>(P(p).keyframes[i].value, Dim); }
+    static void  writeValue(void* p, int i, float v){ PutScalar<T>(P(p).keyframes[i].value, Dim, v); }
+    static float readOutSpeed(void* p, int i)       { return PickScalar<T>(P(p).keyframes[i].outSpeed, Dim); }
+    static void  writeOutSpeed(void* p, int i, float v){ PutScalar<T>(P(p).keyframes[i].outSpeed, Dim, v); }
+    static float readInSpeed(void* p, int i)        { return PickScalar<T>(P(p).keyframes[i].inSpeed, Dim); }
+    static void  writeInSpeed(void* p, int i, float v){ PutScalar<T>(P(p).keyframes[i].inSpeed, Dim, v); }
+    // Mirror the full-vector speed (used by ContinuousBezier drag).
+    static void  copyOutSpeedToIn(void* p, int i)   {
+        auto& k = P(p).keyframes[i];
+        k.inSpeed = ScaleT(k.outSpeed, -1.0f);   // opposite sign for time-mirror
     }
-    static void  writeValue(void* p, int i, float v) {
-        PutScalar<T>(reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].value, Dim, v);
+    static void  copyInSpeedToOut(void* p, int i)   {
+        auto& k = P(p).keyframes[i];
+        k.outSpeed = ScaleT(k.inSpeed, -1.0f);
     }
-    static float readOutTanValue(void* p, int i) {
-        return PickScalar<T>(reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].outTangentValue, Dim);
-    }
-    static void  writeOutTanValue(void* p, int i, float v) {
-        PutScalar<T>(reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].outTangentValue, Dim, v);
-    }
-    static float readInTanValue(void* p, int i) {
-        return PickScalar<T>(reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].inTangentValue, Dim);
-    }
-    static void  writeInTanValue(void* p, int i, float v) {
-        PutScalar<T>(reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].inTangentValue, Dim, v);
-    }
-    static float readTime(void* p, int i)        { return reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].time; }
-    static float readOutTanTime(void* p, int i)  { return reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].outTangentTime; }
-    static void  writeOutTanTime(void* p, int i, float v) { reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].outTangentTime = v; }
-    static float readInTanTime(void* p, int i)   { return reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].inTangentTime; }
-    static void  writeInTanTime(void* p, int i, float v)  { reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].inTangentTime = v; }
-    static int   readInMode(void* p, int i)      { return (int)reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].incomingMode; }
-    static int   readOutMode(void* p, int i)     { return (int)reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].outgoingMode; }
-    static void  writeInMode(void* p, int i, int m)  { reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].incomingMode = (InterpMode)m; }
-    static void  writeOutMode(void* p, int i, int m) { reinterpret_cast<AnimatedProperty<T>*>(p)->keyframes[i].outgoingMode = (InterpMode)m; }
+    static float readTime(void* p, int i)      { return P(p).keyframes[i].time; }
+    static float readOutInf(void* p, int i)    { return P(p).keyframes[i].outInfluence; }
+    static void  writeOutInf(void* p, int i, float v) { P(p).keyframes[i].outInfluence = v; }
+    static float readInInf(void* p, int i)     { return P(p).keyframes[i].inInfluence; }
+    static void  writeInInf(void* p, int i, float v)  { P(p).keyframes[i].inInfluence = v; }
+    static int   readInMode(void* p, int i)    { return (int)P(p).keyframes[i].incomingMode; }
+    static int   readOutMode(void* p, int i)   { return (int)P(p).keyframes[i].outgoingMode; }
+    static void  writeInMode(void* p, int i, int m)  { P(p).keyframes[i].incomingMode = (InterpMode)m; }
+    static void  writeOutMode(void* p, int i, int m) { P(p).keyframes[i].outgoingMode = (InterpMode)m; }
     static void  eraseKey(void* p, int i) {
-        auto* pr = reinterpret_cast<AnimatedProperty<T>*>(p);
-        if (i < 0 || i >= (int)pr->keyframes.size()) return;
-        pr->keyframes.erase(pr->keyframes.begin() + i);
+        auto& pp = P(p);
+        if (i < 0 || i >= (int)pp.keyframes.size()) return;
+        pp.keyframes.erase(pp.keyframes.begin() + i);
     }
-    static bool  isAnimated(void* p) { return reinterpret_cast<AnimatedProperty<T>*>(p)->IsAnimated(); }
-
     static ChannelAccessor Make(AnimatedProperty<T>& prop, const char* label) {
         ChannelAccessor a;
         a.prop = &prop; a.label = label;
         a.keyCount = &keyCount;
-        a.readValue = &readValue;         a.writeValue = &writeValue;
-        a.readOutTanValue = &readOutTanValue; a.writeOutTanValue = &writeOutTanValue;
-        a.readInTanValue  = &readInTanValue;  a.writeInTanValue  = &writeInTanValue;
+        a.readValue = &readValue; a.writeValue = &writeValue;
+        a.readOutSpeed = &readOutSpeed; a.writeOutSpeed = &writeOutSpeed;
+        a.readInSpeed  = &readInSpeed;  a.writeInSpeed  = &writeInSpeed;
+        a.copyOutSpeedToIn = &copyOutSpeedToIn;
+        a.copyInSpeedToOut = &copyInSpeedToOut;
         a.readTime = &readTime;
-        a.readOutTanTime = &readOutTanTime; a.writeOutTanTime = &writeOutTanTime;
-        a.readInTanTime  = &readInTanTime;  a.writeInTanTime  = &writeInTanTime;
+        a.readOutInf = &readOutInf; a.writeOutInf = &writeOutInf;
+        a.readInInf  = &readInInf;  a.writeInInf  = &writeInInf;
         a.readInMode = &readInMode; a.readOutMode = &readOutMode;
         a.writeInMode = &writeInMode; a.writeOutMode = &writeOutMode;
-        a.eraseKey = &eraseKey; a.isAnimated = &isAnimated;
+        a.eraseKey = &eraseKey;
         return a;
     }
 };
 
-// Evaluate one segment as a scalar (matches AnimatedProperty::Evaluate but
-// projected to the chosen dim). We rebuild the tiny Bezier inline here so we
-// can plot arbitrarily many samples per segment without going through the
-// full templated Evaluate() path per sample.
-inline float EvalSegScalar(const ChannelAccessor& c, int i0, int i1, float t) {
-    const float t0 = c.readTime(c.prop, i0);
-    const float t1 = c.readTime(c.prop, i1);
-    const float v0 = c.readValue(c.prop, i0);
-    const float v1 = c.readValue(c.prop, i1);
-    const int   omA = c.readOutMode(c.prop, i0);
-    const int   imB = c.readInMode(c.prop, i1);
-    if (omA == (int)InterpMode::Hold) return v0;
-    if (omA == (int)InterpMode::Linear && imB == (int)InterpMode::Linear) {
-        const float span = t1 - t0;
-        const float u = (span > 1e-6f) ? (t - t0) / span : 0.0f;
-        return v0 + (v1 - v0) * u;
-    }
-    // Cubic Bezier in (time, value) — solve for u via Newton on x.
-    const float span = t1 - t0;
-    if (span <= 1e-6f) return v1;
-    float ta = t0 + c.readOutTanTime(c.prop, i0);
-    float tb = t1 + c.readInTanTime (c.prop, i1);
-    if (ta < t0) ta = t0; if (ta > t1) ta = t1;
-    if (tb < t0) tb = t0; if (tb > t1) tb = t1;
-    const float va = v0 + c.readOutTanValue(c.prop, i0);
-    const float vb = v1 + c.readInTanValue (c.prop, i1);
-    float u = (t - t0) / span;
-    if (u < 0) u = 0; if (u > 1) u = 1;
-    for (int it = 0; it < 6; ++it) {
-        const float mu = 1.0f - u;
-        const float x  = mu*mu*mu*t0 + 3*mu*mu*u*ta + 3*mu*u*u*tb + u*u*u*t1;
-        const float dx = 3*mu*mu*(ta - t0) + 6*mu*u*(tb - ta) + 3*u*u*(t1 - tb);
-        const float err = x - t;
-        if (std::fabs(err) < 1e-5f) break;
-        if (std::fabs(dx) < 1e-6f) break;
-        u -= err / dx;
-        if (u < 0) u = 0; if (u > 1) u = 1;
-    }
-    const float mu = 1.0f - u;
-    return mu*mu*mu*v0 + 3*mu*mu*u*va + 3*mu*u*u*vb + u*u*u*v1;
-}
-
 } // namespace
 
 void RenderEngine::DrawGraphEditor() {
-    // --------------------- top toolbar: mode + property picker ----------------
     Layer* sel = layerManager.GetSelectedLayer();
     if (!sel) {
         ImGui::TextDisabled("Select a layer to edit its animation curves.");
         return;
     }
 
-    // Reset auto-pick when layer selection changes so we re-pick sensibly.
+    // Reset auto-pick + selection on layer change.
     if (sel->id != graphSelectedLayerId) {
-        graphSelectedLayerId   = sel->id;
-        graphSelectedKeyIndex  = -1;
-        graphChannelAutoPicked = false;
-        graphDraggedTangent    = GraphTangent::None;
+        graphSelectedLayerId  = sel->id;
+        graphSelectedKeyIndex = -1;
+        graphAutoPicked       = false;
+        graphDraggedTangent   = GraphTangent::None;
+        graphFocusDim         = 0;
     }
 
-    // Auto-pick a "most likely animated" channel the first time we see this
-    // layer. Priority: Position (99% of first anims) -> Rotation -> Scale
-    // -> Opacity -> PositionX default. Runs once per layer selection so it
-    // doesn't overwrite a user's explicit picker choice later.
-    if (!graphChannelAutoPicked) {
-        if      (sel->transform.position.IsAnimated()) graphChannel = GraphChannel::PositionX;
-        else if (sel->transform.rotation.IsAnimated()) graphChannel = GraphChannel::RotationZ;
-        else if (sel->transform.scale.IsAnimated())    graphChannel = GraphChannel::ScaleX;
-        else if (sel->transform.opacity.IsAnimated())  graphChannel = GraphChannel::Opacity;
-        else                                           graphChannel = GraphChannel::PositionX;
-        graphChannelAutoPicked = true;
+    // Auto-pick the "most likely animated" property group on first sight of
+    // this layer. Priority: Position -> Rotation -> Scale -> Opacity.
+    if (!graphAutoPicked) {
+        if      (sel->transform.position.IsAnimated()) graphPropGroup = GraphPropGroup::Position;
+        else if (sel->transform.rotation.IsAnimated()) graphPropGroup = GraphPropGroup::Rotation;
+        else if (sel->transform.scale.IsAnimated())    graphPropGroup = GraphPropGroup::Scale;
+        else if (sel->transform.opacity.IsAnimated())  graphPropGroup = GraphPropGroup::Opacity;
+        else                                           graphPropGroup = GraphPropGroup::Position;
+        graphAutoPicked = true;
     }
 
-    // Mode toggle.
+    // ---------------------------- toolbar ------------------------------------
     {
         const bool valueSel = (graphMode == GraphMode::Value);
         if (valueSel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.52f, 0.85f, 1.0f));
@@ -2596,48 +2649,97 @@ void RenderEngine::DrawGraphEditor() {
         if (ImGui::Button("Speed")) graphMode = GraphMode::Speed;
         if (speedSel) ImGui::PopStyleColor();
     }
-    ImGui::SameLine();
-    ImGui::Text("|");
-    ImGui::SameLine();
+    ImGui::SameLine();  ImGui::Text("|");  ImGui::SameLine();
     ImGui::TextUnformatted("Property:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(140.0f);
-    const char* chLabels[(int)GraphChannel::COUNT] = {
-        "Position.x", "Position.y", "Position.z",
-        "Rotation.z",
-        "Scale.x", "Scale.y",
-        "Opacity"
+    ImGui::SetNextItemWidth(120.0f);
+    const char* groupLabels[(int)GraphPropGroup::COUNT] = {
+        "Position", "Rotation", "Scale", "Opacity"
     };
-    int chi = (int)graphChannel;
-    if (ImGui::Combo("##graphChan", &chi, chLabels, (int)GraphChannel::COUNT)) {
-        graphChannel = (GraphChannel)chi;
+    int gi = (int)graphPropGroup;
+    if (ImGui::Combo("##graphGrp", &gi, groupLabels, (int)GraphPropGroup::COUNT)) {
+        graphPropGroup = (GraphPropGroup)gi;
         graphSelectedKeyIndex = -1;
+        graphFocusDim = 0;
     }
     ImGui::SameLine();
     ImGui::TextDisabled("|  Layer: %s", sel->name.c_str());
     ImGui::SameLine();
-    ImGui::TextDisabled(" (right-click a key: Linear / Bezier / Hold / Delete)");
+    ImGui::TextDisabled(" (Shift-drag: influence  |  Alt-drag: speed  |  right-click key for menu)");
 
-    // --------------------- build channel accessor -----------------------------
-    ChannelAccessor c;
-    switch (graphChannel) {
-        case GraphChannel::PositionX: c = ChanImpl<Vec3, 0>::Make(sel->transform.position, "Position.x"); break;
-        case GraphChannel::PositionY: c = ChanImpl<Vec3, 1>::Make(sel->transform.position, "Position.y"); break;
-        case GraphChannel::PositionZ: c = ChanImpl<Vec3, 2>::Make(sel->transform.position, "Position.z"); break;
-        case GraphChannel::RotationZ: c = ChanImpl<Vec3, 2>::Make(sel->transform.rotation, "Rotation.z"); break;
-        case GraphChannel::ScaleX:    c = ChanImpl<Vec3, 0>::Make(sel->transform.scale,    "Scale.x");    break;
-        case GraphChannel::ScaleY:    c = ChanImpl<Vec3, 1>::Make(sel->transform.scale,    "Scale.y");    break;
-        case GraphChannel::Opacity:   c = ChanImpl<float, 0>::Make(sel->transform.opacity, "Opacity");    break;
+    // ---------------------------- resolve property group ----------------------
+    // We build an array of per-dim accessors (up to 3) for Value mode drawing.
+    ChannelAccessor accs[3];
+    int   nDims = 0;
+    // Property axis colors (X/Y/Z or focus-only). AE default.
+    ImU32 dimColor[3] = {
+        IM_COL32(230, 90, 90, 255),   // X red
+        IM_COL32(90, 210, 90, 255),   // Y green
+        IM_COL32(90, 150, 255, 255),  // Z blue
+    };
+    const char* dimName[3] = { "x", "y", "z" };
+    void* propRawPtr = nullptr;    // reserved for future typed dispatch needs
+    // Bind property references at outer scope so the AutoBezier recompute
+    // dispatch below can reference them safely. Each case sets up accessors
+    // for the group's dims + calls the correctly-typed recompute inline.
+    switch (graphPropGroup) {
+        case GraphPropGroup::Position: {
+            auto& prop = sel->transform.position;
+            accs[0] = ChanImpl<Vec3, 0>::Make(prop, "Position.x");
+            accs[1] = ChanImpl<Vec3, 1>::Make(prop, "Position.y");
+            accs[2] = ChanImpl<Vec3, 2>::Make(prop, "Position.z");
+            nDims = 3;
+            propRawPtr = &prop;
+            RecomputeAutoBezierTangents(prop);
+            break;
+        }
+        case GraphPropGroup::Rotation: {
+            auto& prop = sel->transform.rotation;
+            accs[0] = ChanImpl<Vec3, 2>::Make(prop, "Rotation.z");
+            nDims = 1;   // only Z is meaningful in 2D; hide X/Y from graph
+            propRawPtr = &prop;
+            RecomputeAutoBezierTangents(prop);
+            // Rotation.z uses Z color to be visually consistent, but rotate
+            // uses only one curve — recolor to white for readability.
+            dimColor[0] = IM_COL32(220, 220, 220, 255);
+            dimName[0]  = "z";
+            break;
+        }
+        case GraphPropGroup::Scale: {
+            auto& prop = sel->transform.scale;
+            accs[0] = ChanImpl<Vec3, 0>::Make(prop, "Scale.x");
+            accs[1] = ChanImpl<Vec3, 1>::Make(prop, "Scale.y");
+            nDims = 2;   // AE ignores Z for Scale in graph
+            propRawPtr = &prop;
+            RecomputeAutoBezierTangents(prop);
+            break;
+        }
+        case GraphPropGroup::Opacity: {
+            auto& prop = sel->transform.opacity;
+            accs[0] = ChanImpl<float, 0>::Make(prop, "Opacity");
+            nDims = 1;
+            propRawPtr = &prop;
+            RecomputeAutoBezierTangents(prop);
+            dimColor[0] = IM_COL32(220, 220, 220, 255);
+            dimName[0]  = "v";
+            break;
+        }
         default: return;
     }
+    (void)propRawPtr;
 
-    const int nKeys = c.keyCount(c.prop);
+    // Clamp focus dim to available range.
+    if (graphFocusDim < 0)         graphFocusDim = 0;
+    if (graphFocusDim >= nDims)    graphFocusDim = 0;
+
+    const int nKeys = accs[0].keyCount(accs[0].prop);
+    if (graphSelectedKeyIndex >= nKeys) graphSelectedKeyIndex = -1;
+
     if (nKeys == 0) {
-        ImGui::TextDisabled("No keyframes on this channel. Enable the stopwatch in Inspector to add some.");
-        // Still draw an empty backdrop so it's visually consistent.
+        ImGui::TextDisabled("No keyframes on this property. Enable the stopwatch in Inspector to add some.");
     }
 
-    // --------------------- graph canvas ---------------------------------------
+    // ---------------------------- canvas backdrop ----------------------------
     ImVec2 canvas_p0 = ImGui::GetCursorScreenPos();
     ImVec2 canvas_sz = ImGui::GetContentRegionAvail();
     if (canvas_sz.x < 120.0f) canvas_sz.x = 120.0f;
@@ -2650,80 +2752,150 @@ void RenderEngine::DrawGraphEditor() {
         ImVec2(canvas_p0.x + canvas_sz.x, canvas_p0.y + canvas_sz.y),
         IM_COL32(15, 15, 18, 255));
 
-    const float padL = 44.0f, padR = 12.0f, padT = 12.0f, padB = 22.0f;
+    const float padL = 48.0f, padR = 12.0f, padT = 12.0f, padB = 22.0f;
     ImVec2 g_min = ImVec2(canvas_p0.x + padL, canvas_p0.y + padT);
     ImVec2 g_max = ImVec2(canvas_p0.x + canvas_sz.x - padR,
                           canvas_p0.y + canvas_sz.y - padB);
     if (g_max.x <= g_min.x + 4.0f || g_max.y <= g_min.y + 4.0f) return;
 
-    // --------------------- time & value bounds --------------------------------
+    // ---------------------------- time bounds --------------------------------
     float duration = (animEngine.duration > 0.0001f) ? animEngine.duration : 1.0f;
     float tMin = 0.0f;
     float tMax = duration;
-    // Extend to cover all keys just in case.
     for (int i = 0; i < nKeys; ++i) {
-        const float t = c.readTime(c.prop, i);
+        const float t = accs[0].readTime(accs[0].prop, i);
         if (t < tMin) tMin = t;
         if (t > tMax) tMax = t;
     }
     if (tMax - tMin < 1e-4f) tMax = tMin + 1.0f;
 
-    // Sample the curve for Y bounds. Also compute derivative for Speed mode.
+    // ---------------------------- sample curves ------------------------------
+    // In Value mode we sample each dim independently.
+    // In Speed mode we sample the FULL T-value at each t and compute a single
+    // magnitude derivative across all meaningful dims.
     const int   nSamples = std::max(64, (int)(g_max.x - g_min.x) / 2);
-    std::vector<float> sampleValue(nSamples), sampleTime(nSamples);
+    std::vector<float> sampleTime(nSamples);
+    // Value samples per dim.
+    std::vector<std::vector<float>> valPerDim(nDims, std::vector<float>(nSamples, 0.0f));
+    // Speed samples (single curve).
+    std::vector<float> spdSamples(nSamples, 0.0f);
+
     for (int s = 0; s < nSamples; ++s) {
         const float u = (nSamples == 1) ? 0.0f : (float)s / (float)(nSamples - 1);
         const float t = tMin + u * (tMax - tMin);
         sampleTime[s] = t;
-        // Evaluate: find segment containing t and eval; fall back to nearest key.
-        float v = 0.0f;
-        if (nKeys == 0) v = 0.0f;
-        else if (nKeys == 1) v = c.readValue(c.prop, 0);
-        else if (t <= c.readTime(c.prop, 0)) v = c.readValue(c.prop, 0);
-        else if (t >= c.readTime(c.prop, nKeys - 1)) v = c.readValue(c.prop, nKeys - 1);
-        else {
-            for (int i = 0; i + 1 < nKeys; ++i) {
-                if (t >= c.readTime(c.prop, i) && t <= c.readTime(c.prop, i + 1)) {
-                    v = EvalSegScalar(c, i, i + 1, t);
-                    break;
+        // For each dim, sample value at t using the per-dim accessor.
+        if (nKeys >= 1) {
+            for (int d = 0; d < nDims; ++d) {
+                const auto& acc = accs[d];
+                float v = 0.0f;
+                if (nKeys == 1) v = acc.readValue(acc.prop, 0);
+                else if (t <= acc.readTime(acc.prop, 0)) v = acc.readValue(acc.prop, 0);
+                else if (t >= acc.readTime(acc.prop, nKeys - 1)) v = acc.readValue(acc.prop, nKeys - 1);
+                else {
+                    for (int i = 0; i + 1 < nKeys; ++i) {
+                        if (t >= acc.readTime(acc.prop, i) && t <= acc.readTime(acc.prop, i + 1)) {
+                            // Segment eval via templated helper — but we only
+                            // have opaque prop pointer here. Reuse writeValue
+                            // pattern is overkill; instead we exploit the
+                            // fact that Bezier eval on one dim is independent
+                            // when the property is per-dim tangent-additive.
+                            // Simplest: re-derive with (speed, influence)
+                            // pulled through the accessor.
+                            const float t0 = acc.readTime(acc.prop, i);
+                            const float t1 = acc.readTime(acc.prop, i + 1);
+                            const float v0 = acc.readValue(acc.prop, i);
+                            const float v1 = acc.readValue(acc.prop, i + 1);
+                            const int   omA = acc.readOutMode(acc.prop, i);
+                            const int   imB = acc.readInMode (acc.prop, i + 1);
+                            if (omA == (int)InterpMode::Hold) { v = v0; break; }
+                            if (omA == (int)InterpMode::Linear && imB == (int)InterpMode::Linear) {
+                                const float span = t1 - t0;
+                                const float uu = (span > 1e-6f) ? (t - t0) / span : 0.0f;
+                                v = v0 + (v1 - v0) * uu;
+                                break;
+                            }
+                            // Derive Bezier P0..P3 from AE-native fields.
+                            const float dtSeg = t1 - t0;
+                            const float outInf = std::clamp(acc.readOutInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
+                            const float inInf  = std::clamp(acc.readInInf (acc.prop, i + 1), 0.0f, 100.0f) * 0.01f;
+                            const float P0t = t0;
+                            const float P1t = t0 + dtSeg * outInf;
+                            const float P2t = t1 - dtSeg * inInf;
+                            const float P3t = t1;
+                            const float outSpd = acc.readOutSpeed(acc.prop, i);
+                            const float inSpd  = acc.readInSpeed (acc.prop, i + 1);
+                            const float P0v = v0;
+                            const float P1v = v0 + outSpd * (dtSeg * outInf);
+                            const float P2v = v1 - inSpd  * (dtSeg * inInf);
+                            const float P3v = v1;
+                            // Newton on time.
+                            float uu = (dtSeg > 1e-6f) ? (t - t0) / dtSeg : 0.0f;
+                            if (uu < 0) uu = 0; if (uu > 1) uu = 1;
+                            for (int it = 0; it < 6; ++it) {
+                                const float mu = 1.0f - uu;
+                                const float x  = mu*mu*mu*P0t + 3*mu*mu*uu*P1t + 3*mu*uu*uu*P2t + uu*uu*uu*P3t;
+                                const float dx = 3*mu*mu*(P1t - P0t) + 6*mu*uu*(P2t - P1t) + 3*uu*uu*(P3t - P2t);
+                                const float err = x - t;
+                                if (std::fabs(err) < 1e-5f) break;
+                                if (std::fabs(dx) < 1e-6f) break;
+                                uu -= err / dx;
+                                if (uu < 0) uu = 0; if (uu > 1) uu = 1;
+                            }
+                            const float mu = 1.0f - uu;
+                            v = mu*mu*mu*P0v + 3*mu*mu*uu*P1v + 3*mu*uu*uu*P2v + uu*uu*uu*P3v;
+                            break;
+                        }
+                    }
                 }
+                valPerDim[d][s] = v;
             }
         }
-        sampleValue[s] = v;
     }
 
-    // Speed = finite difference of value samples in units/sec.
-    std::vector<float> sampleSpeed(nSamples, 0.0f);
-    if (graphMode == GraphMode::Speed && nSamples > 1) {
+    // Speed samples: finite-difference the multi-dim value vector.
+    if (graphMode == GraphMode::Speed && nSamples > 1 && nKeys > 0) {
         for (int s = 0; s < nSamples; ++s) {
             const int a = std::max(0, s - 1);
             const int b = std::min(nSamples - 1, s + 1);
             const float dt = sampleTime[b] - sampleTime[a];
-            sampleSpeed[s] = (dt > 1e-6f) ? (sampleValue[b] - sampleValue[a]) / dt : 0.0f;
+            if (dt <= 1e-6f) { spdSamples[s] = 0.0f; continue; }
+            float sumSq = 0.0f;
+            for (int d = 0; d < nDims; ++d) {
+                const float dv = valPerDim[d][b] - valPerDim[d][a];
+                sumSq += dv * dv;
+            }
+            spdSamples[s] = std::sqrt(sumSq) / dt;
         }
     }
 
-    // Y bounds from the samples we'll actually plot.
-    const std::vector<float>& yData = (graphMode == GraphMode::Value) ? sampleValue : sampleSpeed;
+    // ---------------------------- Y bounds -----------------------------------
     float yMin =  1e30f, yMax = -1e30f;
-    for (float v : yData) { if (v < yMin) yMin = v; if (v > yMax) yMax = v; }
-    // For Value mode, also include the raw key values (in case there's a Hold
-    // right before a sample gap).
     if (graphMode == GraphMode::Value) {
+        for (int d = 0; d < nDims; ++d) {
+            for (float v : valPerDim[d]) {
+                if (v < yMin) yMin = v; if (v > yMax) yMax = v;
+            }
+        }
+        // Include raw key values so hold keys don't drop off the top edge.
         for (int i = 0; i < nKeys; ++i) {
-            const float v = c.readValue(c.prop, i);
+            for (int d = 0; d < nDims; ++d) {
+                const float v = accs[d].readValue(accs[d].prop, i);
+                if (v < yMin) yMin = v; if (v > yMax) yMax = v;
+            }
+        }
+    } else {
+        for (float v : spdSamples) {
             if (v < yMin) yMin = v; if (v > yMax) yMax = v;
         }
     }
     if (!(yMin < yMax)) { yMin = 0.0f; yMax = 1.0f; }
-    // Pad the value range by 10% so keys aren't glued to the panel edge.
     const float yPad = (yMax - yMin) * 0.1f + 1e-3f;
     yMin -= yPad; yMax += yPad;
 
-    // --------------------- axis + grid lines ----------------------------------
+    // ---------------------------- axis + grid --------------------------------
     dl->AddLine(ImVec2(g_min.x, g_max.y), ImVec2(g_max.x, g_max.y), IM_COL32(80, 80, 80, 255), 1.0f);
     dl->AddLine(ImVec2(g_min.x, g_min.y), ImVec2(g_min.x, g_max.y), IM_COL32(80, 80, 80, 255), 1.0f);
-    // 4 horizontal grid lines + labels.
     for (int i = 0; i <= 4; ++i) {
         const float u = (float)i / 4.0f;
         const float y = g_max.y + (g_min.y - g_max.y) * u;
@@ -2733,7 +2905,6 @@ void RenderEngine::DrawGraphEditor() {
         std::snprintf(buf, sizeof(buf), "%.2f", vv);
         dl->AddText(ImVec2(canvas_p0.x + 4, y - 7), IM_COL32(140, 140, 140, 255), buf);
     }
-    // Time axis labels.
     for (int i = 0; i <= 5; ++i) {
         const float u = (float)i / 5.0f;
         const float x = g_min.x + (g_max.x - g_min.x) * u;
@@ -2743,10 +2914,25 @@ void RenderEngine::DrawGraphEditor() {
         dl->AddText(ImVec2(x - 14, g_max.y + 3), IM_COL32(140, 140, 140, 255), buf);
     }
 
-    // Value/Speed axis label.
+    // Mode / axis label at top-left.
     dl->AddText(ImVec2(canvas_p0.x + 4, canvas_p0.y + 2),
-        (graphMode == GraphMode::Value) ? IM_COL32(180, 220, 255, 255) : IM_COL32(255, 200, 120, 255),
+        (graphMode == GraphMode::Value) ? IM_COL32(180, 220, 255, 255)
+                                        : IM_COL32(255, 200, 120, 255),
         (graphMode == GraphMode::Value) ? "value" : "speed (u/s)");
+    // Dim legend in value mode.
+    if (graphMode == GraphMode::Value && nDims > 1) {
+        float lx = canvas_p0.x + 44.0f;
+        for (int d = 0; d < nDims; ++d) {
+            const bool isFocus = (d == graphFocusDim);
+            const ImU32 col = dimColor[d];
+            dl->AddRectFilled(ImVec2(lx, canvas_p0.y + 3),
+                              ImVec2(lx + 10, canvas_p0.y + 13), col);
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "%s%s", dimName[d], isFocus ? "*" : " ");
+            dl->AddText(ImVec2(lx + 13, canvas_p0.y + 2), col, buf);
+            lx += 32.0f;
+        }
+    }
 
     // Coord mapping helpers.
     auto ToScreen = [&](float t, float v) -> ImVec2 {
@@ -2756,229 +2942,326 @@ void RenderEngine::DrawGraphEditor() {
                       g_max.y - vy * (g_max.y - g_min.y));
     };
     auto ScreenToVal = [&](ImVec2 s) -> ImVec2 {
-        // Returns (time, value)
         const float tx = (s.x - g_min.x) / (g_max.x - g_min.x);
         const float vy = (g_max.y - s.y) / (g_max.y - g_min.y);
         return ImVec2(tMin + tx * (tMax - tMin), yMin + vy * (yMax - yMin));
     };
-
-    // --------------------- plot the sampled curve -----------------------------
-    const ImU32 curveCol = (graphMode == GraphMode::Value)
-        ? IM_COL32(80, 200, 255, 255)
-        : IM_COL32(255, 200, 120, 255);
-    for (int s = 0; s + 1 < nSamples; ++s) {
-        ImVec2 a = ToScreen(sampleTime[s],     yData[s]);
-        ImVec2 b = ToScreen(sampleTime[s + 1], yData[s + 1]);
-        dl->AddLine(a, b, curveCol, 2.0f);
-    }
-
-    // --------------------- draw keys (only meaningful in Value mode) ----------
-    // In Speed mode we still draw keys as small markers along the speed curve
-    // so users can see WHERE keys are; but tangent handles / drag interaction
-    // stay in Value mode where they're mathematically meaningful.
-    const bool interactive = (graphMode == GraphMode::Value);
-    if (graphSelectedKeyIndex >= nKeys) graphSelectedKeyIndex = -1;
-
-    // Track handle screen positions for the selected key so drag hit-testing
-    // can pick them.
-    ImVec2 selKeyPos(0, 0), selInHandlePos(0, 0), selOutHandlePos(0, 0);
-    bool   selHasInHandle = false, selHasOutHandle = false;
-
-    for (int i = 0; i < nKeys; ++i) {
-        const float kt = c.readTime(c.prop, i);
-        float kv = c.readValue(c.prop, i);
-        if (graphMode == GraphMode::Speed) {
-            // Approx speed at key = derivative between neighbors.
-            if (nKeys == 1) kv = 0.0f;
-            else if (i == 0) {
-                const float dt = c.readTime(c.prop, 1) - c.readTime(c.prop, 0);
-                kv = (dt > 1e-6f) ? (c.readValue(c.prop, 1) - c.readValue(c.prop, 0)) / dt : 0.0f;
-            } else if (i == nKeys - 1) {
-                const float dt = c.readTime(c.prop, i) - c.readTime(c.prop, i - 1);
-                kv = (dt > 1e-6f) ? (c.readValue(c.prop, i) - c.readValue(c.prop, i - 1)) / dt : 0.0f;
-            } else {
-                const float dt = c.readTime(c.prop, i + 1) - c.readTime(c.prop, i - 1);
-                kv = (dt > 1e-6f) ? (c.readValue(c.prop, i + 1) - c.readValue(c.prop, i - 1)) / dt : 0.0f;
-            }
-        }
-        const ImVec2 kp = ToScreen(kt, kv);
-        const bool isSel = (i == graphSelectedKeyIndex);
-        const ImU32 dotCol = isSel ? IM_COL32(255, 220, 80, 255) : IM_COL32(220, 220, 220, 255);
-        // Draw with a mode-hint outline: Hold=square, Bezier=diamond, Linear=circle.
-        const int inMode  = c.readInMode (c.prop, i);
-        const int outMode = c.readOutMode(c.prop, i);
-        const bool anyBezier = (inMode == (int)InterpMode::Bezier) || (outMode == (int)InterpMode::Bezier);
-        const bool anyHold   = (inMode == (int)InterpMode::Hold)   || (outMode == (int)InterpMode::Hold);
-        if (anyHold) {
-            dl->AddRectFilled(ImVec2(kp.x - 5, kp.y - 5), ImVec2(kp.x + 5, kp.y + 5), dotCol);
-        } else if (anyBezier) {
-            ImVec2 d[4] = { ImVec2(kp.x, kp.y - 6), ImVec2(kp.x + 6, kp.y),
-                            ImVec2(kp.x, kp.y + 6), ImVec2(kp.x - 6, kp.y) };
-            dl->AddConvexPolyFilled(d, 4, dotCol);
-        } else {
-            dl->AddCircleFilled(kp, 5.0f, dotCol);
-        }
-        if (isSel) {
-            dl->AddCircle(kp, 9.0f, IM_COL32(255, 220, 80, 200), 12, 1.5f);
-            selKeyPos = kp;
-        }
-
-        // Draw tangent handles for selected key (Value mode only).
-        if (isSel && interactive) {
-            if (outMode == (int)InterpMode::Bezier && i + 1 < nKeys) {
-                const float ht = kt + c.readOutTanTime(c.prop, i);
-                const float hv = kv + c.readOutTanValue(c.prop, i);
-                const ImVec2 hp = ToScreen(ht, hv);
-                dl->AddLine(kp, hp, IM_COL32(255, 180, 0, 200), 1.5f);
-                dl->AddCircleFilled(hp, 5.0f, IM_COL32(255, 200, 0, 255));
-                selOutHandlePos = hp; selHasOutHandle = true;
-            }
-            if (inMode == (int)InterpMode::Bezier && i > 0) {
-                const float ht = kt + c.readInTanTime(c.prop, i);
-                const float hv = kv + c.readInTanValue(c.prop, i);
-                const ImVec2 hp = ToScreen(ht, hv);
-                dl->AddLine(kp, hp, IM_COL32(255, 180, 0, 200), 1.5f);
-                dl->AddCircleFilled(hp, 5.0f, IM_COL32(255, 200, 0, 255));
-                selInHandlePos = hp; selHasInHandle = true;
-            }
-        }
-    }
-
-    // --------------------- playhead line --------------------------------------
-    {
-        const float pt = std::clamp(animEngine.currentTime, tMin, tMax);
-        const ImVec2 pa = ToScreen(pt, yMin);
-        const ImVec2 pb = ToScreen(pt, yMax);
-        dl->AddLine(ImVec2(pa.x, g_min.y - 6), ImVec2(pb.x, g_max.y + 6),
-                    IM_COL32(255, 60, 60, 220), 1.5f);
-    }
-
-    // --------------------- interaction ----------------------------------------
-    ImGui::SetCursorScreenPos(canvas_p0);
-    ImGui::InvisibleButton("##GraphCanvas5_4", canvas_sz);
-    const bool hovered = ImGui::IsItemHovered();
-    const ImVec2 mp    = ImGui::GetIO().MousePos;
     auto dist2 = [](ImVec2 a, ImVec2 b) {
         const float dx = a.x - b.x, dy = a.y - b.y; return dx*dx + dy*dy;
     };
 
-    // Left-click: (1) if starting on a tangent handle of selected key, begin
-    // drag; (2) else if on a key, select it; (3) else if not on anything and
-    // in Value mode, click empties selection.
+    // ---------------------------- plot curves --------------------------------
+    if (graphMode == GraphMode::Value) {
+        for (int d = 0; d < nDims; ++d) {
+            const bool isFocus = (d == graphFocusDim);
+            const int  alpha   = isFocus ? 255 : 130;
+            const ImU32 base   = dimColor[d];
+            const ImU32 col    = (base & 0x00FFFFFFu) | ((ImU32)alpha << 24);
+            for (int s = 0; s + 1 < nSamples; ++s) {
+                ImVec2 a = ToScreen(sampleTime[s],     valPerDim[d][s]);
+                ImVec2 b = ToScreen(sampleTime[s + 1], valPerDim[d][s + 1]);
+                dl->AddLine(a, b, col, isFocus ? 2.0f : 1.5f);
+            }
+        }
+    } else {
+        const ImU32 col = IM_COL32(255, 200, 120, 255);
+        for (int s = 0; s + 1 < nSamples; ++s) {
+            ImVec2 a = ToScreen(sampleTime[s],     spdSamples[s]);
+            ImVec2 b = ToScreen(sampleTime[s + 1], spdSamples[s + 1]);
+            dl->AddLine(a, b, col, 2.0f);
+        }
+    }
+
+    // ---------------------------- key dots + handles -------------------------
+    // Track handle screen positions on the FOCUSED dim of the selected key so
+    // drag hit-testing works.
+    ImVec2 selKeyPos(0, 0), selInHandlePos(0, 0), selOutHandlePos(0, 0);
+    bool   selHasInHandle = false, selHasOutHandle = false;
+    const bool interactive = (graphMode == GraphMode::Value);
+
+    for (int i = 0; i < nKeys; ++i) {
+        for (int d = 0; d < nDims; ++d) {
+            const auto& acc = accs[d];
+            const float kt = acc.readTime(acc.prop, i);
+            float kv = acc.readValue(acc.prop, i);
+            ImVec2 kp;
+            if (graphMode == GraphMode::Value) {
+                kp = ToScreen(kt, kv);
+            } else {
+                // Speed mode: place key dot on the sampled speed curve at kt.
+                float sv = 0.0f;
+                for (int s = 0; s < nSamples; ++s) {
+                    if (sampleTime[s] >= kt) { sv = spdSamples[s]; break; }
+                }
+                kp = ToScreen(kt, sv);
+                // Only draw one dot per key in speed mode; break after d=0.
+            }
+
+            const bool isSel      = (i == graphSelectedKeyIndex);
+            const bool isFocusDim = (d == graphFocusDim);
+            const int  alpha      = (isSel || isFocusDim) ? 255 : 130;
+            const int inMode  = acc.readInMode (acc.prop, i);
+            const int outMode = acc.readOutMode(acc.prop, i);
+            const bool anyBezier = (inMode  == (int)InterpMode::Bezier ||
+                                    inMode  == (int)InterpMode::ContinuousBezier ||
+                                    inMode  == (int)InterpMode::AutoBezier ||
+                                    outMode == (int)InterpMode::Bezier ||
+                                    outMode == (int)InterpMode::ContinuousBezier ||
+                                    outMode == (int)InterpMode::AutoBezier);
+            const bool anyHold   = (inMode == (int)InterpMode::Hold || outMode == (int)InterpMode::Hold);
+
+            ImU32 baseCol = isSel ? IM_COL32(255, 220, 80, 255)
+                                  : ((graphMode == GraphMode::Value) ? dimColor[d]
+                                                                     : IM_COL32(230, 230, 230, 255));
+            const ImU32 col = (baseCol & 0x00FFFFFFu) | ((ImU32)alpha << 24);
+
+            if (anyHold) {
+                dl->AddRectFilled(ImVec2(kp.x - 5, kp.y - 5), ImVec2(kp.x + 5, kp.y + 5), col);
+            } else if (anyBezier) {
+                ImVec2 dpts[4] = { ImVec2(kp.x, kp.y - 6), ImVec2(kp.x + 6, kp.y),
+                                   ImVec2(kp.x, kp.y + 6), ImVec2(kp.x - 6, kp.y) };
+                dl->AddConvexPolyFilled(dpts, 4, col);
+            } else {
+                dl->AddCircleFilled(kp, 5.0f, col);
+            }
+            if (isSel && isFocusDim) {
+                dl->AddCircle(kp, 9.0f, IM_COL32(255, 220, 80, 200), 12, 1.5f);
+                selKeyPos = kp;
+            }
+
+            // Handles: only on selected key AND on the FOCUSED dim (Value mode).
+            if (interactive && isSel && isFocusDim) {
+                // Outgoing handle: shown if outgoing side is any Bezier variant
+                // AND there's a next key (nowhere for the handle to go otherwise).
+                const bool outBez = (outMode == (int)InterpMode::Bezier ||
+                                     outMode == (int)InterpMode::ContinuousBezier ||
+                                     outMode == (int)InterpMode::AutoBezier);
+                if (outBez && i + 1 < nKeys) {
+                    const float nextT = acc.readTime(acc.prop, i + 1);
+                    const float dtSeg = nextT - kt;
+                    const float inf   = std::clamp(acc.readOutInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
+                    const float spd   = acc.readOutSpeed(acc.prop, i);
+                    const float ht    = kt + dtSeg * inf;
+                    const float hv    = kv + spd * (dtSeg * inf);
+                    const ImVec2 hp   = ToScreen(ht, hv);
+                    const ImU32 hcol  = (outMode == (int)InterpMode::AutoBezier)
+                                        ? IM_COL32(180, 180, 180, 160)
+                                        : IM_COL32(255, 200, 0, 255);
+                    dl->AddLine(kp, hp, hcol, 1.5f);
+                    dl->AddCircleFilled(hp, 5.0f, hcol);
+                    selOutHandlePos = hp; selHasOutHandle = true;
+                }
+                const bool inBez = (inMode == (int)InterpMode::Bezier ||
+                                    inMode == (int)InterpMode::ContinuousBezier ||
+                                    inMode == (int)InterpMode::AutoBezier);
+                if (inBez && i > 0) {
+                    const float prevT = acc.readTime(acc.prop, i - 1);
+                    const float dtSeg = kt - prevT;
+                    const float inf   = std::clamp(acc.readInInf(acc.prop, i), 0.0f, 100.0f) * 0.01f;
+                    const float spd   = acc.readInSpeed(acc.prop, i);
+                    const float ht    = kt - dtSeg * inf;
+                    const float hv    = kv - spd * (dtSeg * inf);
+                    const ImVec2 hp   = ToScreen(ht, hv);
+                    const ImU32 hcol  = (inMode == (int)InterpMode::AutoBezier)
+                                        ? IM_COL32(180, 180, 180, 160)
+                                        : IM_COL32(255, 200, 0, 255);
+                    dl->AddLine(kp, hp, hcol, 1.5f);
+                    dl->AddCircleFilled(hp, 5.0f, hcol);
+                    selInHandlePos = hp; selHasInHandle = true;
+                }
+            }
+
+            if (graphMode == GraphMode::Speed) break; // one dot per key in speed mode
+        }
+    }
+
+    // ---------------------------- playhead -----------------------------------
+    {
+        const float pt = std::clamp(animEngine.currentTime, tMin, tMax);
+        const ImVec2 pa = ToScreen(pt, yMin);
+        dl->AddLine(ImVec2(pa.x, g_min.y - 6), ImVec2(pa.x, g_max.y + 6),
+                    IM_COL32(255, 60, 60, 220), 1.5f);
+    }
+
+    // ---------------------------- interaction --------------------------------
+    ImGui::SetCursorScreenPos(canvas_p0);
+    ImGui::InvisibleButton("##GraphCanvas54Fix", canvas_sz);
+    const bool hovered = ImGui::IsItemHovered();
+    const ImVec2 mp    = ImGui::GetIO().MousePos;
+
+    // Left-click: try handle first (only if AutoBezier isn't on that side),
+    // then any-dim key (auto-focuses to closest dim).
     if (interactive && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         graphDraggedTangent = GraphTangent::None;
-        // Priority: handles of currently-selected key.
-        if (graphSelectedKeyIndex >= 0) {
-            if (selHasOutHandle && dist2(mp, selOutHandlePos) < 12.0f * 12.0f) {
+        if (graphSelectedKeyIndex >= 0 && graphSelectedKeyIndex < nKeys) {
+            const auto& facc = accs[graphFocusDim];
+            const int outMode = facc.readOutMode(facc.prop, graphSelectedKeyIndex);
+            const int inMode  = facc.readInMode (facc.prop, graphSelectedKeyIndex);
+            const bool outLocked = (outMode == (int)InterpMode::AutoBezier);
+            const bool inLocked  = (inMode  == (int)InterpMode::AutoBezier);
+            if (selHasOutHandle && !outLocked && dist2(mp, selOutHandlePos) < 12.0f * 12.0f) {
                 graphDraggedTangent = GraphTangent::Out;
                 MarkForSnapshot();
-            } else if (selHasInHandle && dist2(mp, selInHandlePos) < 12.0f * 12.0f) {
+            } else if (selHasInHandle && !inLocked && dist2(mp, selInHandlePos) < 12.0f * 12.0f) {
                 graphDraggedTangent = GraphTangent::In;
                 MarkForSnapshot();
             }
         }
-        // No handle grabbed? Try picking a key.
         if (graphDraggedTangent == GraphTangent::None) {
-            int  bestIdx  = -1;
-            float bestD2  = 14.0f * 14.0f;
+            int  bestIdx = -1, bestDim = graphFocusDim;
+            float bestD2 = 14.0f * 14.0f;
             for (int i = 0; i < nKeys; ++i) {
-                const float kt = c.readTime(c.prop, i);
-                const float kv = c.readValue(c.prop, i);
-                const ImVec2 kp = ToScreen(kt, kv);
-                const float d2 = dist2(mp, kp);
-                if (d2 < bestD2) { bestD2 = d2; bestIdx = i; }
+                for (int d = 0; d < nDims; ++d) {
+                    const auto& acc = accs[d];
+                    const float kt = acc.readTime(acc.prop, i);
+                    const float kv = acc.readValue(acc.prop, i);
+                    const ImVec2 kp = ToScreen(kt, kv);
+                    const float d2 = dist2(mp, kp);
+                    if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = d; }
+                }
             }
-            graphSelectedKeyIndex = bestIdx;
+            if (bestIdx >= 0) {
+                graphSelectedKeyIndex = bestIdx;
+                graphFocusDim         = bestDim;
+            } else {
+                graphSelectedKeyIndex = -1;
+            }
         }
     }
 
-    // Drag: move the active tangent handle.
+    // Drag: recover (speed, influence) from the mouse position and store.
     if (interactive && graphDraggedTangent != GraphTangent::None &&
         ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
         graphSelectedKeyIndex >= 0 && graphSelectedKeyIndex < nKeys) {
-        const ImVec2 vv = ScreenToVal(mp);
-        const float kt = c.readTime(c.prop, graphSelectedKeyIndex);
-        const float kv = c.readValue(c.prop, graphSelectedKeyIndex);
-        const float dt = vv.x - kt;
-        const float dv = vv.y - kv;
-        if (graphDraggedTangent == GraphTangent::Out) {
-            // Clamp time to stay before next key.
-            float dtClamp = dt;
-            if (graphSelectedKeyIndex + 1 < nKeys) {
-                const float maxDt = c.readTime(c.prop, graphSelectedKeyIndex + 1) - kt;
-                if (dtClamp > maxDt) dtClamp = maxDt;
+        const auto& acc = accs[graphFocusDim];
+        const int   i   = graphSelectedKeyIndex;
+        const float kt  = acc.readTime (acc.prop, i);
+        const float kv  = acc.readValue(acc.prop, i);
+        const ImVec2 tv = ScreenToVal(mp);
+        const bool  isOut = (graphDraggedTangent == GraphTangent::Out);
+
+        // AE-native decomposition: the dragged handle is at
+        //   ht = kt + dtSeg * inf         (out; -dtSeg for in)
+        //   hv = kv + speed * (dtSeg * inf)
+        // Inverting:
+        //   inf   = (ht - kt) / dtSeg   (clamp to [0..1])
+        //   speed = (hv - kv) / (dtSeg * inf)    when inf > 0
+        // With Shift: horizontal-only (influence only). With Alt: vertical-only
+        // (speed only, using CURRENT influence to keep handle X pinned).
+        const bool shiftHeld = ImGui::GetIO().KeyShift;
+        const bool altHeld   = ImGui::GetIO().KeyAlt;
+
+        if (isOut && i + 1 < nKeys) {
+            const float nextT = acc.readTime(acc.prop, i + 1);
+            const float dtSeg = nextT - kt;
+            if (dtSeg > 1e-6f) {
+                float newInf = altHeld ? acc.readOutInf(acc.prop, i)
+                                       : std::clamp((tv.x - kt) / dtSeg * 100.0f, 0.0f, 100.0f);
+                float newSpd = shiftHeld ? acc.readOutSpeed(acc.prop, i)
+                                         : ((newInf > 0.1f)
+                                              ? (tv.y - kv) / (dtSeg * newInf * 0.01f)
+                                              : 0.0f);
+                acc.writeOutInf  (acc.prop, i, newInf);
+                acc.writeOutSpeed(acc.prop, i, newSpd);
+                // ContinuousBezier: mirror in/out (equal influence, opposite-sign
+                // full-vector speed on the incoming side).
+                if (acc.readOutMode(acc.prop, i) == (int)InterpMode::ContinuousBezier) {
+                    acc.writeInMode  (acc.prop, i, (int)InterpMode::ContinuousBezier);
+                    acc.writeInInf   (acc.prop, i, newInf);
+                    acc.copyOutSpeedToIn(acc.prop, i);
+                }
             }
-            if (dtClamp < 0.0f) dtClamp = 0.0f;
-            c.writeOutTanTime (c.prop, graphSelectedKeyIndex, dtClamp);
-            c.writeOutTanValue(c.prop, graphSelectedKeyIndex, dv);
-        } else {
-            float dtClamp = dt;
-            if (graphSelectedKeyIndex > 0) {
-                const float minDt = c.readTime(c.prop, graphSelectedKeyIndex - 1) - kt;
-                if (dtClamp < minDt) dtClamp = minDt;
+        } else if (!isOut && i > 0) {
+            const float prevT = acc.readTime(acc.prop, i - 1);
+            const float dtSeg = kt - prevT;
+            if (dtSeg > 1e-6f) {
+                float newInf = altHeld ? acc.readInInf(acc.prop, i)
+                                       : std::clamp((kt - tv.x) / dtSeg * 100.0f, 0.0f, 100.0f);
+                float newSpd = shiftHeld ? acc.readInSpeed(acc.prop, i)
+                                         : ((newInf > 0.1f)
+                                              ? (kv - tv.y) / (dtSeg * newInf * 0.01f)
+                                              : 0.0f);
+                acc.writeInInf  (acc.prop, i, newInf);
+                acc.writeInSpeed(acc.prop, i, newSpd);
+                if (acc.readInMode(acc.prop, i) == (int)InterpMode::ContinuousBezier) {
+                    acc.writeOutMode(acc.prop, i, (int)InterpMode::ContinuousBezier);
+                    acc.writeOutInf (acc.prop, i, newInf);
+                    acc.copyInSpeedToOut(acc.prop, i);
+                }
             }
-            if (dtClamp > 0.0f) dtClamp = 0.0f;
-            c.writeInTanTime (c.prop, graphSelectedKeyIndex, dtClamp);
-            c.writeInTanValue(c.prop, graphSelectedKeyIndex, dv);
         }
     }
     if (graphDraggedTangent != GraphTangent::None && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         graphDraggedTangent = GraphTangent::None;
     }
 
-    // Right-click a key -> open context menu.
+    // Right-click a key -> context menu.
     if (interactive && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-        int bestIdx = -1;
+        int bestIdx = -1, bestDim = graphFocusDim;
         float bestD2 = 14.0f * 14.0f;
         for (int i = 0; i < nKeys; ++i) {
-            const float kt = c.readTime(c.prop, i);
-            const float kv = c.readValue(c.prop, i);
-            const ImVec2 kp = ToScreen(kt, kv);
-            const float d2 = dist2(mp, kp);
-            if (d2 < bestD2) { bestD2 = d2; bestIdx = i; }
+            for (int d = 0; d < nDims; ++d) {
+                const auto& acc = accs[d];
+                const float kt = acc.readTime(acc.prop, i);
+                const float kv = acc.readValue(acc.prop, i);
+                const ImVec2 kp = ToScreen(kt, kv);
+                const float d2 = dist2(mp, kp);
+                if (d2 < bestD2) { bestD2 = d2; bestIdx = i; bestDim = d; }
+            }
         }
         if (bestIdx >= 0) {
             graphContextKeyIndex  = bestIdx;
             graphSelectedKeyIndex = bestIdx;
-            ImGui::OpenPopup("##GraphKeyCtx");
+            graphFocusDim         = bestDim;
+            ImGui::OpenPopup("##GraphKeyCtx54Fix");
         }
     }
 
-    if (ImGui::BeginPopup("##GraphKeyCtx")) {
+    if (ImGui::BeginPopup("##GraphKeyCtx54Fix")) {
         const int i = graphContextKeyIndex;
-        if (i < 0 || i >= c.keyCount(c.prop)) { ImGui::EndPopup(); }
-        else {
-            ImGui::TextDisabled("Key #%d (%s @ %.3fs)", i, c.label, c.readTime(c.prop, i));
+        if (i < 0 || i >= accs[0].keyCount(accs[0].prop)) {
+            ImGui::EndPopup();
+        } else {
+            const auto& acc = accs[graphFocusDim];
+            ImGui::TextDisabled("Key #%d (%s @ %.3fs)", i, acc.label, acc.readTime(acc.prop, i));
             ImGui::Separator();
-            if (ImGui::MenuItem("Set to Linear")) {
+            auto setMode = [&](InterpMode m) {
                 MarkForSnapshot();
-                c.writeInMode (c.prop, i, (int)InterpMode::Linear);
-                c.writeOutMode(c.prop, i, (int)InterpMode::Linear);
-            }
-            if (ImGui::MenuItem("Set to Bezier (Easy Ease)")) {
-                MarkForSnapshot();
-                c.writeInMode (c.prop, i, (int)InterpMode::Bezier);
-                c.writeOutMode(c.prop, i, (int)InterpMode::Bezier);
-                // Seed symmetric tangents: 1/3 of neighbor span along time,
-                // zero value offset (produces classic ease-in-out shape).
-                const int n = c.keyCount(c.prop);
-                float leftSpan  = 0.3f, rightSpan = 0.3f;
-                if (i > 0)     leftSpan  = c.readTime(c.prop, i) - c.readTime(c.prop, i - 1);
-                if (i + 1 < n) rightSpan = c.readTime(c.prop, i + 1) - c.readTime(c.prop, i);
-                c.writeInTanTime  (c.prop, i, -leftSpan  * 0.33f);
-                c.writeOutTanTime (c.prop, i,  rightSpan * 0.33f);
-                c.writeInTanValue (c.prop, i, 0.0f);
-                c.writeOutTanValue(c.prop, i, 0.0f);
-            }
-            if (ImGui::MenuItem("Set to Hold")) {
-                MarkForSnapshot();
-                c.writeInMode (c.prop, i, (int)InterpMode::Hold);
-                c.writeOutMode(c.prop, i, (int)InterpMode::Hold);
-            }
+                // Apply mode to BOTH sides on ALL dims (AE convention when
+                // you right-click and set a mode from the key body).
+                for (int d = 0; d < nDims; ++d) {
+                    accs[d].writeInMode (accs[d].prop, i, (int)m);
+                    accs[d].writeOutMode(accs[d].prop, i, (int)m);
+                }
+                // For fresh Bezier: seed with Easy-Ease-ish influence.
+                if (m == InterpMode::Bezier || m == InterpMode::ContinuousBezier) {
+                    for (int d = 0; d < nDims; ++d) {
+                        accs[d].writeInInf (accs[d].prop, i, 33.333f);
+                        accs[d].writeOutInf(accs[d].prop, i, 33.333f);
+                        accs[d].writeInSpeed (accs[d].prop, i, 0.0f);
+                        accs[d].writeOutSpeed(accs[d].prop, i, 0.0f);
+                    }
+                }
+                if (m == InterpMode::AutoBezier) {
+                    // Recompute happens next frame at the top of DrawGraphEditor.
+                }
+                if (m == InterpMode::Hold) {
+                    // Nothing else to seed; evaluator short-circuits.
+                }
+            };
+            if (ImGui::MenuItem("Set to Linear"))            setMode(InterpMode::Linear);
+            if (ImGui::MenuItem("Set to Bezier (F9 Easy Ease)")) setMode(InterpMode::Bezier);
+            if (ImGui::MenuItem("Set to Continuous Bezier")) setMode(InterpMode::ContinuousBezier);
+            if (ImGui::MenuItem("Set to Auto Bezier"))       setMode(InterpMode::AutoBezier);
+            if (ImGui::MenuItem("Set to Hold"))              setMode(InterpMode::Hold);
             ImGui::Separator();
             if (ImGui::MenuItem("Delete Keyframe")) {
                 MarkForSnapshot();
-                c.eraseKey(c.prop, i);
+                // Erase on ALL dims (they share the same key vector when the
+                // property is a single AnimatedProperty<Vec3>, so calling
+                // erase on accs[0] is enough — but be safe with float / scalar
+                // properties: only call erase once per underlying property).
+                accs[0].eraseKey(accs[0].prop, i);
                 graphSelectedKeyIndex = -1;
                 graphContextKeyIndex  = -1;
             }
