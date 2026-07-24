@@ -342,11 +342,10 @@ bool TextRenderer::RasterizeString(const TextProps& props,
         default: format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING); break;
     }
 
-    // Measure first with a very wide layout box so we know the true bounds.
-    // Then create the final layout at the measured size so DrawTextLayout
-    // fills the bitmap exactly. Add ~4px padding on each side so glyph
-    // overhang (italics, script hooks) doesn't clip.
-    const float kPad = 4.0f;
+    // Task 5.9-fix: measure with a very wide layout box, then apply overhang
+    // margins so italic terminal serifs / script hooks don't clip on the
+    // trailing edge (kPad alone wasn't enough — italics can overshoot the
+    // logical advance by 15-20% of the em-square).
     ComPtr<IDWriteTextLayout> layout;
     hr = factory_->CreateTextLayout(wtext.c_str(), (UINT32)wtext.size(),
                                      format.Get(),
@@ -357,8 +356,31 @@ bool TextRenderer::RasterizeString(const TextProps& props,
     DWRITE_TEXT_METRICS metrics{};
     if (FAILED(layout->GetMetrics(&metrics))) return false;
 
-    const int wPix = std::max(1, (int)std::ceil(metrics.widthIncludingTrailingWhitespace + 2 * kPad));
-    const int hPix = std::max(1, (int)std::ceil(metrics.height + 2 * kPad));
+    // Task 5.9-fix (alignment bug): center/right alignment aligns text
+    // within the LAYOUT box, not the measured bounds. My 4096-wide layout
+    // was aligning centered text at ~x=2048 - width/2, drawing it far
+    // outside the tight bitmap. Shrink layout MaxWidth to the measured
+    // content width so center/right alignment lands INSIDE the bitmap.
+    // Do this BEFORE reading overhang so overhang reflects the final
+    // (tightly-boxed) glyph positions.
+    layout->SetMaxWidth(metrics.widthIncludingTrailingWhitespace);
+    layout->SetMaxHeight(metrics.height);
+
+    // Italic overhang: GetOverhangMetrics reports per-side glyph overshoot
+    // beyond the layout rectangle. Positive numbers = overshoot. We inflate
+    // the bitmap dims by these, plus a small safety pad on top so sub-
+    // pixel positioning + AA halo can't touch the edge.
+    DWRITE_OVERHANG_METRICS oh{};
+    layout->GetOverhangMetrics(&oh);
+    const float leftPad   = std::max(0.0f, oh.left)   + 2.0f;
+    const float rightPad  = std::max(0.0f, oh.right)  + 2.0f;
+    const float topPad    = std::max(0.0f, oh.top)    + 2.0f;
+    const float bottomPad = std::max(0.0f, oh.bottom) + 2.0f;
+
+    const int wPix = std::max(1, (int)std::ceil(
+        metrics.widthIncludingTrailingWhitespace + leftPad + rightPad));
+    const int hPix = std::max(1, (int)std::ceil(
+        metrics.height + topPad + bottomPad));
 
     // Resize the bitmap-render-target if the string doesn't fit. IDWrite
     // returns E_INVALIDARG on shrink attempts; we only ever grow.
@@ -385,17 +407,18 @@ bool TextRenderer::RasterizeString(const TextProps& props,
     HBRUSH blackBrush = (HBRUSH)GetStockObject(BLACK_BRUSH);
     FillRect(hdc, &clearRc, blackBrush);
 
-    // Draw the text layout at (kPad, kPad) with white glyphs. IDWriteBitmap
-    // RenderTarget doesn't expose DrawTextLayout directly (that would need a
-    // D2D device context) — instead we invoke IDWriteTextLayout::Draw() with
-    // a custom IDWriteTextRenderer callback that forwards glyph runs to
+    // Draw at the padded origin so italic left-overhang and top-overhang
+    // land inside the bitmap. IDWriteBitmapRenderTarget doesn't expose
+    // DrawTextLayout directly (that would need a D2D device context) —
+    // instead we invoke IDWriteTextLayout::Draw() with a custom
+    // IDWriteTextRenderer callback that forwards glyph runs to
     // bitmapTarget_->DrawGlyphRun. Standard FW1-style bridge.
     {
         BitmapTextRenderer* bmr = new BitmapTextRenderer();
         bmr->target       = bitmapTarget_.Get();
         bmr->renderParams = renderParams_.Get();
         bmr->fgColor      = RGB(255, 255, 255);
-        hr = layout->Draw(nullptr, bmr, kPad, kPad);
+        hr = layout->Draw(nullptr, bmr, leftPad, topPad);
         bmr->Release();
         if (FAILED(hr)) return false;
     }
@@ -503,5 +526,14 @@ bool TextRenderer::EnsureLayerCache(Layer& layer, ID3D11Device* device) {
     layer.textTexW     = w;
     layer.textTexH     = h;
     layer.textCacheKey = key;
+
+    // Task 5.9-fix (auto-grow bounding box): mirror the atlas dims into
+    // sizePixels.staticValue so the gizmo hit-box matches what's actually
+    // on screen. Only touch it when the size stopwatch is OFF — if the
+    // user has size keyframes they explicitly want a fixed rect, don't
+    // stomp those.
+    if (!layer.transform.sizePixels.stopwatchEnabled) {
+        layer.transform.sizePixels.staticValue = Vec2((float)w, (float)h);
+    }
     return true;
 }

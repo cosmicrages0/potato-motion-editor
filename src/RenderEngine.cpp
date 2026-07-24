@@ -1523,12 +1523,25 @@ void RenderEngine::DrawInspectorPanel() {
                            4.0f, 512.0f, "%.0f");
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
-        // Weight (100..900, snap to 100 increments)
-        int weight = sel->textProps.fontWeight;
-        if (ImGui::SliderInt("Weight##textWt", &weight, 100, 900, "%d")) {
-            sel->textProps.fontWeight = ((weight + 50) / 100) * 100;
+        // Task 5.9-fix: Weight as a named combo (AE/Figma convention). Slider
+        // was misleading — most fonts ship only 2-4 weights and DirectWrite
+        // silently substitutes, so intermediate slider values did nothing
+        // visible. Named weights make substitution honest: pick 'Medium'
+        // and see if it looks distinct from 'Regular' for THIS font.
+        static const char* kWeightLabels[] = {
+            "100 Thin", "200 ExtraLight", "300 Light",
+            "400 Regular", "500 Medium", "600 SemiBold",
+            "700 Bold", "800 ExtraBold", "900 Black"
+        };
+        static const int kWeightValues[] = { 100, 200, 300, 400, 500, 600, 700, 800, 900 };
+        int wIdx = 3; // Regular default
+        for (int i = 0; i < 9; ++i) {
+            if (sel->textProps.fontWeight == kWeightValues[i]) { wIdx = i; break; }
         }
-        if (ImGui::IsItemActivated()) MarkForSnapshot();
+        if (ImGui::Combo("Weight##textWt", &wIdx, kWeightLabels, 9)) {
+            MarkForSnapshot();
+            sel->textProps.fontWeight = kWeightValues[wIdx];
+        }
 
         // Italic
         if (ImGui::Checkbox("Italic##textIt", &sel->textProps.italic)) {
