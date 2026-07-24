@@ -875,118 +875,16 @@ void RenderEngine::DrawTimelinePanel() {
     ImGui::Separator();
 
     // Task 5.12: right-pane content selector.
-    //   Bars mode  -> existing timeline strip (label column + track column
-    //                 with trim bars + keyframe diamonds + playhead).
+    //   Bars mode  -> timeline strip (label column with Vis/Name/Parent
+    //                 + track column with trim bars + keyframe diamonds
+    //                 + playhead). This IS the layer list — no separate
+    //                 table below anymore (Task 5.12b removed it).
     //   Graph mode -> graph editor (full-width now that it isn't sharing
     //                 the bottom dock with the Timeline anymore).
-    // Both paths share the layer table below.
     if (bottomPaneMode == BottomPaneMode::Bars) {
-        // Task 4.5: real timeline strip with playhead + keyframe diamonds.
         DrawTimelineStrip();
     } else {
         DrawGraphEditor();
-    }
-
-    ImGui::Separator();
-
-    // Task 5.0-b: 3D column only appears when 3D features are enabled.
-    const int  colCount = show3DFeatures ? 5 : 4;
-    const int  nameCol  = show3DFeatures ? 2 : 1;
-    const int  typeCol  = show3DFeatures ? 3 : 2;
-    const int  parentCol= show3DFeatures ? 4 : 3;
-    if (ImGui::BeginTable("LayerTable", colCount,
-        ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Vis", ImGuiTableColumnFlags_WidthFixed, 32.0f);
-        if (show3DFeatures) ImGui::TableSetupColumn("3D",  ImGuiTableColumnFlags_WidthFixed, 28.0f);
-        ImGui::TableSetupColumn("Name");
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Parent", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableHeadersRow();
-
-        auto& L = layerManager.Layers();
-        for (size_t i = 0; i < L.size(); ++i) {
-            Layer& layer = L[i];
-            ImGui::PushID(layer.id);
-
-            ImGui::TableNextRow();
-            // Vis toggle
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Checkbox("##vis", &layer.isVisible);
-
-            // 3D toggle (only when 3D features enabled)
-            if (show3DFeatures) {
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Checkbox("##3d", &layer.is3D);
-            }
-
-            // Selectable name (with [fx] badge if the layer has any enabled effects)
-            ImGui::TableSetColumnIndex(nameCol);
-            const bool isSelected = (layer.id == layerManager.GetSelectedId());
-            char label[160];
-            const bool fx = layer.HasAnyEnabledEffect();
-            std::snprintf(label, sizeof(label), "%s%s",
-                          fx ? "[fx] " : "",
-                          layer.name.c_str());
-            // Task 5.3 fix: without AllowOverlap the Selectable steals every
-            // click across the entire row (including on the Parent Combo two
-            // cells over) because SpanAllColumns extends its hit-rect
-            // across all columns. AllowOverlap lets subsequent widgets in the
-            // row (like the Combo) claim their own hit-rects and receive
-            // clicks normally.
-            const ImGuiSelectableFlags selFlags =
-                (ImGuiSelectableFlags)((int)ImGuiSelectableFlags_SpanAllColumns |
-                                       (int)ImGuiSelectableFlags_AllowOverlap);
-            if (ImGui::Selectable(label, isSelected, selFlags)) {
-                layerManager.SetSelectedId(layer.id);
-            }
-
-            // Type (read-only column)
-            ImGui::TableSetColumnIndex(typeCol);
-            const char* typeName = "Rect";
-            switch (layer.type) {
-                case ShapeType::Rectangle:  typeName = "Rectangle"; break;
-                case ShapeType::Ellipse:    typeName = "Ellipse";   break;
-                case ShapeType::CustomPath: typeName = "Path";      break;
-                case ShapeType::Camera:     typeName = "Camera";    break;
-                case ShapeType::Null:       typeName = "Null";      break;
-            }
-            ImGui::TextUnformatted(typeName);
-
-            // Parent dropdown
-            ImGui::TableSetColumnIndex(parentCol);
-            // Task 5.3 fix: paired with the Selectable's AllowOverlap flag
-            // above. Tells ImGui this widget's hit-rect wins over any prior
-            // overlapping item — the Combo now receives clicks that used to
-            // be stolen by the Name column's row-spanning Selectable.
-            ImGui::SetNextItemAllowOverlap();
-            const Layer* parent = layerManager.GetLayerById(layer.parentId);
-            const char* preview = parent ? parent->name.c_str() : "(none)";
-            if (ImGui::BeginCombo("##parent", preview, ImGuiComboFlags_HeightSmall)) {
-                // Task 5.3-fix-2: use SetParentPreservingWorld so the child
-                // stays visually in place when parented/re-parented, matching
-                // AE and Alight Motion behavior. Raw SetParent (which causes
-                // the child to jump) stays available for future use.
-                const float ct = animEngine.currentTime;
-                if (ImGui::Selectable("(none)", layer.parentId == -1)) {
-                    MarkForSnapshot();
-                    layerManager.SetParentPreservingWorld(layer.id, -1, ct);
-                }
-                for (const auto& candidate : L) {
-                    if (candidate.id == layer.id) continue;
-                    const bool wouldCycle = layerManager.WouldCreateCycle(layer.id, candidate.id);
-                    ImGuiSelectableFlags flags = wouldCycle ? ImGuiSelectableFlags_Disabled : 0;
-                    const bool sel = (layer.parentId == candidate.id);
-                    if (ImGui::Selectable(candidate.name.c_str(), sel, flags)) {
-                        MarkForSnapshot();
-                        layerManager.SetParentPreservingWorld(layer.id, candidate.id, ct);
-                    }
-                }
-                ImGui::EndCombo();
-            }
-
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
     }
 }
 
@@ -1129,33 +1027,119 @@ void RenderEngine::DrawTimelineStrip() {
                               ImVec2(origin.x + stripW, rowY0 + rowH),
                               IM_COL32(90, 90, 140, 180));
         }
-        // Label column
-        dl->AddText(ImVec2(origin.x + 6.0f, rowY0 + 2.0f),
-                    IM_COL32(220, 220, 230, 255), layer.name.c_str());
+        // Task 5.12b: label column now hosts the Vis toggle + Name + Parent
+        // combo directly, so the redundant ImGui table below can go away.
+        // Widget order matters for click routing: the interactive widgets
+        // (Vis checkbox, Parent combo) are drawn BEFORE the reorder
+        // InvisibleButton so they win the hit-test where they overlap.
+        //
+        // Layout inside labelW:
+        //   [Vis 18px] [padding 4px] [Name flex] [Parent 90px if room]
+        const float visW    = 18.0f;
+        const float parentW = 90.0f;
+        // Skip parent combo when the label column is too tight — user can
+        // still parent via the Inspector.
+        const bool  showParentCol = (trackX0 - origin.x) > 260.0f;
+        const float nameX0    = origin.x + visW + 6.0f;
+        const float parentX0  = origin.x + (trackX0 - origin.x) - parentW - 6.0f;
+        const float nameX1    = showParentCol ? parentX0 - 4.0f
+                                              : (trackX0 - 4.0f);
 
-        // Task 5.11: drag-to-reorder hit-region over the label column.
-        // Sized to fit the label area (origin.x..trackX0 minus a small
-        // margin). Suppressed while a diamond or trim drag is in flight
-        // so those interactions win.
+        // --- Vis toggle (eye checkbox, small) --------------------------
+        {
+            ImGui::PushID((int)(0x7B000000 | layer.id));
+            ImGui::SetCursorScreenPos(ImVec2(origin.x + 2.0f, rowY0 + 2.0f));
+            bool vis = layer.isVisible;
+            if (ImGui::Checkbox("##vis", &vis)) {
+                MarkForSnapshot();
+                layer.isVisible = vis;
+            }
+            ImGui::PopID();
+        }
+
+        // --- Layer name text -------------------------------------------
+        // Clip to available width so long names don't spill over the parent
+        // combo or the track area. Cheap manual clip: measure and truncate.
+        {
+            const float nameMaxW = std::max(20.0f, nameX1 - nameX0);
+            const char* nm = layer.name.c_str();
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "%s", nm);
+            ImVec2 sz = ImGui::CalcTextSize(buf);
+            if (sz.x > nameMaxW) {
+                // Truncate with ellipsis. Cheap loop; label lengths are
+                // ~20 chars typical so this is O(N) per row per frame.
+                size_t len = std::strlen(buf);
+                while (len > 1 && sz.x > nameMaxW - 12.0f) {
+                    buf[--len] = '\0';
+                    if (len < sizeof(buf) - 3) {
+                        buf[len] = '\0';
+                    }
+                    sz = ImGui::CalcTextSize(buf);
+                }
+                // Append "..." if we actually truncated.
+                if (len < std::strlen(nm)) {
+                    if (len + 3 < sizeof(buf)) std::strcat(buf, "...");
+                }
+            }
+            dl->AddText(ImVec2(nameX0, rowY0 + 2.0f),
+                        IM_COL32(220, 220, 230, 255), buf);
+        }
+
+        // --- Parent combo (only when there's room) ---------------------
+        if (showParentCol) {
+            ImGui::PushID((int)(0x7C000000 | layer.id));
+            ImGui::SetCursorScreenPos(ImVec2(parentX0, rowY0 + 1.0f));
+            ImGui::SetNextItemWidth(parentW);
+            const Layer* parent = layerManager.GetLayerById(layer.parentId);
+            const char* preview = parent ? parent->name.c_str() : "(none)";
+            if (ImGui::BeginCombo("##parent", preview,
+                                   ImGuiComboFlags_HeightSmall |
+                                   ImGuiComboFlags_NoArrowButton)) {
+                const float ct = animEngine.currentTime;
+                if (ImGui::Selectable("(none)", layer.parentId == -1)) {
+                    MarkForSnapshot();
+                    layerManager.SetParentPreservingWorld(layer.id, -1, ct);
+                }
+                for (const auto& candidate : layers) {
+                    if (candidate.id == layer.id) continue;
+                    const bool wouldCycle =
+                        layerManager.WouldCreateCycle(layer.id, candidate.id);
+                    const ImGuiSelectableFlags flags =
+                        wouldCycle ? ImGuiSelectableFlags_Disabled : 0;
+                    const bool sel = (layer.parentId == candidate.id);
+                    if (ImGui::Selectable(candidate.name.c_str(), sel, flags)) {
+                        MarkForSnapshot();
+                        layerManager.SetParentPreservingWorld(layer.id, candidate.id, ct);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+        }
+
+        // Task 5.11: drag-to-reorder hit-region.
+        // Task 5.12b: EXTENDED to the full row width (not just the label
+        // column) so users can grab any part of the row — matching AE.
+        // Sits AFTER the Vis + Parent widgets so those claim their hit-
+        // rects first; the trim-bar handles + keyframe diamonds draw
+        // later in the loop and win on their sub-rects too.
         //
         // Task 5.11-fix: we CAN'T rely on ImGui::IsItemActive() to keep
         // the drag alive across frames — MoveLayerToIndex reorders the
-        // vector mid-drag, which moves this row's InvisibleButton to a
-        // different screen Y, which makes ImGui drop the active state
-        // because "the widget moved". Instead: detect the mouse-down
-        // via IsItemHovered + IsMouseClicked, then track drag lifetime
-        // via a global IsMouseDown check in the post-loop block (below).
+        // vector mid-drag, moving this row's InvisibleButton to a
+        // different screen Y. ImGui interprets 'widget moved' = drag
+        // lost. Detect mouse-down via IsItemHovered + IsMouseClicked,
+        // then track lifetime via the global IsMouseDown check in the
+        // post-loop block.
         if (!diamondDragActive) {
             ImGui::PushID((int)(0x7A000000 | layer.id));
             ImGui::SetCursorScreenPos(ImVec2(origin.x, rowY0));
-            const float labelW = std::max(20.0f, trackX0 - origin.x - 4.0f);
-            ImGui::InvisibleButton("##layerReorder", ImVec2(labelW, rowH));
+            ImGui::InvisibleButton("##layerReorder", ImVec2(stripW, rowH));
             const bool hovered = ImGui::IsItemHovered();
             if (hovered || layer.id == layerReorderDragId) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
             }
-            // Start the drag on mouse-down over this row (only when no
-            // other drag is already in flight).
             if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 (layerReorderDragId < 0)) {
                 MarkForSnapshot();
