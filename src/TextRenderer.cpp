@@ -9,6 +9,91 @@
 using Microsoft::WRL::ComPtr;
 
 // =============================================================================
+// BitmapTextRenderer — minimal IDWriteTextRenderer that turns
+// IDWriteTextLayout::Draw() glyph runs into IDWriteBitmapRenderTarget::
+// DrawGlyphRun() calls. IDWriteBitmapRenderTarget doesn't expose a
+// higher-level DrawTextLayout method (that would need a full D2D device
+// context), so this is the standard bridge — same pattern the FW1 wrapper
+// uses. Non-glyph elements (underline, strikethrough, inline objects) are
+// no-ops for v1; we don't use them.
+// =============================================================================
+namespace {
+
+struct BitmapTextRenderer : public IDWriteTextRenderer {
+    IDWriteBitmapRenderTarget*  target       = nullptr;   // non-owning
+    IDWriteRenderingParams*     renderParams = nullptr;   // non-owning
+    COLORREF                    fgColor      = RGB(255, 255, 255);
+
+    // --- IUnknown -------------------------------------------------------
+    ULONG refCount = 1;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (iid == __uuidof(IUnknown) ||
+            iid == __uuidof(IDWritePixelSnapping) ||
+            iid == __uuidof(IDWriteTextRenderer)) {
+            *ppv = static_cast<IDWriteTextRenderer*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef()  override { return ++refCount; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG r = --refCount;
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // --- IDWritePixelSnapping ------------------------------------------
+    HRESULT STDMETHODCALLTYPE IsPixelSnappingDisabled(void*, BOOL* isDisabled) override {
+        *isDisabled = FALSE;   // enable snapping for crisp glyph edges
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetCurrentTransform(void*, DWRITE_MATRIX* transform) override {
+        // Identity — the layout is already positioned in bitmap coords via
+        // the originX/originY args passed to Draw().
+        transform->m11 = 1.0f; transform->m12 = 0.0f;
+        transform->m21 = 0.0f; transform->m22 = 1.0f;
+        transform->dx  = 0.0f; transform->dy  = 0.0f;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPixelsPerDip(void*, FLOAT* pixelsPerDip) override {
+        *pixelsPerDip = 1.0f;   // matches bitmapTarget_->SetPixelsPerDip(1.0f)
+        return S_OK;
+    }
+
+    // --- IDWriteTextRenderer -------------------------------------------
+    HRESULT STDMETHODCALLTYPE DrawGlyphRun(
+        void* /*clientDrawingContext*/,
+        FLOAT baselineOriginX, FLOAT baselineOriginY,
+        DWRITE_MEASURING_MODE measuringMode,
+        const DWRITE_GLYPH_RUN* glyphRun,
+        const DWRITE_GLYPH_RUN_DESCRIPTION* /*glyphRunDescription*/,
+        IUnknown* /*clientDrawingEffect*/) override {
+        if (!target || !glyphRun) return S_OK;
+        RECT dirty{};
+        return target->DrawGlyphRun(baselineOriginX, baselineOriginY,
+                                    measuringMode, glyphRun,
+                                    renderParams, fgColor, &dirty);
+    }
+    HRESULT STDMETHODCALLTYPE DrawUnderline(
+        void*, FLOAT, FLOAT, const DWRITE_UNDERLINE*, IUnknown*) override {
+        return S_OK;  // v1: no underline
+    }
+    HRESULT STDMETHODCALLTYPE DrawStrikethrough(
+        void*, FLOAT, FLOAT, const DWRITE_STRIKETHROUGH*, IUnknown*) override {
+        return S_OK;  // v1: no strikethrough
+    }
+    HRESULT STDMETHODCALLTYPE DrawInlineObject(
+        void*, FLOAT, FLOAT, IDWriteInlineObject*, BOOL, BOOL, IUnknown*) override {
+        return S_OK;  // v1: no inline objects
+    }
+};
+
+} // namespace
+
+// =============================================================================
 // Construction / lifecycle
 // =============================================================================
 TextRenderer::TextRenderer() = default;
@@ -300,13 +385,20 @@ bool TextRenderer::RasterizeString(const TextProps& props,
     HBRUSH blackBrush = (HBRUSH)GetStockObject(BLACK_BRUSH);
     FillRect(hdc, &clearRc, blackBrush);
 
-    // Draw the text layout at (kPad, kPad) with white color; grayscale AA
-    // gives us a black->white coverage ramp we can lift as R8.
-    hr = bitmapTarget_->DrawTextLayout(kPad, kPad,
-                                        layout.Get(),
-                                        renderParams_.Get(),
-                                        RGB(255, 255, 255));
-    if (FAILED(hr)) return false;
+    // Draw the text layout at (kPad, kPad) with white glyphs. IDWriteBitmap
+    // RenderTarget doesn't expose DrawTextLayout directly (that would need a
+    // D2D device context) — instead we invoke IDWriteTextLayout::Draw() with
+    // a custom IDWriteTextRenderer callback that forwards glyph runs to
+    // bitmapTarget_->DrawGlyphRun. Standard FW1-style bridge.
+    {
+        BitmapTextRenderer* bmr = new BitmapTextRenderer();
+        bmr->target       = bitmapTarget_.Get();
+        bmr->renderParams = renderParams_.Get();
+        bmr->fgColor      = RGB(255, 255, 255);
+        hr = layout->Draw(nullptr, bmr, kPad, kPad);
+        bmr->Release();
+        if (FAILED(hr)) return false;
+    }
 
     // Extract the DIB backing pixels. GetCurrentObject on the HDC returns
     // the HBITMAP; GetObject fills a BITMAP struct with a pointer to the
