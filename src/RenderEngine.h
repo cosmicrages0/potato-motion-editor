@@ -202,6 +202,13 @@ private:
     };
     DiamondHit  draggedDiamond;
     bool        diamondDragActive = false;
+
+    // Task 5.11: drag-to-reorder state for the timeline label column.
+    // Left-click-and-hold on a layer name and drag up/down; when the
+    // cursor crosses the midpoint of a neighbor row we swap indices via
+    // LayerManager::MoveLayerToIndex. Snapshot fires ONCE on mouse-down.
+    int  layerReorderDragId       = -1;   // id of layer being moved; -1 = idle
+    bool layerReorderSnapshotDone = false;// guards duplicate MarkForSnapshot per drag
     // Right-click context menu target (persisted across frames because ImGui
     // popups open on the frame AFTER the click).
     DiamondHit  contextDiamond;

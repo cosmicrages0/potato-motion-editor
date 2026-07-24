@@ -1014,26 +1014,68 @@ void RenderEngine::DrawTimelineStrip() {
         }
     }
 
-    // Per-layer rows with keyframe diamonds
+    // Per-layer rows with keyframe diamonds.
+    // Task 5.11 (AE-order): row 0 (top of strip) maps to the LAST layer in
+    // the vector — matches AE where the top row is the front-most layer.
+    // CompositionRenderer keeps its forward-vector iteration (later index =
+    // drawn last = on top), which is what makes the front-most layer
+    // visually on top of the canvas AND at the top of the timeline strip.
     const int selectedId = layerManager.GetSelectedId();
     // Task 5.3-fix: precompute playhead X once so per-diamond render code can
     // highlight keys that are near the playhead.
     const float playheadX = TimeToX(animEngine.currentTime);
     constexpr float kNearPlayheadPixels = 10.0f;
-    for (size_t i = 0; i < layers.size(); ++i) {
+    const size_t nLayers = layers.size();
+    for (size_t rowI = 0; rowI < nLayers; ++rowI) {
+        // Vector index that this row displays (top row = last vector element).
+        const size_t i = nLayers - 1 - rowI;
         Layer& layer = layers[i];    // Task 5.10: mutable for trim-bar drag
-        const float rowY0 = origin.y + rulerH + rowH * (float)i;
+        const float rowY0 = origin.y + rulerH + rowH * (float)rowI;
         const float rowYc = rowY0 + rowH * 0.5f;
 
-        // Row background: highlight selected
+        // Row background: highlight selected. Slightly brighter tint when
+        // this row is the drag-in-flight source so the user sees what's
+        // being moved.
         if (layer.id == selectedId) {
             dl->AddRectFilled(ImVec2(origin.x, rowY0),
                               ImVec2(origin.x + stripW, rowY0 + rowH),
                               IM_COL32(50, 50, 80, 200));
         }
+        if (layer.id == layerReorderDragId) {
+            dl->AddRectFilled(ImVec2(origin.x, rowY0),
+                              ImVec2(origin.x + stripW, rowY0 + rowH),
+                              IM_COL32(90, 90, 140, 180));
+        }
         // Label column
         dl->AddText(ImVec2(origin.x + 6.0f, rowY0 + 2.0f),
                     IM_COL32(220, 220, 230, 255), layer.name.c_str());
+
+        // Task 5.11: drag-to-reorder hit-region over the label column.
+        // Sized to fit the label area (origin.x..trackX0 minus a small
+        // margin). Suppressed while a diamond or trim drag is in flight
+        // so those interactions win. Uses ImGui InvisibleButton for the
+        // hover/active detection; we consult mouse position directly for
+        // the swap logic since we need per-frame cross-row detection.
+        if (!diamondDragActive) {
+            ImGui::PushID((int)(0x7A000000 | layer.id));
+            ImGui::SetCursorScreenPos(ImVec2(origin.x, rowY0));
+            const float labelW = std::max(20.0f, trackX0 - origin.x - 4.0f);
+            ImGui::InvisibleButton("##layerReorder", ImVec2(labelW, rowH));
+            const bool hovered = ImGui::IsItemHovered();
+            const bool active  = ImGui::IsItemActive();
+            if (hovered || active) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            }
+            if (ImGui::IsItemActivated()) {
+                // Mouse-down on a label row starts a reorder drag AND
+                // selects the layer for immediate editing (matches AE).
+                MarkForSnapshot();
+                layerReorderDragId       = layer.id;
+                layerReorderSnapshotDone = true;
+                layerManager.SetSelectedId(layer.id);
+            }
+            ImGui::PopID();
+        }
 
         // Track baseline
         dl->AddLine(ImVec2(trackX0, rowYc), ImVec2(trackX1, rowYc),
@@ -1202,6 +1244,39 @@ void RenderEngine::DrawTimelineStrip() {
         drawAndHitKeys(layer.transform.scale,    DiamondProperty::Scale,    IM_COL32(255, 200, 120, 255));
         drawAndHitKeys(layer.transform.rotation, DiamondProperty::Rotation, IM_COL32(200, 255, 120, 255));
         drawAndHitKeys(layer.transform.opacity,  DiamondProperty::Opacity,  IM_COL32(255, 120, 200, 255));
+    }
+
+    // Task 5.11: reorder-drag position tracking. Runs AFTER the per-row
+    // loop so we can consult mouse Y against known row bounds. On each
+    // frame the drag is active, work out which row the mouse hovers and
+    // if it's different from the dragged layer's current row, call
+    // MoveLayerToIndex. Ends cleanly on mouse-up.
+    if (layerReorderDragId >= 0) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const float mY   = ImGui::GetIO().MousePos.y;
+            const float body0 = origin.y + rulerH;
+            const int dragFromRow = (int)((mY - body0) / rowH);
+            if (dragFromRow >= 0 && dragFromRow < (int)nLayers) {
+                // Row -> vector index (reverse mapping, top row = last).
+                const int targetVecIdx = (int)nLayers - 1 - dragFromRow;
+                // Current vector index of the dragged layer.
+                Layer* dragL = layerManager.GetLayerById(layerReorderDragId);
+                if (dragL) {
+                    int curVecIdx = -1;
+                    for (size_t k = 0; k < nLayers; ++k) {
+                        if (layers[k].id == layerReorderDragId) { curVecIdx = (int)k; break; }
+                    }
+                    if (curVecIdx >= 0 && curVecIdx != targetVecIdx) {
+                        layerManager.MoveLayerToIndex(layerReorderDragId, targetVecIdx);
+                    }
+                }
+            }
+        } else {
+            // Mouse-up: end the drag. Snapshot was already fired on
+            // activation so no post-drag snapshot needed.
+            layerReorderDragId       = -1;
+            layerReorderSnapshotDone = false;
+        }
     }
 
     // Right-click context menu for a keyframe. contextDiamond is set by the

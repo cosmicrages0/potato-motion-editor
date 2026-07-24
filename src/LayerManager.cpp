@@ -65,6 +65,7 @@ int LayerManager::AddLayer(ShapeType type, const std::string& nameHint) {
             case ShapeType::CustomPath: L.name = "Path "      + std::to_string(L.id); break;
             case ShapeType::Camera:     L.name = "Camera "    + std::to_string(L.id); break;
             case ShapeType::Null:       L.name = "Null "      + std::to_string(L.id); break;
+            case ShapeType::Text:       L.name = "Text "      + std::to_string(L.id); break;
         }
     }
 
@@ -85,11 +86,25 @@ int LayerManager::AddLayer(ShapeType type, const std::string& nameHint) {
     };
     L.fillColor = palette[L.id % 6];
 
-    layers.push_back(std::move(L));
+    // Task 5.11 (AE-order fix): insert the new layer IMMEDIATELY AFTER the
+    // currently-selected layer in the vector. Since CompositionRenderer
+    // draws in forward-vector-order (later index = on top) AND the
+    // timeline strip renders in reverse-vector-order (later index = top
+    // row = front-most, AE convention), inserting after the selection
+    // means the new layer appears BOTH on top visually AND at the top
+    // row of the timeline strip — matches how AE places new layers.
+    // Falls back to push_back when nothing is selected or the selection
+    // id is stale.
+    size_t insertIdx = layers.size();
+    if (selectedLayerId >= 0) {
+        const int selIdx = IndexOfId(selectedLayerId);
+        if (selIdx >= 0) insertIdx = (size_t)(selIdx + 1);
+    }
+    layers.insert(layers.begin() + insertIdx, std::move(L));
     RebuildIndex();
 
     // Auto-select the new layer for immediate editing.
-    selectedLayerId = layers.back().id;
+    selectedLayerId = layers[insertIdx].id;
     return selectedLayerId;
 }
 
@@ -140,6 +155,33 @@ int LayerManager::DuplicateLayer(int srcId) {
     // Auto-select the new layer for immediate editing.
     selectedLayerId = layers[(size_t)(srcIdx + 1)].id;
     return selectedLayerId;
+}
+
+// Task 5.11: reorder helper. Moves the layer with id=movingId to absolute
+// vector index targetIdx. Preserves stable ids (RebuildIndex handles the
+// idToIndex remap). Clamps targetIdx to a legal range. Silent no-op if
+// movingId doesn't exist or targetIdx equals the current index (nothing
+// to do — saves an unnecessary snapshot / vector churn).
+bool LayerManager::MoveLayerToIndex(int movingId, int targetIdx) {
+    const int fromIdx = IndexOfId(movingId);
+    if (fromIdx < 0) return false;
+    // Clamp target into legal range. After we erase the moving layer, the
+    // vector shrinks by one, so a target after fromIdx effectively shifts
+    // left by 1 during the insert. Compute the post-erase target here.
+    int adjTarget = targetIdx;
+    if (adjTarget < 0)                    adjTarget = 0;
+    if (adjTarget > (int)layers.size() - 1) adjTarget = (int)layers.size() - 1;
+    if (adjTarget == fromIdx) return true; // no-op
+
+    Layer L = std::move(layers[(size_t)fromIdx]);
+    layers.erase(layers.begin() + fromIdx);
+    // After erase, indices > fromIdx have shifted down by 1.
+    if (adjTarget > fromIdx) adjTarget -= 1;
+    if (adjTarget < 0)                     adjTarget = 0;
+    if (adjTarget > (int)layers.size())    adjTarget = (int)layers.size();
+    layers.insert(layers.begin() + adjTarget, std::move(L));
+    RebuildIndex();
+    return true;
 }
 
 bool LayerManager::WouldCreateCycle(int childId, int candidateParentId) const {

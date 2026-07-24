@@ -34,6 +34,13 @@ public:
     // or -1 if srcId doesn't exist.
     int  DuplicateLayer(int srcId);
 
+    // Task 5.11: reorder layer with id `movingId` so it lands at absolute
+    // vector index `targetIdx` in the layer stack. Handles both up- and
+    // down- moves via a temp erase + insert. Returns true on success.
+    // Callers (timeline drag-to-reorder) should MarkForSnapshot on the
+    // first mouse-down of the drag, not on every incremental swap.
+    bool MoveLayerToIndex(int movingId, int targetIdx);
+
     // Task 5.2: wipe all layers and reset id counter / selection. Called by
     // LoadProject before deserializing a saved file so the loaded scene
     // doesn't collide with whatever was in memory.
