@@ -383,10 +383,13 @@ static void UnpackABGRToRGBAf(unsigned int abgr, float out[4]) {
 void CompositionRenderer::DrawRect(const Mat3& world, const Vec2& size,
                                    unsigned int fillColor, unsigned int strokeColor,
                                    float strokeWidth, float cornerRadius,
-                                   UINT targetW, UINT targetH) {
+                                   UINT logicalW, UINT logicalH) {
     if (!context_ || !ps_shape_sdf_) return;
     ShapeCB cb{};
-    BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
+    // Task 5.8: MVP division uses LOGICAL dims (composition pixels), NOT the
+    // RT's actual pixel count. That keeps shape coordinates comp-correct even
+    // when the RT is downsampled by the preview-scale knob.
+    BuildShapeMVP(world, size, logicalW, logicalH, cb.mvp);
     UnpackABGRToRGBAf(fillColor,   cb.color);
     UnpackABGRToRGBAf(strokeColor, cb.stroke);
     cb.params[0]  = 0.0f;                      // shape type = rect
@@ -410,10 +413,11 @@ void CompositionRenderer::DrawRect(const Mat3& world, const Vec2& size,
 void CompositionRenderer::DrawEllipse(const Mat3& world, const Vec2& size,
                                       unsigned int fillColor, unsigned int strokeColor,
                                       float strokeWidth,
-                                      UINT targetW, UINT targetH) {
+                                      UINT logicalW, UINT logicalH) {
     if (!context_ || !ps_shape_sdf_) return;
     ShapeCB cb{};
-    BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
+    // Task 5.8: see DrawRect — logical dims for MVP.
+    BuildShapeMVP(world, size, logicalW, logicalH, cb.mvp);
     UnpackABGRToRGBAf(fillColor,   cb.color);
     UnpackABGRToRGBAf(strokeColor, cb.stroke);
     cb.params[0]  = 1.0f;                      // shape type = ellipse
@@ -435,10 +439,11 @@ void CompositionRenderer::DrawEllipse(const Mat3& world, const Vec2& size,
 }
 
 void CompositionRenderer::DrawNullMarker(const Mat3& world, const Vec2& size,
-                                         UINT targetW, UINT targetH) {
+                                         UINT logicalW, UINT logicalH) {
     if (!context_ || !ps_null_) return;
     ShapeCB cb{};
-    BuildShapeMVP(world, size, targetW, targetH, cb.mvp);
+    // Task 5.8: see DrawRect — logical dims for MVP.
+    BuildShapeMVP(world, size, logicalW, logicalH, cb.mvp);
     cb.color[0] = cb.color[1] = cb.color[2] = 0.75f;
     cb.color[3] = 1.0f;
     cb.params[0] = 2.0f;
@@ -455,11 +460,19 @@ void CompositionRenderer::DrawNullMarker(const Mat3& world, const Vec2& size,
 void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
                                        UINT targetW, UINT targetH,
                                        LayerManager& layerManager,
-                                       const float bgColor[4]) {
+                                       const float bgColor[4],
+                                       UINT logicalW, UINT logicalH) {
     if (!initialized_ || !context_ || !targetRTV) return;
     if (targetW == 0 || targetH == 0) return;
 
-    // Bind target + viewport + clear
+    // Task 5.8: back-compat — if the caller didn't specify logical dims,
+    // fall back to the target dims. That reproduces the pre-5.8 behavior
+    // where shape MVP + viewport were locked to the same size.
+    if (logicalW == 0) logicalW = targetW;
+    if (logicalH == 0) logicalH = targetH;
+
+    // Bind target + viewport + clear. Viewport uses TARGET dims (RT pixel
+    // count) — that's how many pixels the rasterizer fills.
     D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)targetW, (float)targetH, 0.0f, 1.0f };
     context_->RSSetViewports(1, &vp);
     context_->OMSetRenderTargets(1, &targetRTV, nullptr);
@@ -508,13 +521,13 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
 
         switch (layer.type) {
             case ShapeType::Rectangle:
-                DrawRect(wm, sz, fillC, strokeC, sw, cr, targetW, targetH); break;
+                DrawRect(wm, sz, fillC, strokeC, sw, cr, logicalW, logicalH); break;
             case ShapeType::Ellipse:
-                DrawEllipse(wm, sz, fillC, strokeC, sw, targetW, targetH); break;
+                DrawEllipse(wm, sz, fillC, strokeC, sw, logicalW, logicalH); break;
             case ShapeType::CustomPath:
-                DrawEllipse(wm, sz, fillC, strokeC, sw, targetW, targetH); break; // stub
+                DrawEllipse(wm, sz, fillC, strokeC, sw, logicalW, logicalH); break; // stub
             case ShapeType::Null:
-                DrawNullMarker(wm, sz, targetW, targetH); break;
+                DrawNullMarker(wm, sz, logicalW, logicalH); break;
             case ShapeType::Camera:
                 break;
         }

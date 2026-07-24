@@ -248,6 +248,37 @@ private:
     int   compositionFps    = 30;
     float bgColor[4]        = { 0.08f, 0.08f, 0.10f, 1.0f };
 
+    // Task 5.8: Preview scale — how much we downsample the composition RT
+    // for perf. Composition dims stay authoritative; the RT is sized at
+    // (compositionWidth * previewScale, compositionHeight * previewScale).
+    // All coord math (gizmos, ScreenToCanvas, click hit-test) remains in
+    // composition-pixel space regardless of this value.
+    //
+    // Editor state only. NOT persisted in .pmge (matches AE convention:
+    // preview quality doesn't travel with the project). Loads default Full.
+    // Only three values are legal: 1.0 / 0.5 / 0.25 (Full/Half/Quarter).
+    float previewScale = 1.0f;
+
+    // Task 5.8: dead-simple FPS smoothing ring buffer for the toolbar readout.
+    // 30-sample rolling average of `1.0f / deltaTime`. Fixed-size, zero heap.
+    static constexpr int kFpsRingCap = 30;
+    float fpsRing[kFpsRingCap] = {};
+    int   fpsRingHead = 0;
+    int   fpsRingCount = 0;
+
+    // Task 5.8: helpers — the RT allocation dims are always
+    // (compositionWidth * previewScale, compositionHeight * previewScale),
+    // clamped to at least 1 pixel so the D3D allocator can't be handed a
+    // zero-size texture even if some weird combination pushes it there.
+    UINT RtWidth()  const {
+        const int w = (int)((float)compositionWidth  * previewScale + 0.5f);
+        return (UINT)((w < 1) ? 1 : w);
+    }
+    UINT RtHeight() const {
+        const int h = (int)((float)compositionHeight * previewScale + 0.5f);
+        return (UINT)((h < 1) ? 1 : h);
+    }
+
     // Task 5.6: Composition Settings modal state. Edits go to `pending*`
     // fields first so Cancel really cancels. Apply copies pending -> real
     // and (if W/H changed) rebuilds the composition RT and effect ping-pong

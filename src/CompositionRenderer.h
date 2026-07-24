@@ -47,15 +47,29 @@ public:
     void Shutdown();
     bool IsReady() const { return initialized_; }
 
-    // Render every visible 2D layer into `targetRTV` at (targetW x targetH).
+    // Render every visible 2D layer into `targetRTV`.
     // 3D layers and Camera / Null special types are skipped here (they have
     // their own paths in RenderEngine). Layers are drawn in timeline order so
     // later layers appear on top.
     // Clears the target to the background color first.
+    //
+    // Task 5.8: split of the old single `targetW/H` into two roles:
+    //   * targetW/H  = D3D11 viewport dims (== the RT's actual pixel count).
+    //                  Drives how many pixels the rasterizer fills.
+    //   * logicalW/H = "composition dims" used inside BuildShapeMVP to map
+    //                  shape positions (in comp pixels) into NDC. Passing
+    //                  logicalW = compositionWidth (regardless of RT size)
+    //                  makes shape coordinates stable under preview
+    //                  downscaling: rasterizer scales to whatever pixel
+    //                  count the RT has, but the NDC layout stays comp-
+    //                  correct.
+    // Backward-compat: when logicalW/H are 0 they default to targetW/H so
+    // every pre-5.8 caller keeps rendering exactly as before.
     void RenderLayers(ID3D11RenderTargetView* targetRTV,
                       UINT targetW, UINT targetH,
                       LayerManager& layerManager,
-                      const float bgColor[4]);
+                      const float bgColor[4],
+                      UINT logicalW = 0, UINT logicalH = 0);
 
 private:
     bool CreateShaders();
@@ -66,16 +80,19 @@ private:
     // Task 5.7: DrawRect and DrawEllipse now share ps_shape_sdf_ and take
     // stroke color / stroke width / corner radius. Passing zero for the two
     // scalars reproduces the pre-5.7 hard-edged unstroked look.
+    // Task 5.8: draw helpers take logicalW/H (drive MVP) separately from
+    // targetW/H (drive viewport). All internal callers now come from
+    // RenderLayers which resolves the two dim pairs once at the top.
     void DrawRect   (const Mat3& worldMatrix, const Vec2& size,
                      unsigned int fillColor, unsigned int strokeColor,
                      float strokeWidth, float cornerRadius,
-                     UINT targetW, UINT targetH);
+                     UINT logicalW, UINT logicalH);
     void DrawEllipse(const Mat3& worldMatrix, const Vec2& size,
                      unsigned int fillColor, unsigned int strokeColor,
                      float strokeWidth,
-                     UINT targetW, UINT targetH);
+                     UINT logicalW, UINT logicalH);
     void DrawNullMarker(const Mat3& worldMatrix, const Vec2& size,
-                        UINT targetW, UINT targetH);
+                        UINT logicalW, UINT logicalH);
 
     // Constant buffer layout (16-byte aligned; must match HLSL).
     // Task 5.7: added stroke[4] + params2[4] for stroke color + halfExtent.

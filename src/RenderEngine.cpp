@@ -66,7 +66,8 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
 
     // Task 5.0: create the fixed-size composition render target BEFORE the
     // effect manager (which sizes its ping-pong buffers to match).
-    if (!CreateCompositionRT((UINT)compositionWidth, (UINT)compositionHeight)) {
+    // Task 5.8: RT dims = comp dims * previewScale (default 1.0 => equal).
+    if (!CreateCompositionRT(RtWidth(), RtHeight())) {
         std::cerr << "[RenderEngine] Composition RT allocation failed" << std::endl;
         return false;
     }
@@ -324,6 +325,14 @@ void RenderEngine::BeginFrame() {
     float deltaTime = (freq > 0) ? (float)((now - lastTime) / (double)freq) : 0.0f;
     lastTime = now;
     if (deltaTime > 0.25f) deltaTime = 0.25f;
+
+    // Task 5.8: feed the fps ring for the viewport toolbar readout. Skip
+    // pathological zero-delta frames so we don't accidentally publish inf.
+    if (deltaTime > 1e-4f) {
+        fpsRing[fpsRingHead] = 1.0f / deltaTime;
+        fpsRingHead = (fpsRingHead + 1) % kFpsRingCap;
+        if (fpsRingCount < kFpsRingCap) ++fpsRingCount;
+    }
 
     // Task 5.6: bump the per-frame counter FIRST so any MarkForSnapshot()
     // call made during this frame's UI + input pass can coalesce correctly.
@@ -1693,8 +1702,10 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
         const float dx = a.x - b.x, dy = a.y - b.y;
         return std::sqrt(dx*dx + dy*dy);
     };
+    // Task 5.8: pair with ScreenToCanvas (which returns COMPOSITION coords),
+    // so the screen->canvas scale factor uses composition dims, not RT dims.
     const float scale = (lastCanvasLetterboxSize.x > 1.0f)
-                            ? ((float)compTextureWidth / lastCanvasLetterboxSize.x)
+                            ? ((float)compositionWidth / lastCanvasLetterboxSize.x)
                             : 1.0f;
     const float kHit = 12.0f * scale;
 
@@ -1819,6 +1830,55 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
 // lambdas inside).
 // =============================================================================
 void RenderEngine::DrawViewportCanvas() {
+    // -------------------------------------------------------------------
+    // Task 5.8: viewport toolbar. Preview Scale + FPS + Canvas readout.
+    // Sits ABOVE the letterbox rect so its ~24 px steal from the top of
+    // the panel; the rest of the panel is the composition + gizmos.
+    // -------------------------------------------------------------------
+    {
+        // Preview dropdown
+        const char* scaleLabels[3] = { "Full", "Half", "Quarter" };
+        const float scaleValues[3] = { 1.0f, 0.5f, 0.25f };
+        int scaleIdx = 0;
+        if      (previewScale <= 0.30f) scaleIdx = 2;
+        else if (previewScale <= 0.75f) scaleIdx = 1;
+        else                            scaleIdx = 0;
+
+        ImGui::TextUnformatted("Preview:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.0f);
+        if (ImGui::Combo("##previewScale", &scaleIdx, scaleLabels, 3)) {
+            const float newScale = scaleValues[scaleIdx];
+            if (std::fabs(newScale - previewScale) > 1e-4f) {
+                previewScale = newScale;
+                // Rebuild RT + effect ping-pong at the new size. Same path
+                // as Comp Settings modal Apply and File > Open post-load.
+                ReleaseCompositionRT();
+                CreateCompositionRT(RtWidth(), RtHeight());
+                if (effectManager.IsReady()) {
+                    effectManager.Resize(RtWidth(), RtHeight());
+                }
+            }
+        }
+
+        // FPS readout (30-sample rolling average)
+        float fpsAvg = 0.0f;
+        if (fpsRingCount > 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < fpsRingCount; ++i) sum += fpsRing[i];
+            fpsAvg = sum / (float)fpsRingCount;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("| FPS: %5.1f", fpsAvg);
+
+        // Canvas dims + preview-scaled RT dims (for user confidence that the
+        // downsample knob is actually doing something).
+        ImGui::SameLine();
+        ImGui::TextDisabled("| Canvas: %d x %d  (RT: %u x %u)",
+                            compositionWidth, compositionHeight,
+                            RtWidth(), RtHeight());
+    }
+
     ImVec2 panelOrigin = ImGui::GetCursorScreenPos();
     ImVec2 panelSize   = ImGui::GetContentRegionAvail();
     if (panelSize.x < 50.0f) panelSize.x = 50.0f;
@@ -1836,8 +1896,13 @@ void RenderEngine::DrawViewportCanvas() {
     // Letterbox math: fit the compTexture (compW x compH) inside the panel
     // preserving aspect ratio, centered.
     // -------------------------------------------------------------------
-    const float compW = (float)compTextureWidth;
-    const float compH = (float)compTextureHeight;
+    // Task 5.8: letterbox math + all coord conversions use COMPOSITION dims,
+    // not RT dims. Preview scale downsamples the RT but the canvas the user
+    // draws on is always compositionWidth x compositionHeight. The RT is
+    // just a lower-res copy — ImGui::AddImage sample-filters it up to the
+    // letterbox rect for free.
+    const float compW = (float)compositionWidth;
+    const float compH = (float)compositionHeight;
     const float compAspect  = (compH > 0) ? (compW / compH) : (16.0f / 9.0f);
     const float panelAspect = panelSize.x / panelSize.y;
 
@@ -1862,6 +1927,7 @@ void RenderEngine::DrawViewportCanvas() {
     lastViewportCenterWorld   = { compW * 0.5f, compH * 0.5f };
 
     // Canvas-pixels -> screen-pixels helper (captures lbOrigin/lbSize).
+    // Task 5.8: divides by comp dims so callers can pass comp-space points.
     auto CanvasToScreen = [&](Vec2 p) -> ImVec2 {
         return ImVec2(lbOrigin.x + (p.x / compW) * lbSize.x,
                       lbOrigin.y + (p.y / compH) * lbSize.y);
@@ -1870,13 +1936,14 @@ void RenderEngine::DrawViewportCanvas() {
     // -------------------------------------------------------------------
     // 1) Render all 2D layers into compRTV using CompositionRenderer.
     //    The renderer clears to the composition background color first.
+    // Task 5.8: pass RT dims as target (viewport pixel count) AND comp
+    // dims as logical (MVP division) so shape NDC positions stay
+    // comp-correct at any preview scale.
     // -------------------------------------------------------------------
     if (compRTV && compRenderer.IsReady()) {
-        // Task 5.6: bgColor is now a user-editable member driven by the
-        // Comp Settings modal (Composition -> Settings...). Old hard-coded
-        // dark-gray value is now the initial default.
         compRenderer.RenderLayers(compRTV, compTextureWidth, compTextureHeight,
-                                  layerManager, bgColor);
+                                  layerManager, bgColor,
+                                  (UINT)compositionWidth, (UINT)compositionHeight);
 
         // 2) If ANY layer has an enabled effect, run its chain against the
         //    whole composition. NOTE: this is a composition-wide effect model
@@ -2068,11 +2135,13 @@ void RenderEngine::DrawViewportCanvas() {
     //    3D features are enabled.
     // -------------------------------------------------------------------
     char hud[192];
+    // Task 5.8: HUD reports COMPOSITION dims (what the user drew on), not
+    // RT dims (which is a preview-scale artifact).
     if (show3DFeatures) {
         const int camLayer = layerManager.FindActiveCameraLayerId();
         std::snprintf(hud, sizeof(hud),
-            "Canvas %u x %u   FOV=%.1f   Cam=(%.0f, %.0f, %.0f)%s%s",
-            compTextureWidth, compTextureHeight,
+            "Canvas %d x %d   FOV=%.1f   Cam=(%.0f, %.0f, %.0f)%s%s",
+            compositionWidth, compositionHeight,
             camera.fov, camera.position.x, camera.position.y, camera.position.z,
             (camLayer >= 0) ? "  (from Camera layer)" : "",
             anyLayerHasEffects ? "  [FX ON]" : "");
@@ -2083,8 +2152,8 @@ void RenderEngine::DrawViewportCanvas() {
             "RMB: Orbit   MMB: Pan   Wheel: Zoom");
     } else {
         std::snprintf(hud, sizeof(hud),
-            "Canvas %u x %u%s",
-            compTextureWidth, compTextureHeight,
+            "Canvas %d x %d%s",
+            compositionWidth, compositionHeight,
             anyLayerHasEffects ? "   [FX ON]" : "");
         draw_list->AddText(ImVec2(panelOrigin.x + 8, panelOrigin.y + 4),
             IM_COL32(200, 220, 255, 255), hud);
@@ -3740,7 +3809,10 @@ void RenderEngine::DrawDebugPanel() {
                 lastCanvasLetterboxOrigin.x, lastCanvasLetterboxOrigin.y);
     ImGui::Text("Letterbox size:   (%.1f x %.1f)",
                 lastCanvasLetterboxSize.x, lastCanvasLetterboxSize.y);
-    ImGui::Text("Comp texture:     (%u x %u)", compTextureWidth, compTextureHeight);
+    ImGui::Text("Composition:      (%d x %d)   preview=%.2f",
+                compositionWidth, compositionHeight, previewScale);
+    ImGui::Text("Comp texture RT:  (%u x %u)   [comp * previewScale]",
+                compTextureWidth, compTextureHeight);
 
     ImGui::Separator();
     ImGui::TextDisabled("--- Mouse ---");
@@ -3885,9 +3957,14 @@ void RenderEngine::PumpExportOneFrameIfActive() {
         // is BGRA and ffmpeg is told "bgra" (meaning bytes B,G,R,A),
         // everything lines up naturally with NO swap. The color shows
         // correctly.
+        // Task 5.8: export ALWAYS renders at full comp resolution (preview
+        // scale is a viewport-perf knob and doesn't touch the export path).
+        // After Task 6.1, export dims equal comp dims already — pass comp
+        // dims as logical for explicit safety even so.
         compRenderer.RenderLayers(rtv, (UINT)exportEngine.Width(),
                                   (UINT)exportEngine.Height(),
-                                  layerManager, bg);
+                                  layerManager, bg,
+                                  (UINT)compositionWidth, (UINT)compositionHeight);
 
         // Apply the effect chain if any layer has effects enabled.
         if (anyLayerHasEffects && effectManager.IsReady()) {
@@ -4025,16 +4102,22 @@ void RenderEngine::ReleaseCompositionRT() {
 }
 
 // Convert a viewport-panel screen point (Windows-DPI pixels) into composition
-// pixels (0..compTextureWidth, 0..compTextureHeight). Returns (0,0) if the
+// pixels (0..compositionWidth, 0..compositionHeight). Returns (0,0) if the
 // letterbox rect is degenerate (panel too small to display anything).
+// Task 5.8: returns COMPOSITION coords (not RT coords) so gizmo hit-tests
+// stay stable under preview downscaling.
 Vec2 RenderEngine::ScreenToCanvas(ImVec2 screen) const {
     if (lastCanvasLetterboxSize.x < 1.0f || lastCanvasLetterboxSize.y < 1.0f) {
         return Vec2(0.0f, 0.0f);
     }
     const float u = (screen.x - lastCanvasLetterboxOrigin.x) / lastCanvasLetterboxSize.x;
     const float v = (screen.y - lastCanvasLetterboxOrigin.y) / lastCanvasLetterboxSize.y;
-    return Vec2(u * (float)compTextureWidth,
-                v * (float)compTextureHeight);
+    // Task 5.8: return coordinates in COMPOSITION-PIXEL space, not RT-pixel
+    // space. Every downstream caller (gizmo hit-test, click-to-select,
+    // camera drag) authors positions in comp coords, so this keeps them
+    // stable regardless of whether the RT is downsampled by preview scale.
+    return Vec2(u * (float)compositionWidth,
+                v * (float)compositionHeight);
 }
 
 // =============================================================================
@@ -4123,11 +4206,14 @@ void RenderEngine::ApplyLoadedScalars(const AppState& st) {
     // Task 5.6: fps + bgColor propagate from load / undo.
     compositionFps    = st.compositionFps;
     for (int i = 0; i < 4; ++i) bgColor[i] = st.bgColor[i];
-    if (compTextureWidth  != (UINT)compositionWidth ||
-        compTextureHeight != (UINT)compositionHeight) {
+    // Task 5.8: compare RT dims against the CURRENT preview-scaled comp size,
+    // not raw comp size. Save/load doesn't touch previewScale (editor state)
+    // so this always resizes to the right target after a load/undo.
+    if (compTextureWidth  != RtWidth() ||
+        compTextureHeight != RtHeight()) {
         ReleaseCompositionRT();
-        CreateCompositionRT((UINT)compositionWidth, (UINT)compositionHeight);
-        effectManager.Resize((UINT)compositionWidth, (UINT)compositionHeight);
+        CreateCompositionRT(RtWidth(), RtHeight());
+        effectManager.Resize(RtWidth(), RtHeight());
     }
 }
 
@@ -4309,9 +4395,10 @@ void RenderEngine::DrawCompSettingsModal() {
             animEngine.duration = pendingCompDur;
 
             if (sizeChanged) {
+                // Task 5.8: allocate at preview-scaled dims, not raw comp dims.
                 ReleaseCompositionRT();
-                CreateCompositionRT((UINT)compositionWidth, (UINT)compositionHeight);
-                effectManager.Resize((UINT)compositionWidth, (UINT)compositionHeight);
+                CreateCompositionRT(RtWidth(), RtHeight());
+                effectManager.Resize(RtWidth(), RtHeight());
             }
 
             // Ship-this-commit-only wiring (design section 12): Export Queue
