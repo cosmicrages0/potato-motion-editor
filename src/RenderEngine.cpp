@@ -2461,68 +2461,32 @@ void RenderEngine::DrawViewportCanvas() {
             } else {
                 // Isolation path.
                 effectManager.Resize(compTextureWidth, compTextureHeight);
-                const float transparent[4] = { 0, 0, 0, 0 };
-                // ============ DIAGNOSTIC v2 (Task 5.13-diag2) ============
-                // Swap RenderSingleLayer for the full RenderLayers path,
-                // targeted at pingRTV. RenderLayers is the exact same code
-                // that works when targeted at compRTV in the pre-5.13
-                // pipeline. If the shape appears in pingRTV via
-                // RenderLayers but NOT via RenderSingleLayer, the bug is
-                // in RenderSingleLayer specifically (some missing state
-                // setup vs RenderLayers).
+                // ============ DIAGNOSTIC v3 (Task 5.13-diag3) ============
+                // Ultra-minimal: ClearComp pingRTV to opaque MAGENTA, then
+                // composite pingSRV over compRTV. NO shape draw at all.
                 //
-                // Trade-off for the diagnostic: this renders ALL layers
-                // into pingRTV, not just this one. For a single-layer
-                // test scene it's equivalent. For multi-layer scenes the
-                // isolation semantics break (every layer gets every
-                // other layer's shape stamped through its filter). But
-                // this is throwaway diagnostic code.
-                compRenderer.RenderLayers(effectManager.GetPingRTV(),
-                                          compTextureWidth, compTextureHeight,
-                                          layerManager,
-                                          transparent,
-                                          (UINT)compositionWidth,
-                                          (UINT)compositionHeight,
-                                          animEngine.duration);
-                // Old code below, commented for now:
-                // compRenderer.ClearComp(effectManager.GetPingRTV(), transparent);
-                // compRenderer.RenderSingleLayer(layer,
-                //                                effectManager.GetPingRTV(),
-                //                                compTextureWidth, compTextureHeight,
-                //                                layerManager,
-                //                                (UINT)compositionWidth,
-                //                                (UINT)compositionHeight);
-                // ============ END DIAGNOSTIC v2 ============
-                // Build a small vector of just this layer's enabled effects.
-                std::vector<Effect> perLayer;
-                perLayer.reserve(layer.effects.size());
-                for (const auto& e : layer.effects) {
-                    if (e.enabled) perLayer.push_back(e);
-                }
-                // Pick the destination: ApplyChain's parity-agnostic write
-                // path uses whichever pool RT ISN'T the source's texture as
-                // its first-pass write, then ping-pongs. To land the final
-                // result in a predictable SRV for the composite, always
-                // pass the OPPOSITE pool RT as destination.
-                // ============ DIAGNOSTIC (Task 5.13-diag) ============
-                // Bypass ApplyChain entirely. Just composite pingSRV
-                // (which should contain the isolated shape drawn by
-                // RenderSingleLayer above) straight over compRTV.
-                //
-                // Read: if you see the ellipse rendered normally (WITHOUT
-                //   the chromatic RGB fringe), the shape draw works and
-                //   the bug lives inside ApplyChain / ps_chroma / pong.
-                // Read: if the ellipse STILL vanishes, the shape isn't
-                //   even landing in pingRTV — bug is in RenderSingleLayer
-                //   or in the clear/bind sequence right above.
-                //
-                // Passing `perLayer` to a no-op ApplyChain also lets us
-                // sanity-check that ApplyChain doesn't corrupt state.
-                // Comment / uncomment as needed.
+                // Expected outcomes:
+                //  (A) The whole canvas fills with magenta -> pingRTV
+                //      write via ClearRenderTargetView + pingSRV read via
+                //      composite work fine. Bug is in RenderLayers /
+                //      RenderSingleLayer's write into pingRTV
+                //      (state-corruption or dropped bind between the
+                //      clear and the draw).
+                //  (B) Canvas stays dark, no magenta -> the entire ping
+                //      pool RT pipeline is broken. Something in the RTV
+                //      binding / texture creation / SRV creation is
+                //      dropping the write or the read. VERY suspicious of
+                //      Resize() being called with same dims but doing
+                //      something weird, or of the SRV pointing at a
+                //      different texture than the RTV.
+                const float magenta[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+                compRenderer.ClearComp(effectManager.GetPingRTV(), magenta);
+                // Skip shape draw + effect chain entirely.
+                std::vector<Effect> perLayer; // unused, keep for later
                 (void)perLayer;
                 effectManager.CompositeSRVOver(effectManager.GetPingSRV(),
                                                compRTV);
-                // ============ END DIAGNOSTIC ============
+                // ============ END DIAGNOSTIC v3 ============
             }
         }
     }
