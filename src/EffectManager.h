@@ -115,6 +115,14 @@ private:
     ID3D11Buffer*         cb_effect_     = nullptr; // 64 bytes, EffectParams
     ID3D11SamplerState*   linear_clamp_  = nullptr;
     ID3D11BlendState*     blend_normal_  = nullptr;
+    // Task 5.13-fix: opaque REPLACE blend state (BlendEnable=FALSE).
+    // Bound at the top of ApplyChain so every effect pass overwrites the
+    // pool RT pixel-for-pixel, ignoring whatever alpha state the shape
+    // rasterizer left behind. Without this, effect passes inherit the
+    // SRC_ALPHA/INV_SRC_ALPHA state from CompositionRenderer and blend
+    // their output against uninitialized-or-stale pong contents, causing
+    // filtered layers to vanish or show ghosts of previous layers.
+    ID3D11BlendState*     blend_replace_ = nullptr;
 
     // One pixel shader per EffectType. Populated in Initialize().
     // Index = (int)EffectType. Slot may be null if compile failed — in that

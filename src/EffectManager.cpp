@@ -423,6 +423,24 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
         if (FAILED(hr)) return false;
     }
 
+    // 7b) Task 5.13-fix: opaque REPLACE blend state. Effect passes need
+    //     write-through semantics (the shader's output is the final pixel,
+    //     including its own alpha). Alpha blending inside ApplyChain
+    //     causes filtered layers to blend against stale pong contents.
+    {
+        D3D11_BLEND_DESC bd = {};
+        bd.RenderTarget[0].BlendEnable    = FALSE;
+        bd.RenderTarget[0].SrcBlend       = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlend      = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOp        = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        HRESULT hr = device_->CreateBlendState(&bd, &blend_replace_);
+        if (FAILED(hr)) return false;
+    }
+
     // 8) Ping-pong RTs
     if (!CreateRenderTargets(width, height)) return false;
 
@@ -543,6 +561,20 @@ bool EffectManager::ApplyChain(ID3D11ShaderResourceView* sourceSRV,
     // Count enabled effects (they might all be disabled).
     size_t enabledCount = 0;
     for (const auto& e : effects) if (e.enabled) ++enabledCount;
+
+    // Task 5.13-fix: bind opaque REPLACE blend state ONCE at the top of
+    // ApplyChain. Every effect pass (simple + DropShadow's internal
+    // passes + the post-loop passthrough copy) writes the shader's own
+    // RGBA verbatim into the pool RT. Alpha blending here would cause
+    // the shader's transparent-outside-shape pixels to reveal whatever
+    // stale garbage lived in pong, which is exactly the "filtered layer
+    // vanishes" bug from the first shipping of Task 5.13. The final
+    // layer-over-comp composite is done separately by CompositeSRVOver,
+    // which explicitly rebinds blend_normal_.
+    if (blend_replace_) {
+        const float blendFactor[4] = { 0, 0, 0, 0 };
+        context_->OMSetBlendState(blend_replace_, blendFactor, 0xFFFFFFFF);
+    }
 
     // Fast path: nothing to do -> passthrough source into destination.
     if (enabledCount == 0) {
@@ -764,6 +796,7 @@ void EffectManager::Shutdown() {
     if (cb_effect_)      { cb_effect_->Release();      cb_effect_      = nullptr; }
     if (linear_clamp_)   { linear_clamp_->Release();   linear_clamp_   = nullptr; }
     if (blend_normal_)   { blend_normal_->Release();   blend_normal_   = nullptr; }
+    if (blend_replace_)  { blend_replace_->Release();  blend_replace_  = nullptr; }
     ReleaseRenderTargets();
     initialized_ = false;
     device_ = nullptr;
