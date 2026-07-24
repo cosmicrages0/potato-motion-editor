@@ -561,10 +561,12 @@ void RenderEngine::RenderAEDockingLayout() {
         ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->WorkSize);
 
         ImGuiID dock_main_id = dockspace_id;
+        // Task 5.12: unified bottom dock — Timeline now spans the full
+        // width. Graph Editor is no longer a separate dock; it's a mode
+        // toggle inside the Timeline panel's right pane (Shift+F3).
         ImGuiID dock_bottom_id       = ImGui::DockBuilderSplitNode(dock_main_id,   ImGuiDir_Down,  0.35f, nullptr, &dock_main_id);
         ImGuiID dock_left_id         = ImGui::DockBuilderSplitNode(dock_main_id,   ImGuiDir_Left,  0.20f, nullptr, &dock_main_id);
         ImGuiID dock_right_id        = ImGui::DockBuilderSplitNode(dock_main_id,   ImGuiDir_Right, 0.25f, nullptr, &dock_main_id);
-        ImGuiID dock_bottom_right_id = ImGui::DockBuilderSplitNode(dock_bottom_id, ImGuiDir_Right, 0.50f, nullptr, &dock_bottom_id);
 
         ImGui::DockBuilderDockWindow("Project Assets",        dock_left_id);
         ImGui::DockBuilderDockWindow("Effects Palette",       dock_left_id);   // tabbed under Project Assets
@@ -572,7 +574,6 @@ void RenderEngine::RenderAEDockingLayout() {
         ImGui::DockBuilderDockWindow("Inspector & Effects",   dock_right_id);
         ImGui::DockBuilderDockWindow("Effect Controls",       dock_right_id);  // tabbed under Inspector
         ImGui::DockBuilderDockWindow("Timeline",              dock_bottom_id);
-        ImGui::DockBuilderDockWindow("Graph Editor",          dock_bottom_right_id);
 
         ImGui::DockBuilderFinish(dockspace_id);
     }
@@ -754,8 +755,10 @@ void RenderEngine::RenderAEDockingLayout() {
     ImGui::Begin("Composition Viewport");  DrawViewportCanvas();         ImGui::End();
     ImGui::Begin("Inspector & Effects");   DrawInspectorPanel();         ImGui::End();
     ImGui::Begin("Effect Controls");       DrawEffectControlsPanel();    ImGui::End();
+    // Task 5.12: unified bottom dock — Graph Editor is now a mode inside
+    // Timeline (right pane switches between bars and graph curves via a
+    // toolbar toggle + Shift+F3 shortcut). No separate window.
     ImGui::Begin("Timeline");              DrawTimelinePanel();          ImGui::End();
-    ImGui::Begin("Graph Editor");          DrawGraphEditor();            ImGui::End();
 
     // Task 6: Render Queue window (only shown after Export -> Render Queue).
     if (showRenderQueue) {
@@ -793,6 +796,13 @@ void RenderEngine::DrawProjectAssetsPanel() {
 // Panel: Timeline (layer list with visibility + selection)
 // =============================================================================
 void RenderEngine::DrawTimelinePanel() {
+    // Task 5.12: install imgui.ini SettingsHandler for the bottom-dock
+    // state (mode + splitFrac) on first call. Idempotent — the guard
+    // ensures we only register once even if the panel is torn down and
+    // rebuilt (e.g. after View -> Reset Layout).
+    RegisterBottomDockSettings();
+
+    // -------------------- Top toolbar row 1: add / delete / demo -----------
     if (ImGui::Button("+ Rect"))    SpawnShapeAtViewportCenter(ShapeType::Rectangle);
     ImGui::SameLine();
     if (ImGui::Button("+ Ellipse")) SpawnShapeAtViewportCenter(ShapeType::Ellipse);
@@ -813,6 +823,33 @@ void RenderEngine::DrawTimelinePanel() {
     }
     ImGui::SameLine();
     ImGui::Checkbox("Slingshot -> Selected Scale", &applySlingshotToSelected);
+
+    // -------------------- Task 5.12: mode toggle + shortcut ---------------
+    // Bars mode = existing timeline strip. Graph mode = graph editor
+    // replaces the strip in the same panel body (full-width).
+    // Shift+F3 also toggles (AE-standard).
+    ImGui::SameLine();
+    ImGui::TextDisabled(" | ");
+    ImGui::SameLine();
+    {
+        const bool barsSel = (bottomPaneMode == BottomPaneMode::Bars);
+        if (barsSel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.52f, 0.85f, 1.0f));
+        if (ImGui::Button("Bars##paneMode")) bottomPaneMode = BottomPaneMode::Bars;
+        if (barsSel) ImGui::PopStyleColor();
+        ImGui::SameLine();
+        const bool graphSel = (bottomPaneMode == BottomPaneMode::Graph);
+        if (graphSel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.52f, 0.85f, 1.0f));
+        if (ImGui::Button("Graph##paneMode")) bottomPaneMode = BottomPaneMode::Graph;
+        if (graphSel) ImGui::PopStyleColor();
+    }
+    // Global Shift+F3 shortcut — only fires when the Timeline is focused
+    // OR nobody's typing text (so it doesn't fire mid-input).
+    if (!ImGui::GetIO().WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_F3) &&
+        (ImGui::GetIO().KeyShift)) {
+        bottomPaneMode = (bottomPaneMode == BottomPaneMode::Bars)
+                            ? BottomPaneMode::Graph : BottomPaneMode::Bars;
+    }
 
     // Task 5.0-b: composition duration is now editable directly from the
     // timeline panel (was previously buried in the Global tab). Users hit
@@ -837,8 +874,18 @@ void RenderEngine::DrawTimelinePanel() {
 
     ImGui::Separator();
 
-    // Task 4.5: real timeline strip with playhead + keyframe diamonds.
-    DrawTimelineStrip();
+    // Task 5.12: right-pane content selector.
+    //   Bars mode  -> existing timeline strip (label column + track column
+    //                 with trim bars + keyframe diamonds + playhead).
+    //   Graph mode -> graph editor (full-width now that it isn't sharing
+    //                 the bottom dock with the Timeline anymore).
+    // Both paths share the layer table below.
+    if (bottomPaneMode == BottomPaneMode::Bars) {
+        // Task 4.5: real timeline strip with playhead + keyframe diamonds.
+        DrawTimelineStrip();
+    } else {
+        DrawGraphEditor();
+    }
 
     ImGui::Separator();
 
@@ -958,16 +1005,21 @@ void RenderEngine::DrawTimelineStrip() {
     ImVec2 avail  = ImGui::GetContentRegionAvail();
     const float stripW = std::max(200.0f, avail.x);
 
-    // Task 5.0: label column width scales with the longest layer name so
-    // names no longer clip to "Background..." style ellipses.
-    float labelW = 100.0f;
+    // Task 5.12: label column width is now driven by the user-adjustable
+    // bottomPaneSplitFrac (persisted to imgui.ini via SettingsHandler).
+    // Clamped [0.15, 0.60] of the strip width; 100 px floor as a safety.
+    // The auto-fit-to-longest-name behavior from Task 5.0 is preserved as
+    // a MINIMUM — if the user shrinks the splitter below what names need
+    // for display, we bump it up so names never clip.
+    float labelW = stripW * bottomPaneSplitFrac;
+    float autoMin = 100.0f;
     for (const auto& layer : layerManager.Layers()) {
         const ImVec2 sz = ImGui::CalcTextSize(layer.name.c_str());
-        if (sz.x + 24.0f > labelW) labelW = sz.x + 24.0f;
+        if (sz.x + 24.0f > autoMin) autoMin = sz.x + 24.0f;
     }
-    // Cap at 30% of strip so the ruler always has room; floor at 100px.
-    if (labelW > stripW * 0.30f) labelW = stripW * 0.30f;
-    if (labelW < 100.0f) labelW = 100.0f;
+    if (labelW < autoMin)         labelW = autoMin;
+    if (labelW > stripW * 0.60f)  labelW = stripW * 0.60f;
+    if (labelW < 100.0f)          labelW = 100.0f;
     const float rulerH = 22.0f;
     const float rowH   = 18.0f;
     // Task 5.10: mutable ref so trim-bar drag can mutate in/out points
@@ -986,6 +1038,37 @@ void RenderEngine::DrawTimelineStrip() {
     dl->AddLine(ImVec2(origin.x + labelW, origin.y),
                 ImVec2(origin.x + labelW, origin.y + totalH),
                 IM_COL32(60, 60, 70, 255), 1.0f);
+
+    // Task 5.12: 6-pixel splitter handle over the label|track divider.
+    // Drag = updates bottomPaneSplitFrac. Clamped [0.15, 0.60]. Value
+    // persists to imgui.ini via the SettingsHandler installed in
+    // DrawTimelinePanel::RegisterBottomDockSettings.
+    {
+        const float splitterW = 6.0f;
+        ImGui::PushID("##bottomDockSplitter");
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + labelW - splitterW * 0.5f, origin.y));
+        ImGui::InvisibleButton("##splitBar", ImVec2(splitterW, totalH));
+        const bool hov = ImGui::IsItemHovered();
+        const bool act = ImGui::IsItemActive();
+        if (hov || act) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            // Bright hover / active tint so users can see it.
+            dl->AddRectFilled(
+                ImVec2(origin.x + labelW - splitterW * 0.5f, origin.y),
+                ImVec2(origin.x + labelW + splitterW * 0.5f, origin.y + totalH),
+                IM_COL32(120, 140, 200, act ? 180 : 90));
+        }
+        if (act) {
+            const float dx = ImGui::GetIO().MouseDelta.x;
+            if (dx != 0.0f && stripW > 1.0f) {
+                float f = bottomPaneSplitFrac + dx / stripW;
+                if (f < 0.15f) f = 0.15f;
+                if (f > 0.60f) f = 0.60f;
+                bottomPaneSplitFrac = f;
+            }
+        }
+        ImGui::PopID();
+    }
 
     const float trackX0 = origin.x + labelW + 4.0f;
     const float trackX1 = origin.x + stripW - 6.0f;
@@ -5018,4 +5101,115 @@ void RenderEngine::RecomputeAutoExportDuration() {
     if (autoExtent > animEngine.duration) autoExtent = animEngine.duration;
     if (autoExtent < 0.1f) autoExtent = 0.1f;
     pendingExportSeconds = autoExtent;
+}
+
+// =============================================================================
+// Task 5.12: bottom-dock settings persistence via ImGui SettingsHandler.
+//
+// The bottomPaneMode + bottomPaneSplitFrac values are editor state (not
+// scene state), and we want them to survive across app restarts. imgui.ini
+// already persists window sizes / dock layouts; we tack our two values into
+// the same file via the SettingsHandler API. That way there's ONE settings
+// file per user, no extra I/O in Shutdown, and if imgui.ini gets deleted
+// (which is how users "reset all UI") our settings reset too — matches
+// user expectations.
+//
+// Handler is registered ONCE on first DrawTimelinePanel call (guarded via
+// bottomDockSettingsRegistered) — earlier than that, RenderEngine's `this`
+// pointer isn't stable enough to be captured in the handler.
+// =============================================================================
+namespace {
+    // ImGui's SettingsHandler is C-style — the callbacks take a void*
+    // UserData that we set to `this`. Statics here so the API stays clean.
+    // We ONLY handle one entry per section ("[PotatoBottomDock][State]");
+    // parser is single-line "mode=N" / "split=F".
+    struct BottomDockSettingsBinding {
+        int   modePersisted     = 0;    // 0 = Bars, 1 = Graph
+        float splitFracPersisted = 0.30f;
+    };
+
+    static void* BottomDock_ReadOpen(ImGuiContext*, ImGuiSettingsHandler* h,
+                                     const char* name) {
+        auto* bind = reinterpret_cast<BottomDockSettingsBinding*>(h->UserData);
+        (void)name;
+        // We only expose one section: "State". Any name returns the same
+        // binding since there's only one blob to fill.
+        return bind;
+    }
+    static void BottomDock_ReadLine(ImGuiContext*, ImGuiSettingsHandler*,
+                                     void* entry, const char* line) {
+        auto* bind = reinterpret_cast<BottomDockSettingsBinding*>(entry);
+        if (!bind || !line) return;
+        int   iv = 0;
+        float fv = 0.0f;
+        if (std::sscanf(line, "mode=%d",  &iv) == 1) {
+            bind->modePersisted = iv;
+        } else if (std::sscanf(line, "split=%f", &fv) == 1) {
+            bind->splitFracPersisted = fv;
+        }
+    }
+    static void BottomDock_ApplyAll(ImGuiContext*, ImGuiSettingsHandler*) {
+        // Nothing to do here — the parsed values sit in g_bottomDockBinding
+        // and are propagated into live RenderEngine members by
+        // RenderEngine::RegisterBottomDockSettings after LoadIniSettings
+        // completes. Kept as a no-op stub so the ImGui handler struct is
+        // fully populated (some ImGui versions warn on null ApplyAllFn).
+    }
+    static void BottomDock_WriteAll(ImGuiContext*, ImGuiSettingsHandler* h,
+                                     ImGuiTextBuffer* buf) {
+        auto* bind = reinterpret_cast<BottomDockSettingsBinding*>(h->UserData);
+        if (!bind) return;
+        buf->appendf("[%s][State]\n", h->TypeName);
+        buf->appendf("mode=%d\n",    bind->modePersisted);
+        buf->appendf("split=%.4f\n", bind->splitFracPersisted);
+        buf->append("\n");
+    }
+    // One static binding shared with the RenderEngine — updated each
+    // frame from live values (so writes at shutdown capture the current
+    // state) and consumed each frame BY the RenderEngine (so reads at
+    // startup propagate into live values).
+    static BottomDockSettingsBinding g_bottomDockBinding;
+}
+
+void RenderEngine::RegisterBottomDockSettings() {
+    if (bottomDockSettingsRegistered) {
+        // Every frame: sync live values -> binding (for the next Write pass).
+        g_bottomDockBinding.modePersisted      = (int)bottomPaneMode;
+        g_bottomDockBinding.splitFracPersisted = bottomPaneSplitFrac;
+        return;
+    }
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (!ctx) return;
+
+    ImGuiSettingsHandler h{};
+    h.TypeName   = "PotatoBottomDock";
+    h.TypeHash   = ImHashStr("PotatoBottomDock");
+    h.ReadOpenFn = BottomDock_ReadOpen;
+    h.ReadLineFn = BottomDock_ReadLine;
+    h.ApplyAllFn = BottomDock_ApplyAll;
+    h.WriteAllFn = BottomDock_WriteAll;
+    h.UserData   = &g_bottomDockBinding;
+    ImGui::AddSettingsHandler(&h);
+
+    // If imgui.ini was already loaded before we registered (typical since
+    // RenderEngine::Initialize creates the ImGui context and ini load
+    // happens on first NewFrame), re-load so our handler sees the file.
+    // Cheap: imgui.ini is a few KB. Guard on IniFilename in case the user
+    // configured io.IniFilename = nullptr to disable persistence entirely.
+    if (ctx->IO.IniFilename) {
+        ImGui::LoadIniSettingsFromDisk(ctx->IO.IniFilename);
+    }
+
+    // Now propagate whatever was in the ini into our live values (with
+    // sanity clamps in case the file was hand-edited).
+    int   m = g_bottomDockBinding.modePersisted;
+    float f = g_bottomDockBinding.splitFracPersisted;
+    if (m < 0) m = 0;
+    if (m > 1) m = 1;
+    if (f < 0.15f) f = 0.15f;
+    if (f > 0.60f) f = 0.60f;
+    bottomPaneMode      = (m == 1) ? BottomPaneMode::Graph : BottomPaneMode::Bars;
+    bottomPaneSplitFrac = f;
+
+    bottomDockSettingsRegistered = true;
 }

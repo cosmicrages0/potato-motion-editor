@@ -209,6 +209,24 @@ private:
     // LayerManager::MoveLayerToIndex. Snapshot fires ONCE on mouse-down.
     int  layerReorderDragId       = -1;   // id of layer being moved; -1 = idle
     bool layerReorderSnapshotDone = false;// guards duplicate MarkForSnapshot per drag
+
+    // -------------------------------------------------------------------------
+    // Task 5.12: unified bottom dock. Timeline + Graph Editor merged into a
+    // single full-width panel. bottomPaneMode selects what draws in the
+    // right pane; the left pane is always the layer outline / strip label
+    // column. bottomPaneSplitFrac is the horizontal split ratio (fraction
+    // of panel width used by the LEFT/label column). Persisted to imgui.ini
+    // via a custom SettingsHandler (RegisterBottomDockSettings) so the
+    // user's chosen ratio survives across sessions.
+    //
+    // NOT in .pmge — editor state, matches how preview scale / dock layout
+    // are handled today.
+    // -------------------------------------------------------------------------
+    enum class BottomPaneMode : int { Bars = 0, Graph = 1 };
+    BottomPaneMode bottomPaneMode      = BottomPaneMode::Bars;
+    float          bottomPaneSplitFrac = 0.30f;   // 0.15 .. 0.60
+    bool           bottomDockSettingsRegistered = false;
+    void           RegisterBottomDockSettings(); // one-time ini-handler install
     // Right-click context menu target (persisted across frames because ImGui
     // popups open on the frame AFTER the click).
     DiamondHit  contextDiamond;
