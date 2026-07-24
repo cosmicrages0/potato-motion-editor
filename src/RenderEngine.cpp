@@ -1053,22 +1053,28 @@ void RenderEngine::DrawTimelineStrip() {
         // Task 5.11: drag-to-reorder hit-region over the label column.
         // Sized to fit the label area (origin.x..trackX0 minus a small
         // margin). Suppressed while a diamond or trim drag is in flight
-        // so those interactions win. Uses ImGui InvisibleButton for the
-        // hover/active detection; we consult mouse position directly for
-        // the swap logic since we need per-frame cross-row detection.
+        // so those interactions win.
+        //
+        // Task 5.11-fix: we CAN'T rely on ImGui::IsItemActive() to keep
+        // the drag alive across frames — MoveLayerToIndex reorders the
+        // vector mid-drag, which moves this row's InvisibleButton to a
+        // different screen Y, which makes ImGui drop the active state
+        // because "the widget moved". Instead: detect the mouse-down
+        // via IsItemHovered + IsMouseClicked, then track drag lifetime
+        // via a global IsMouseDown check in the post-loop block (below).
         if (!diamondDragActive) {
             ImGui::PushID((int)(0x7A000000 | layer.id));
             ImGui::SetCursorScreenPos(ImVec2(origin.x, rowY0));
             const float labelW = std::max(20.0f, trackX0 - origin.x - 4.0f);
             ImGui::InvisibleButton("##layerReorder", ImVec2(labelW, rowH));
             const bool hovered = ImGui::IsItemHovered();
-            const bool active  = ImGui::IsItemActive();
-            if (hovered || active) {
+            if (hovered || layer.id == layerReorderDragId) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
             }
-            if (ImGui::IsItemActivated()) {
-                // Mouse-down on a label row starts a reorder drag AND
-                // selects the layer for immediate editing (matches AE).
+            // Start the drag on mouse-down over this row (only when no
+            // other drag is already in flight).
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                (layerReorderDragId < 0)) {
                 MarkForSnapshot();
                 layerReorderDragId       = layer.id;
                 layerReorderSnapshotDone = true;
