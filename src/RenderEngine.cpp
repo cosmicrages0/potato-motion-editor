@@ -344,7 +344,21 @@ void RenderEngine::BeginFrame() {
     // as a call for one commit for source compatibility; will be removed.
     FlushPendingSnapshot();
 
-    animEngine.Update(deltaTime);
+    // Task 5.8-fix: freeze the animation clock while ANY interactive drag is
+    // in flight. Without this guard, if the user grabs a shape (gizmo drag)
+    // or a timeline diamond while playback is running with loop on, every
+    // per-frame SetValue(currentTime, ...) call stamps a NEW keyframe at a
+    // NEW time (currentTime advances ~16ms/frame at 60 fps), producing
+    // hundreds of spurious keys and a corrupted Value graph. Matches
+    // Alight behavior: dragging silently suspends the clock; releasing
+    // resumes playback where it left off. isPlaying is left untouched
+    // so no explicit re-Play is needed.
+    const bool anyDragActive =
+        (activeGizmo != GizmoMode::None) ||
+        diamondDragActive;
+    if (!anyDragActive) {
+        animEngine.Update(deltaTime);
+    }
 
     // Task 5.1: LayerManager now publishes composition time so every downstream
     // read (matrix build, opacity chain, camera sync, Inspector) samples at
