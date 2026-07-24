@@ -1261,21 +1261,22 @@ void RenderEngine::DrawTimelineStrip() {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             const float mY   = ImGui::GetIO().MousePos.y;
             const float body0 = origin.y + rulerH;
-            const int dragFromRow = (int)((mY - body0) / rowH);
-            if (dragFromRow >= 0 && dragFromRow < (int)nLayers) {
-                // Row -> vector index (reverse mapping, top row = last).
-                const int targetVecIdx = (int)nLayers - 1 - dragFromRow;
-                // Current vector index of the dragged layer.
-                Layer* dragL = layerManager.GetLayerById(layerReorderDragId);
-                if (dragL) {
-                    int curVecIdx = -1;
-                    for (size_t k = 0; k < nLayers; ++k) {
-                        if (layers[k].id == layerReorderDragId) { curVecIdx = (int)k; break; }
-                    }
-                    if (curVecIdx >= 0 && curVecIdx != targetVecIdx) {
-                        layerManager.MoveLayerToIndex(layerReorderDragId, targetVecIdx);
-                    }
-                }
+            // Task 5.11-fix-2: CLAMP dragFromRow into the valid strip range
+            // instead of early-returning when the mouse leaves the strip.
+            // Old behavior: dragging above the strip did nothing (bug — user
+            // wanted "move to top"). Clamp semantics: mouse above strip =
+            // row 0 (top / front-most), below strip = last row (back-most).
+            int dragFromRow = (int)((mY - body0) / rowH);
+            if (dragFromRow < 0)               dragFromRow = 0;
+            if (dragFromRow > (int)nLayers - 1) dragFromRow = (int)nLayers - 1;
+            // Row -> FINAL vector index (reverse mapping: top row = last vec).
+            const int targetVecIdx = (int)nLayers - 1 - dragFromRow;
+            int curVecIdx = -1;
+            for (size_t k = 0; k < nLayers; ++k) {
+                if (layers[k].id == layerReorderDragId) { curVecIdx = (int)k; break; }
+            }
+            if (curVecIdx >= 0 && curVecIdx != targetVecIdx) {
+                layerManager.MoveLayerToIndex(layerReorderDragId, targetVecIdx);
             }
         } else {
             // Mouse-up: end the drag. Snapshot was already fired on

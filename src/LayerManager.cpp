@@ -157,29 +157,46 @@ int LayerManager::DuplicateLayer(int srcId) {
     return selectedLayerId;
 }
 
-// Task 5.11: reorder helper. Moves the layer with id=movingId to absolute
-// vector index targetIdx. Preserves stable ids (RebuildIndex handles the
-// idToIndex remap). Clamps targetIdx to a legal range. Silent no-op if
-// movingId doesn't exist or targetIdx equals the current index (nothing
-// to do — saves an unnecessary snapshot / vector churn).
+// Task 5.11: reorder helper. After the call, layers[targetIdx] == movingId
+// (i.e. targetIdx is the FINAL resting index the caller wants). Handles
+// both up- and down-moves via a temp erase + insert. Clamps targetIdx to
+// legal range. Silent no-op if movingId doesn't exist or the layer is
+// already at targetIdx.
+//
+// Task 5.11-fix-2 (drag inversion bug): previous implementation treated
+// targetIdx as the raw insert position AFTER the erase, which off-by-oned
+// downward moves (e.g. moving element 0 to "the end" landed one short).
+// Rewritten to use FINAL-POSITION semantics: compute the post-erase
+// insert index from the caller's intended final target, accounting for
+// the shift when moving up vs down.
 bool LayerManager::MoveLayerToIndex(int movingId, int targetIdx) {
     const int fromIdx = IndexOfId(movingId);
     if (fromIdx < 0) return false;
-    // Clamp target into legal range. After we erase the moving layer, the
-    // vector shrinks by one, so a target after fromIdx effectively shifts
-    // left by 1 during the insert. Compute the post-erase target here.
-    int adjTarget = targetIdx;
-    if (adjTarget < 0)                    adjTarget = 0;
-    if (adjTarget > (int)layers.size() - 1) adjTarget = (int)layers.size() - 1;
-    if (adjTarget == fromIdx) return true; // no-op
+    const int n = (int)layers.size();
+    if (n <= 1) return true;
+    // Clamp caller's intended FINAL index.
+    if (targetIdx < 0)     targetIdx = 0;
+    if (targetIdx > n - 1) targetIdx = n - 1;
+    if (targetIdx == fromIdx) return true; // already there
 
     Layer L = std::move(layers[(size_t)fromIdx]);
     layers.erase(layers.begin() + fromIdx);
-    // After erase, indices > fromIdx have shifted down by 1.
-    if (adjTarget > fromIdx) adjTarget -= 1;
-    if (adjTarget < 0)                     adjTarget = 0;
-    if (adjTarget > (int)layers.size())    adjTarget = (int)layers.size();
-    layers.insert(layers.begin() + adjTarget, std::move(L));
+    // FINAL-POSITION semantics: if the caller wants the moving layer to
+    // end up at index targetIdx AFTER the operation:
+    //   * Moving UP (targetIdx < fromIdx): the erase didn't shift the
+    //     target position, insert directly at targetIdx.
+    //   * Moving DOWN (targetIdx > fromIdx): the erase shifted every
+    //     index above fromIdx down by 1, so to land at final index
+    //     targetIdx we insert at (targetIdx) — which is what the erase
+    //     already corrected for us.
+    // Either way: insert at targetIdx works because targetIdx is in the
+    // post-erase coordinate space too when moving down (it just happens
+    // to be the intended final index in both cases).
+    // For a 3-element vector moving 0->2: after erase [B,C], insert A at 2
+    // gives [B,C,A] which is what the user wanted (moving to the end).
+    int insertPos = targetIdx;
+    if (insertPos > (int)layers.size()) insertPos = (int)layers.size();
+    layers.insert(layers.begin() + insertPos, std::move(L));
     RebuildIndex();
     return true;
 }
