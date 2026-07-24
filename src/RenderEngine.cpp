@@ -2459,34 +2459,38 @@ void RenderEngine::DrawViewportCanvas() {
                                                (UINT)compositionWidth,
                                                (UINT)compositionHeight);
             } else {
-                // Isolation path.
+                // Isolation path. Diagnostics 5.13-diag/diag2/diag3 all
+                // reproduced "layer vanishes with fx". Ship the real
+                // pipeline back in place along with the 5.13-fix2 changes
+                // in EffectManager (explicit CULL_NONE rasterizer, DSV
+                // reset, composite-shader passthrough fallback, cbuffer
+                // parity on kPSComposite).
                 effectManager.Resize(compTextureWidth, compTextureHeight);
-                // ============ DIAGNOSTIC v3 (Task 5.13-diag3) ============
-                // Ultra-minimal: ClearComp pingRTV to opaque MAGENTA, then
-                // composite pingSRV over compRTV. NO shape draw at all.
-                //
-                // Expected outcomes:
-                //  (A) The whole canvas fills with magenta -> pingRTV
-                //      write via ClearRenderTargetView + pingSRV read via
-                //      composite work fine. Bug is in RenderLayers /
-                //      RenderSingleLayer's write into pingRTV
-                //      (state-corruption or dropped bind between the
-                //      clear and the draw).
-                //  (B) Canvas stays dark, no magenta -> the entire ping
-                //      pool RT pipeline is broken. Something in the RTV
-                //      binding / texture creation / SRV creation is
-                //      dropping the write or the read. VERY suspicious of
-                //      Resize() being called with same dims but doing
-                //      something weird, or of the SRV pointing at a
-                //      different texture than the RTV.
-                const float magenta[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
-                compRenderer.ClearComp(effectManager.GetPingRTV(), magenta);
-                // Skip shape draw + effect chain entirely.
-                std::vector<Effect> perLayer; // unused, keep for later
-                (void)perLayer;
-                effectManager.CompositeSRVOver(effectManager.GetPingSRV(),
+                const float transparent[4] = { 0, 0, 0, 0 };
+                compRenderer.ClearComp(effectManager.GetPingRTV(), transparent);
+                compRenderer.RenderSingleLayer(layer,
+                                               effectManager.GetPingRTV(),
+                                               compTextureWidth, compTextureHeight,
+                                               layerManager,
+                                               (UINT)compositionWidth,
+                                               (UINT)compositionHeight);
+                // Build a small vector of just this layer's enabled effects.
+                std::vector<Effect> perLayer;
+                perLayer.reserve(layer.effects.size());
+                for (const auto& e : layer.effects) {
+                    if (e.enabled) perLayer.push_back(e);
+                }
+                // Pick the destination: ApplyChain's parity-agnostic write
+                // path uses whichever pool RT ISN'T the source's texture as
+                // its first-pass write, then ping-pongs. To land the final
+                // result in a predictable SRV for the composite, always
+                // pass the OPPOSITE pool RT as destination.
+                effectManager.ApplyChain(effectManager.GetPingSRV(),
+                                         effectManager.GetPongRTV(),
+                                         perLayer);
+                // Composite pongSRV (final) over compRTV.
+                effectManager.CompositeSRVOver(effectManager.GetPongSRV(),
                                                compRTV);
-                // ============ END DIAGNOSTIC v3 ============
             }
         }
     }

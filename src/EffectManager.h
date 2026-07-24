@@ -123,6 +123,14 @@ private:
     // their output against uninitialized-or-stale pong contents, causing
     // filtered layers to vanish or show ghosts of previous layers.
     ID3D11BlendState*     blend_replace_ = nullptr;
+    // Task 5.13-fix2: explicit CULL_NONE rasterizer state bound inside
+    // DrawFullscreenPass. Without this, our fullscreen triangle inherits
+    // whatever rasterizer state the caller last set — which historically
+    // has been fine (ImGui backend sets CULL_NONE), but relying on
+    // inherited state is exactly the class of bug that produces
+    // "shape vanishes on some machines, works on others" failures. Costs
+    // one RSSetState call per fullscreen pass; ~zero perf impact.
+    ID3D11RasterizerState* rasterizer_none_ = nullptr;
 
     // One pixel shader per EffectType. Populated in Initialize().
     // Index = (int)EffectType. Slot may be null if compile failed — in that

@@ -193,8 +193,15 @@ float4 main(VSOut i) : SV_TARGET {
 // Task 5.13: composite blit — sample the source SRV, output with alpha.
 // Blend state at draw time is SRC_ALPHA / INV_SRC_ALPHA, so this is a
 // standard "src over dst" composite. Used by CompositeSRVOver().
+//
+// Task 5.13-fix2: added the EffectCB cbuffer block for parity with all
+// other effect shaders. HLSL cbuffer bindings can be finicky across
+// drivers when the shader signature doesn't match what the VS declares
+// (fullscreen VS has the same block at b0). This makes the composite
+// shader's reflection stable.
 // =============================================================================
 static const char* kPSComposite = R"HLSL(
+cbuffer EffectCB : register(b0) { float4 p0; float4 p1; float4 p2; float4 p3; };
 Texture2D    tex : register(t0);
 SamplerState smp : register(s0);
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -371,6 +378,16 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
     ps_dropshadow_offset_    = CompilePS(kPSDropShadowOffset,     "main");
     ps_dropshadow_composite_ = CompilePS(kPSDropShadowComposite,  "main");
 
+    // Task 5.13-fix2: if composite shader compilation failed (unlikely but
+    // not impossible on some drivers), fall back to the passthrough PS —
+    // same one-liner sample+return, guaranteed to exist by step 2 above.
+    // Without this fallback CompositeSRVOver silently no-ops and the
+    // per-layer isolation dispatch produces a black composite.
+    if (!ps_composite_) {
+        std::cerr << "[EffectManager] ps_composite_ compile failed; falling back to ps_passthrough_" << std::endl;
+        ps_composite_ = ps_passthrough_;
+    }
+
     // 4) Fullscreen triangle VB
     {
         D3D11_BUFFER_DESC bd = {};
@@ -438,6 +455,25 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
         bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         HRESULT hr = device_->CreateBlendState(&bd, &blend_replace_);
+        if (FAILED(hr)) return false;
+    }
+
+    // 7c) Task 5.13-fix2: explicit CULL_NONE rasterizer state. Fullscreen
+    //     triangle winding is CCW (top=(-1,3), BL=(-1,-1), BR=(3,-1)); DX11
+    //     default FrontCounterClockwise=FALSE means CCW is back-facing.
+    //     ImGui's backend sets CULL_NONE which normally covers us, but if
+    //     any other code (or a driver quirk) leaves CULL_BACK bound, our
+    //     fullscreen triangle silently disappears. Bind explicitly.
+    {
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode              = D3D11_FILL_SOLID;
+        rd.CullMode              = D3D11_CULL_NONE;
+        rd.FrontCounterClockwise = FALSE;
+        rd.DepthClipEnable       = TRUE;
+        rd.ScissorEnable         = FALSE;
+        rd.MultisampleEnable     = FALSE;
+        rd.AntialiasedLineEnable = FALSE;
+        HRESULT hr = device_->CreateRasterizerState(&rd, &rasterizer_none_);
         if (FAILED(hr)) return false;
     }
 
@@ -536,6 +572,13 @@ void EffectManager::DrawFullscreenPass(ID3D11PixelShader* ps,
     context_->IASetInputLayout(input_layout_);
     context_->IASetVertexBuffers(0, 1, &vb_fullscreen_, &stride, &offset);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // Task 5.13-fix2: explicit CULL_NONE rasterizer bind. See
+    // rasterizer_none_ init in Initialize() for rationale.
+    if (rasterizer_none_) context_->RSSetState(rasterizer_none_);
+    // Task 5.13-fix2: unbind any lingering depth-stencil state — we don't
+    // depth-test in the effect pipeline and inherited DSV state can drop
+    // the draw silently on some drivers.
+    context_->OMSetDepthStencilState(nullptr, 0);
     context_->VSSetShader(vs_fullscreen_, nullptr, 0);
     context_->PSSetShader(ps,             nullptr, 0);
     context_->PSSetConstantBuffers(0, 1, &cb_effect_);
@@ -785,18 +828,24 @@ void EffectManager::Shutdown() {
         }
         effect_ps_[i] = nullptr;
     }
-    if (ps_passthrough_) { ps_passthrough_->Release(); ps_passthrough_ = nullptr; }
     // Task 5.13: extra PS for the per-layer isolation path.
-    if (ps_composite_)             { ps_composite_->Release();             ps_composite_             = nullptr; }
+    // Task 5.13-fix2: composite may alias to passthrough (fallback path);
+    // release before the passthrough, guard against the alias case.
+    if (ps_composite_ && ps_composite_ != ps_passthrough_) {
+        ps_composite_->Release();
+    }
+    ps_composite_ = nullptr;
     if (ps_dropshadow_offset_)     { ps_dropshadow_offset_->Release();     ps_dropshadow_offset_     = nullptr; }
     if (ps_dropshadow_composite_)  { ps_dropshadow_composite_->Release();  ps_dropshadow_composite_  = nullptr; }
+    if (ps_passthrough_) { ps_passthrough_->Release(); ps_passthrough_ = nullptr; }
     if (vs_fullscreen_)  { vs_fullscreen_->Release();  vs_fullscreen_  = nullptr; }
     if (input_layout_)   { input_layout_->Release();   input_layout_   = nullptr; }
     if (vb_fullscreen_)  { vb_fullscreen_->Release();  vb_fullscreen_  = nullptr; }
     if (cb_effect_)      { cb_effect_->Release();      cb_effect_      = nullptr; }
     if (linear_clamp_)   { linear_clamp_->Release();   linear_clamp_   = nullptr; }
-    if (blend_normal_)   { blend_normal_->Release();   blend_normal_   = nullptr; }
-    if (blend_replace_)  { blend_replace_->Release();  blend_replace_  = nullptr; }
+    if (blend_normal_)    { blend_normal_->Release();    blend_normal_    = nullptr; }
+    if (blend_replace_)   { blend_replace_->Release();   blend_replace_   = nullptr; }
+    if (rasterizer_none_) { rasterizer_none_->Release(); rasterizer_none_ = nullptr; }
     ReleaseRenderTargets();
     initialized_ = false;
     device_ = nullptr;
