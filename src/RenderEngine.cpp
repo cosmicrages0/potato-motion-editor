@@ -2462,13 +2462,37 @@ void RenderEngine::DrawViewportCanvas() {
                 // Isolation path.
                 effectManager.Resize(compTextureWidth, compTextureHeight);
                 const float transparent[4] = { 0, 0, 0, 0 };
-                compRenderer.ClearComp(effectManager.GetPingRTV(), transparent);
-                compRenderer.RenderSingleLayer(layer,
-                                               effectManager.GetPingRTV(),
-                                               compTextureWidth, compTextureHeight,
-                                               layerManager,
-                                               (UINT)compositionWidth,
-                                               (UINT)compositionHeight);
+                // ============ DIAGNOSTIC v2 (Task 5.13-diag2) ============
+                // Swap RenderSingleLayer for the full RenderLayers path,
+                // targeted at pingRTV. RenderLayers is the exact same code
+                // that works when targeted at compRTV in the pre-5.13
+                // pipeline. If the shape appears in pingRTV via
+                // RenderLayers but NOT via RenderSingleLayer, the bug is
+                // in RenderSingleLayer specifically (some missing state
+                // setup vs RenderLayers).
+                //
+                // Trade-off for the diagnostic: this renders ALL layers
+                // into pingRTV, not just this one. For a single-layer
+                // test scene it's equivalent. For multi-layer scenes the
+                // isolation semantics break (every layer gets every
+                // other layer's shape stamped through its filter). But
+                // this is throwaway diagnostic code.
+                compRenderer.RenderLayers(effectManager.GetPingRTV(),
+                                          compTextureWidth, compTextureHeight,
+                                          layerManager,
+                                          transparent,
+                                          (UINT)compositionWidth,
+                                          (UINT)compositionHeight,
+                                          animEngine.duration);
+                // Old code below, commented for now:
+                // compRenderer.ClearComp(effectManager.GetPingRTV(), transparent);
+                // compRenderer.RenderSingleLayer(layer,
+                //                                effectManager.GetPingRTV(),
+                //                                compTextureWidth, compTextureHeight,
+                //                                layerManager,
+                //                                (UINT)compositionWidth,
+                //                                (UINT)compositionHeight);
+                // ============ END DIAGNOSTIC v2 ============
                 // Build a small vector of just this layer's enabled effects.
                 std::vector<Effect> perLayer;
                 perLayer.reserve(layer.effects.size());
