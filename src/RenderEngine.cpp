@@ -5,9 +5,17 @@
 #include <cstring>
 #include <vector>
 #include <type_traits>
+#include <fstream>
+#include <sstream>
 
 // Task 5.2: save/load
 #include "Serialization.h"
+
+// Task 5.9: DirectWrite text sprite renderer + Win32 known-folder path for
+// the favorites JSON file. ShlObj_core.h brings SHGetKnownFolderPath.
+#include "TextRenderer.h"
+#include <ShlObj_core.h>
+#include <KnownFolders.h>
 
 // =============================================================================
 // Lifecycle
@@ -83,6 +91,16 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
     // Task 5.0: the shape rasterizer that turns Layers into compRTV pixels.
     if (!compRenderer.Initialize(device, context)) {
         std::cerr << "[RenderEngine] CompositionRenderer init failed" << std::endl;
+    }
+
+    // Task 5.9: DirectWrite text sprite renderer. Non-fatal on failure —
+    // Text layers just won't render, but everything else still works.
+    textRenderer = new TextRenderer();
+    if (!textRenderer->Initialize()) {
+        std::cerr << "[RenderEngine] TextRenderer init failed; text layers disabled" << std::endl;
+    } else {
+        textRenderer->EnumerateSystemFonts(systemFonts);
+        LoadFontFavorites();
     }
 
     // Seed a couple of demo layers so the app is immediately editable.
@@ -643,6 +661,8 @@ void RenderEngine::RenderAEDockingLayout() {
         if (ImGui::BeginMenu("Layer")) {
             if (ImGui::MenuItem("New Rectangle")) SpawnShapeAtViewportCenter(ShapeType::Rectangle);
             if (ImGui::MenuItem("New Ellipse"))   SpawnShapeAtViewportCenter(ShapeType::Ellipse);
+            // Task 5.9: DirectWrite text layer.
+            if (ImGui::MenuItem("New Text"))      SpawnShapeAtViewportCenter(ShapeType::Text, "Text");
             if (ImGui::MenuItem("New Null Object")) SpawnShapeAtViewportCenter(ShapeType::Null, "Null");
             if (show3DFeatures) {
                 if (ImGui::MenuItem("New Camera"))    SpawnShapeAtViewportCenter(ShapeType::Camera,  "Camera");
@@ -764,6 +784,8 @@ void RenderEngine::DrawTimelinePanel() {
     if (ImGui::Button("+ Rect"))    SpawnShapeAtViewportCenter(ShapeType::Rectangle);
     ImGui::SameLine();
     if (ImGui::Button("+ Ellipse")) SpawnShapeAtViewportCenter(ShapeType::Ellipse);
+    ImGui::SameLine();
+    if (ImGui::Button("+ Text"))    SpawnShapeAtViewportCenter(ShapeType::Text,   "Text");
     ImGui::SameLine();
     if (ImGui::Button("+ Null"))    SpawnShapeAtViewportCenter(ShapeType::Null,   "Null");
     if (show3DFeatures) {
@@ -1440,6 +1462,92 @@ void RenderEngine::DrawInspectorPanel() {
         sel->cornerRadius = std::clamp(sel->cornerRadius, 0.0f, maxR);
     }
 
+    // Task 5.9: Text properties. Only visible for Text layers.
+    if (sel->type == ShapeType::Text &&
+        ImGui::CollapsingHeader("Text", ImGuiTreeNodeFlags_DefaultOpen)) {
+
+        // Editable string. MarkForSnapshot on activation so a burst of
+        // keystrokes collapses into one undo step.
+        char textBuf[512];
+        std::snprintf(textBuf, sizeof(textBuf), "%s", sel->textProps.text.c_str());
+        if (ImGui::InputText("Text##textStr", textBuf, sizeof(textBuf))) {
+            sel->textProps.text = textBuf;
+        }
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+
+        // Font picker. Favorites section pinned at top, separator, then all
+        // system fonts alphabetically. Each row has a star toggle on the
+        // right that flips the favorite state (persisted to
+        // %LOCALAPPDATA%\PotatoMotion\fonts.json at end of frame).
+        if (ImGui::BeginCombo("Font##textFont", sel->textProps.fontFamily.c_str())) {
+            // Favorites first
+            for (const auto& fam : favoriteFonts) {
+                ImGui::PushID(("fav_" + fam).c_str());
+                const bool selected = (fam == sel->textProps.fontFamily);
+                if (ImGui::Selectable(("* " + fam).c_str(), selected,
+                                       ImGuiSelectableFlags_AllowOverlap)) {
+                    MarkForSnapshot();
+                    sel->textProps.fontFamily = fam;
+                }
+                // Star toggle at right edge (unstar removes from favorites)
+                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 20.0f);
+                if (ImGui::SmallButton("x##unfav")) {
+                    ToggleFontFavorite(fam);
+                }
+                ImGui::PopID();
+            }
+            if (!favoriteFonts.empty()) ImGui::Separator();
+            // All system fonts
+            for (const auto& fam : systemFonts) {
+                ImGui::PushID(("all_" + fam).c_str());
+                const bool selected = (fam == sel->textProps.fontFamily);
+                if (ImGui::Selectable(fam.c_str(), selected,
+                                       ImGuiSelectableFlags_AllowOverlap)) {
+                    MarkForSnapshot();
+                    sel->textProps.fontFamily = fam;
+                }
+                // Star toggle
+                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 20.0f);
+                const bool isFav = (favoriteFonts.count(fam) > 0);
+                const char* starLbl = isFav ? "*##fav" : "o##fav";
+                if (ImGui::SmallButton(starLbl)) {
+                    ToggleFontFavorite(fam);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+
+        // Size (px)
+        ImGui::SliderFloat("Size (px)##textSz", &sel->textProps.fontSize,
+                           4.0f, 512.0f, "%.0f");
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+
+        // Weight (100..900, snap to 100 increments)
+        int weight = sel->textProps.fontWeight;
+        if (ImGui::SliderInt("Weight##textWt", &weight, 100, 900, "%d")) {
+            sel->textProps.fontWeight = ((weight + 50) / 100) * 100;
+        }
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+
+        // Italic
+        if (ImGui::Checkbox("Italic##textIt", &sel->textProps.italic)) {
+            MarkForSnapshot();
+        }
+
+        // Alignment radios
+        int align = sel->textProps.alignment;
+        if (ImGui::RadioButton("Left##al",   align == 0)) { MarkForSnapshot(); sel->textProps.alignment = 0; }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Center##al", align == 1)) { MarkForSnapshot(); sel->textProps.alignment = 1; }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Right##al",  align == 2)) { MarkForSnapshot(); sel->textProps.alignment = 2; }
+
+        ImGui::TextDisabled("Color animates via Fill above. Position / rotation /");
+        ImGui::TextDisabled("scale / opacity animate via Transform. Font size / string");
+        ImGui::TextDisabled("changes rebuild the atlas (~5ms one-shot).");
+    }
+
         ImGui::EndTabItem();
     } // end Transform tab
 
@@ -1955,6 +2063,10 @@ void RenderEngine::DrawViewportCanvas() {
     // comp-correct at any preview scale.
     // -------------------------------------------------------------------
     if (compRTV && compRenderer.IsReady()) {
+        // Task 5.9: re-rasterize any Text layer whose props changed since
+        // last frame. Fast-path when nothing changed (hash compare only).
+        RefreshTextLayerCaches();
+
         compRenderer.RenderLayers(compRTV, compTextureWidth, compTextureHeight,
                                   layerManager, bgColor,
                                   (UINT)compositionWidth, (UINT)compositionHeight);
@@ -4075,6 +4187,14 @@ void RenderEngine::SpawnShapeAtViewportCenter(ShapeType type, const char* nameHi
             layer->transform.sizePixels.staticValue = Vec2(60.0f, 60.0f);
             layer->fillColor                        = 0xFFAAAAAA; // gray marker
             break;
+        case ShapeType::Text:
+            // Task 5.9: Text layer. sizePixels is IGNORED at draw time
+            // (the atlas dims drive the quad), but we set a nominal value
+            // for gizmo drag hit-testing which uses it. TextProps carries
+            // the string + font; defaults are set in TextProps constructor.
+            layer->transform.sizePixels.staticValue = Vec2(400.0f, 100.0f);
+            layer->fillColor                        = 0xFFFFFFFF; // opaque white
+            break;
     }
 }
 
@@ -4441,6 +4561,15 @@ void RenderEngine::Shutdown() {
     compRenderer.Shutdown();
     ReleaseCompositionRT();
 
+    // Task 5.9: release DirectWrite factory + text-sprite atlases (each
+    // Layer's ComPtr auto-releases on layer destruction, so the only
+    // thing to clean up here is the TextRenderer instance itself).
+    if (textRenderer) {
+        textRenderer->Shutdown();
+        delete textRenderer;
+        textRenderer = nullptr;
+    }
+
     // Task 5: release GPU resources owned by the effect stack BEFORE the
     // device/context go away.
     effectManager.Shutdown();
@@ -4459,4 +4588,106 @@ void RenderEngine::Shutdown() {
 
     if (window) { SDL_DestroyWindow(window); window = nullptr; }
     SDL_Quit();
+}
+
+// =============================================================================
+// Task 5.9: Text layer support — font favorites persistence + per-frame
+// atlas refresh.
+// =============================================================================
+
+// Compute %LOCALAPPDATA%\PotatoMotion\fonts.json. Falls back to CWD file
+// if SHGetKnownFolderPath fails (very rare — no-network sandboxed builds).
+static std::string GetFontsFavoritePath() {
+    PWSTR wpath = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &wpath))
+        && wpath) {
+        // UTF-16 -> UTF-8
+        const int u8len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                                              nullptr, 0, nullptr, nullptr);
+        std::string base(u8len > 0 ? u8len - 1 : 0, '\0');
+        if (u8len > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, wpath, -1,
+                                base.data(), u8len, nullptr, nullptr);
+        }
+        CoTaskMemFree(wpath);
+        // Ensure the PotatoMotion subfolder exists (silent if it already does).
+        const std::string dir = base + "\\PotatoMotion";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        return dir + "\\fonts.json";
+    }
+    return std::string("fonts.json");
+}
+
+void RenderEngine::LoadFontFavorites() {
+    favoriteFonts.clear();
+    const std::string path = GetFontsFavoritePath();
+    std::ifstream f(path);
+    if (!f.is_open()) return;
+
+    // Deliberately minimal parser — the file is our own tiny format:
+    //   { "favorites": ["Foo", "Bar Baz"] }
+    // No nlohmann/json include here (kept isolated to Serialization.cpp
+    // per the Task 5.2 rule). Manual bracket-and-comma scan; robust to
+    // whitespace but not to arbitrary JSON. If the file's malformed, we
+    // silently start with an empty set — no user-facing error dialog.
+    std::stringstream ss; ss << f.rdbuf();
+    const std::string s = ss.str();
+    const auto arrStart = s.find('[');
+    const auto arrEnd   = s.find(']', arrStart);
+    if (arrStart == std::string::npos || arrEnd == std::string::npos) return;
+    std::string body = s.substr(arrStart + 1, arrEnd - arrStart - 1);
+    size_t i = 0;
+    while (i < body.size()) {
+        // Advance to next opening quote
+        while (i < body.size() && body[i] != '"') ++i;
+        if (i >= body.size()) break;
+        ++i;
+        const size_t start = i;
+        while (i < body.size() && body[i] != '"') ++i;
+        if (i >= body.size()) break;
+        favoriteFonts.insert(body.substr(start, i - start));
+        ++i;
+    }
+}
+
+void RenderEngine::SaveFontFavorites() {
+    const std::string path = GetFontsFavoritePath();
+    std::ofstream f(path, std::ios::trunc);
+    if (!f.is_open()) return;
+    f << "{\n  \"favorites\": [";
+    bool first = true;
+    for (const auto& name : favoriteFonts) {
+        if (!first) f << ", ";
+        first = false;
+        // Escape internal quotes and backslashes so exotic font names don't
+        // corrupt the file. std::string family names shouldn't contain any
+        // of these normally, but defensive is cheap.
+        f << "\"";
+        for (char c : name) {
+            if (c == '\\' || c == '"') f << '\\';
+            f << c;
+        }
+        f << "\"";
+    }
+    f << "]\n}\n";
+    favoritesDirty = false;
+}
+
+void RenderEngine::ToggleFontFavorite(const std::string& family) {
+    auto it = favoriteFonts.find(family);
+    if (it == favoriteFonts.end()) favoriteFonts.insert(family);
+    else                            favoriteFonts.erase(it);
+    favoritesDirty = true;
+}
+
+void RenderEngine::RefreshTextLayerCaches() {
+    if (!textRenderer || !device) return;
+    for (auto& layer : layerManager.Layers()) {
+        if (layer.type != ShapeType::Text) continue;
+        // EnsureLayerCache is a no-op fast path when cache-key matches.
+        textRenderer->EnsureLayerCache(layer, device);
+    }
+    // Deferred favorites write. Runs at most once per frame; toggle bursts
+    // collapse into one file write.
+    if (favoritesDirty) SaveFontFavorites();
 }

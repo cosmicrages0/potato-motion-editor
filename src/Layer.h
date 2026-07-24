@@ -1,8 +1,17 @@
 #pragma once
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <d3d11.h>
+#include <wrl/client.h>   // Task 5.9: Microsoft::WRL::ComPtr
+
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 #include "MathTypes.h"
 #include "AnimationEngine.h"
@@ -12,13 +21,31 @@
 // -----------------------------------------------------------------------------
 // Shape type: extensible enum. CustomPath is stubbed for Task 3 and will be
 // wired up in a later milestone when we add the SVG-style path editor.
+// Task 5.9 adds Text — a layer whose "shape" is a DirectWrite-rasterized
+// string cached into a per-layer R8_UNORM texture.
 // -----------------------------------------------------------------------------
 enum class ShapeType : int {
     Rectangle  = 0,
     Ellipse    = 1,
     CustomPath = 2,
     Camera     = 3,  // Task 4: layer whose transform drives the active 3D camera
-    Null       = 4   // Task 4.5: invisible transform-only layer for parenting rigs
+    Null       = 4,  // Task 4.5: invisible transform-only layer for parenting rigs
+    Text       = 5   // Task 5.9: DirectWrite-rasterized text sprite
+};
+
+// -----------------------------------------------------------------------------
+// TextProps (Task 5.9): styling for a Text layer. Only meaningful when
+// Layer.type == ShapeType::Text. Fill color reuses Layer.fillColor. Not
+// (yet) animated — text is content, not motion. Position / rotation / scale
+// / opacity / fillColor animate via the existing Transform system for free.
+// -----------------------------------------------------------------------------
+struct TextProps {
+    std::string text          = "Text";
+    std::string fontFamily    = "Segoe UI";  // always present on Windows 7+
+    float       fontSize      = 72.0f;       // pixels (matches AE convention)
+    int         fontWeight    = 400;         // DirectWrite scale: 100..900
+    bool        italic        = false;
+    int         alignment     = 0;           // 0=left, 1=center, 2=right
 };
 
 // -----------------------------------------------------------------------------
@@ -121,6 +148,18 @@ struct Layer {
     unsigned int strokeColor  = 0xFF000000; // ABGR; opaque black by default
     float        strokeWidth  = 0.0f;       // pixels; 0 => no stroke
     float        cornerRadius = 0.0f;       // pixels; 0 => sharp corners (Rect only)
+
+    // Task 5.9: TextProps + cache. Only used when type == ShapeType::Text.
+    // Cache texture + hash-key are mutable so the const evaluator can trigger
+    // a re-rasterize when props change (usual const-mutable convention for
+    // caches). ComPtr auto-releases on Layer destruction / re-rasterize
+    // reassignment / device reset — reviewer-fix #3 (no raw pointer leaks).
+    TextProps textProps;
+    mutable Microsoft::WRL::ComPtr<ID3D11Texture2D>          textTex;
+    mutable Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> textSRV;
+    mutable int    textTexW      = 0;
+    mutable int    textTexH      = 0;
+    mutable size_t textCacheKey  = 0;   // hash of (text, family, size, weight, italic, align)
 
     // Task 5: ordered stack of post-processing effects. Reserved so add/remove
     // never allocates inside the frame loop for typical projects.

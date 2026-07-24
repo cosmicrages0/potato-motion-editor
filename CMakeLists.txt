@@ -44,6 +44,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxgi
     d3dcompiler
     Comdlg32               # Task 5.2: Win32 GetOpenFileName/GetSaveFileName
+    Dwrite                 # Task 5.9: DirectWrite text rasterization
+    Shell32                # Task 5.9: SHGetKnownFolderPath for LOCALAPPDATA
+    Ole32                  # Task 5.9: CoTaskMemFree for KNOWNFOLDER path result
     nlohmann_json::nlohmann_json
 )
 

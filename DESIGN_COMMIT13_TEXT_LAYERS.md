@@ -300,14 +300,85 @@ with the text layer's fillColor. Acceptable v1 forward-compat.
 
 ---
 
-## 10. Open questions
+## 11. Pre-go review adjustments (locked)
 
-None strictly blocking. One optional style choice:
+All four reviewer fixes applied to the plan below. Numbered per the
+review comment for traceability.
 
-**Q1.** Cache-key hashing: cheap `std::hash` combine over string +
-floats, or crc32? `std::hash` combines have a small collision chance
-for weird font names. crc32 is bulletproof but ~15 LOC. **My rec:
-std::hash** — collision would just mean one skipped re-rasterization
-per session, harmless.
+**#1 Grayscale AA (critical).** `IDWriteBitmapRenderTarget::DrawGlyphRun`
+defaults to `DWRITE_RENDERING_MODE_DEFAULT` which produces ClearType
+sub-pixel RGB coverage — the R/G/B channels represent per-color-channel
+opacity for the pixel, NOT a proper alpha value. Sampling `.a` from
+that in a shader gives nonsense.
 
-Say **"go single commit"** to execute.
+Fix: create an `IDWriteRenderingParams` with
+`DWRITE_RENDERING_MODE_ALIASED` or set the bitmap-render-target's
+pixel-snapping / anti-aliasing mode to grayscale. Concretely:
+
+```cpp
+IDWriteRenderingParams* rp = nullptr;
+factory->CreateCustomRenderingParams(
+    /*gamma*/ 1.0f, /*enhancedContrast*/ 0.0f, /*clearTypeLevel*/ 0.0f,
+    DWRITE_PIXEL_GEOMETRY_FLAT,
+    DWRITE_RENDERING_MODE_NATURAL,   // grayscale-AA, single-channel coverage
+    &rp);
+bitmapRT->SetPixelsPerDip(1.0f);
+```
+
+Then when DrawGlyphRun renders, R = G = B = coverage. The bitmap
+returned by `GetMemoryDC() -> GetDIBits()` is a proper single-channel
+mask (all three channels equal per pixel).
+
+**#2 Fill-only v1 (doc consistency).** Section 2's line "Stroke reuses
+Layer.strokeColor + strokeWidth — cost = free" was aspirational and
+wrong: alpha-atlas sampling can produce a stroked LOOK via distance-
+field techniques, but only from an SDF text pass. Bitmap alpha alone
+cannot draw an outline. Correcting the design to explicitly say
+**fill only in v1** — matches Section 5's ps_text_ shader shape.
+Stroke deferred with the other polish items (would need an SDF text
+pipeline or a separate outline pre-pass).
+
+**#3 ComPtr for owned COM handles.** Using `mutable ID3D11Texture2D*
+textTex` is a leak waiting to happen: DeleteLayer needs to remember to
+release; device-reset needs a full sweep; RVO/copy semantics on Layer
+struct are landmines. Switch to
+`Microsoft::WRL::ComPtr<ID3D11Texture2D>` / `ComPtr<ID3D11ShaderResourceView>`
+which auto-releases on Layer destruction, on assign, on `.Reset()`
+during re-rasterize. `<wrl/client.h>` is a header-only Windows SDK
+dependency — free. Layer becomes safely copyable/movable by default.
+
+**#4 fontFamily fallback.** If the .pmge file names a font not present
+on the loading machine (e.g. project made on a Mac-user's fork using
+"SF Pro Display" opened on a Windows box), `IDWriteFontCollection::
+FindFamilyName` returns index-out-of-range. Rasterize would either
+crash or produce empty output. Fix: `TextRenderer::RasterizeString`
+first calls `FindFamilyName`; on miss, silently falls back to
+"Segoe UI" (always present on Windows 7+). Logs one line to stderr so
+the user can trace what happened. Original `fontFamily` in TextProps
+is NOT overwritten — save/reopen on the machine with the real font
+restores correct rendering.
+
+**#5 Sample .r not .a (follows from #1).** Two clean options:
+  a. Rasterize into R8G8B8A8, all channels equal, sample any channel.
+     Wastes 4× texture memory.
+  b. Upload as **DXGI_FORMAT_R8_UNORM**, sample `.r`. Halves texture
+     memory AND matches the actual data (one channel of coverage).
+
+**Going with (b)** because it's cheaper and clearer. `ps_text_` becomes:
+
+```hlsl
+float coverage = texAtlas.Sample(samLinear, i.uv).r;
+if (coverage < 0.001) discard;
+float4 result = color;
+result.a *= coverage;
+return result;
+```
+
+TextRenderer post-processes the DirectWrite RGBA bitmap to a single-
+channel R8 buffer before upload — trivial per-pixel copy, fast even
+at 4K text sizes.
+
+## 12. Go
+
+All four reviewer fixes merged. Executing single commit.
+

@@ -9,6 +9,8 @@
 #include <SDL.h>
 #include <SDL_syswm.h>
 #include <string>
+#include <vector>
+#include <set>
 #include <iostream>
 #include <cmath>
 
@@ -107,6 +109,29 @@ private:
     ExportEngine   exportEngine;    // Task 6: FFmpeg direct-stream exporter
     AlightXmlImporter xmlImporter;  // Task 6: Alight Motion .xml curve parser
     CompositionRenderer compRenderer; // Task 5.0: rasterizes layers to compRTV
+
+    // Task 5.9: DirectWrite text sprite renderer. Owns the DirectWrite
+    // factory + shared bitmap-render-target. Called every frame from
+    // BeginFrame's pre-render sweep to keep each Text layer's cached atlas
+    // up to date (fast-path when cache-key unchanged).
+    class TextRenderer* textRenderer = nullptr; // heap-owned; fwd-declared here
+    // Cached system-font list, populated once at Initialize. UI-facing
+    // std::string labels sorted alphabetically. Rebuilding it hits
+    // DirectWrite so we do it once.
+    std::vector<std::string> systemFonts;
+    // Per-user favorites (starred fonts), persisted to
+    // %LOCALAPPDATA%/PotatoMotion/fonts.json. NOT in .pmge.
+    std::set<std::string>    favoriteFonts;
+    // Deferred write flag: any favorite toggle sets this; SaveFontFavorites
+    // fires at EndFrame so a burst of toggles collapses to one file write.
+    bool                     favoritesDirty = false;
+    // Task 5.9: helpers.
+    void LoadFontFavorites();
+    void SaveFontFavorites();
+    void ToggleFontFavorite(const std::string& family);
+    // Ensures each Text layer's rasterized atlas is current. Called once per
+    // frame from BeginFrame before compRenderer.RenderLayers runs.
+    void RefreshTextLayerCaches();
 
     // Task 5.0: fixed-size composition render target. Every 2D layer draws
     // into this each frame; the ping-pong effect chain runs against it; the

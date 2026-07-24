@@ -229,6 +229,7 @@ const char* ShapeTypeToString(ShapeType t) {
         case ShapeType::CustomPath: return "CustomPath";
         case ShapeType::Camera:     return "Camera";
         case ShapeType::Null:       return "Null";
+        case ShapeType::Text:       return "Text";   // Task 5.9
     }
     return "Rectangle";
 }
@@ -237,6 +238,7 @@ ShapeType ShapeTypeFromString(const std::string& s) {
     if (s == "CustomPath") return ShapeType::CustomPath;
     if (s == "Camera")     return ShapeType::Camera;
     if (s == "Null")       return ShapeType::Null;
+    if (s == "Text")       return ShapeType::Text;   // Task 5.9
     return ShapeType::Rectangle;
 }
 
@@ -345,6 +347,25 @@ json WriteLayer(const Layer& L) {
     out["strokeColor"]   = FillColorToHex(L.strokeColor);
     out["strokeWidth"]   = L.strokeWidth;
     out["cornerRadius"]  = L.cornerRadius;
+    // Task 5.9: TextProps — only meaningful when type == Text, but emit
+    // unconditionally when non-default so a manual retype in a text editor
+    // preserves the block. Cheap; text data is tiny.
+    if (L.type == ShapeType::Text ||
+        L.textProps.text != "Text" ||
+        L.textProps.fontFamily != "Segoe UI" ||
+        L.textProps.fontSize != 72.0f ||
+        L.textProps.fontWeight != 400 ||
+        L.textProps.italic ||
+        L.textProps.alignment != 0) {
+        json tp;
+        tp["text"]       = L.textProps.text;
+        tp["fontFamily"] = L.textProps.fontFamily;
+        tp["fontSize"]   = L.textProps.fontSize;
+        tp["fontWeight"] = L.textProps.fontWeight;
+        tp["italic"]     = L.textProps.italic;
+        tp["alignment"]  = L.textProps.alignment;
+        out["textProps"] = std::move(tp);
+    }
     out["transform"]     = WriteTransform(L.transform);
     json effects = json::array();
     for (const auto& e : L.effects) effects.push_back(WriteEffect(e));
@@ -370,6 +391,17 @@ Layer ReadLayer(const json& j) {
     L.strokeColor   = FillColorFromHex(j.value("strokeColor", std::string("0xFF000000")), 0xFF000000u);
     L.strokeWidth   = j.value("strokeWidth",  0.0f);
     L.cornerRadius  = j.value("cornerRadius", 0.0f);
+    // Task 5.9: TextProps. Missing on pre-5.9 files => defaults; on a non-
+    // Text layer with only defaults, ignored downstream anyway.
+    if (j.contains("textProps") && j["textProps"].is_object()) {
+        const auto& tp = j["textProps"];
+        L.textProps.text       = tp.value("text",       std::string("Text"));
+        L.textProps.fontFamily = tp.value("fontFamily", std::string("Segoe UI"));
+        L.textProps.fontSize   = tp.value("fontSize",   72.0f);
+        L.textProps.fontWeight = tp.value("fontWeight", 400);
+        L.textProps.italic     = tp.value("italic",     false);
+        L.textProps.alignment  = tp.value("alignment",  0);
+    }
     if (j.contains("transform")) ReadTransform(j["transform"], L.transform);
     if (j.contains("effects") && j["effects"].is_array()) {
         for (const auto& ej : j["effects"]) L.effects.push_back(ReadEffect(ej));

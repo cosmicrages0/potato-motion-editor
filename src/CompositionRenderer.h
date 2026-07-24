@@ -93,6 +93,14 @@ private:
                      UINT logicalW, UINT logicalH);
     void DrawNullMarker(const Mat3& worldMatrix, const Vec2& size,
                         UINT logicalW, UINT logicalH);
+    // Task 5.9: text sprite. Samples layer's cached R8 atlas via SRV, tints
+    // by fillColor. Size is the R8 atlas dims in pixels (drives the quad's
+    // world-space extent); world matrix places it in comp space just like
+    // any other shape.
+    void DrawText(const Mat3& worldMatrix, const Vec2& size,
+                  unsigned int fillColor,
+                  ID3D11ShaderResourceView* atlasSRV,
+                  UINT logicalW, UINT logicalH);
 
     // Constant buffer layout (16-byte aligned; must match HLSL).
     // Task 5.7: added stroke[4] + params2[4] for stroke color + halfExtent.
@@ -119,6 +127,11 @@ private:
     ID3D11VertexShader*   vs_             = nullptr;
     ID3D11PixelShader*    ps_shape_sdf_   = nullptr;
     ID3D11PixelShader*    ps_null_        = nullptr;
+    // Task 5.9: text pixel shader + linear sampler. Text sprites are cached
+    // R8_UNORM atlases uploaded by TextRenderer; this PS samples .r as
+    // coverage and tints by the fill color.
+    ID3D11PixelShader*    ps_text_        = nullptr;
+    ID3D11SamplerState*   samp_linear_    = nullptr;
     ID3D11InputLayout*    layout_      = nullptr;
     ID3D11Buffer*         cb_shape_    = nullptr;   // dynamic, sizeof(ShapeCB)
     ID3D11Buffer*         vb_quad_     = nullptr;   // 4 verts covering [-0.5,+0.5]

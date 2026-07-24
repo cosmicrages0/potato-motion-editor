@@ -123,6 +123,31 @@ float4 main(VSOut i) : SV_TARGET {
 }
 )HLSL";
 
+// -----------------------------------------------------------------------------
+// Task 5.9: text sprite pixel shader.
+//
+// Samples a per-layer R8_UNORM coverage atlas (produced by TextRenderer via
+// DirectWrite in grayscale mode) and tints by the layer's fill color.
+// Reviewer-fix #5: sample .r (single channel) — the R8_UNORM format we
+// upload has only one channel, and grayscale-mode rasterization stored
+// coverage there.
+//
+// Discard for near-zero coverage skips the vast majority of the quad
+// (any text bitmap is mostly empty pixels around the glyphs).
+// -----------------------------------------------------------------------------
+static const char* kPSTextSrc = R"HLSL(
+Texture2D    texAtlas  : register(t0);
+SamplerState samLinear : register(s0);
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
+float4 main(VSOut i) : SV_TARGET {
+    float coverage = texAtlas.Sample(samLinear, i.uv).r;
+    if (coverage < 0.001) discard;
+    float4 result = i.color;
+    result.a *= coverage;
+    return result;
+}
+)HLSL";
+
 // Unit quad centered on origin, UVs 0..1 across the face.
 struct QVert { float x, y; float u, v; };
 static const QVert kQuadVerts[4] = {
@@ -192,6 +217,8 @@ bool CompositionRenderer::CreateShaders() {
     // Task 5.7: one SDF pixel shader for both Rect and Ellipse.
     if (!makePS(kPSShapeSDFSrc, &ps_shape_sdf_)) return false;
     if (!makePS(kPSNullSrc,     &ps_null_))      return false;
+    // Task 5.9: text sprite PS. Small, single texture, bilinear-sampled.
+    if (!makePS(kPSTextSrc,     &ps_text_))      return false;
     return true;
 }
 
@@ -236,6 +263,19 @@ bool CompositionRenderer::CreateBuffers() {
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         if (FAILED(device_->CreateBlendState(&bd, &blend_alpha_))) return false;
     }
+    // Task 5.9: linear sampler for text sprite bilinear filtering. Clamp
+    // addressing so UVs slightly outside [0,1] (from float error at quad
+    // edges) don't wrap and produce black seam artifacts.
+    {
+        D3D11_SAMPLER_DESC sd{};
+        sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxLOD         = D3D11_FLOAT32_MAX;
+        if (FAILED(device_->CreateSamplerState(&sd, &samp_linear_))) return false;
+    }
     return true;
 }
 
@@ -250,11 +290,13 @@ bool CompositionRenderer::Initialize(ID3D11Device* device, ID3D11DeviceContext* 
 }
 
 void CompositionRenderer::ReleaseAll() {
+    if (samp_linear_)  { samp_linear_->Release();  samp_linear_  = nullptr; }
     if (blend_alpha_) { blend_alpha_->Release(); blend_alpha_ = nullptr; }
     if (ib_quad_)     { ib_quad_->Release();     ib_quad_     = nullptr; }
     if (vb_quad_)     { vb_quad_->Release();     vb_quad_     = nullptr; }
     if (cb_shape_)    { cb_shape_->Release();    cb_shape_    = nullptr; }
     if (layout_)      { layout_->Release();      layout_      = nullptr; }
+    if (ps_text_)     { ps_text_->Release();     ps_text_     = nullptr; }
     if (ps_null_)      { ps_null_->Release();      ps_null_      = nullptr; }
     // Task 5.7: single consolidated SDF pixel shader replaced the old
     // rect + ellipse pair. Both former pointers are gone from the header.
@@ -457,6 +499,40 @@ void CompositionRenderer::DrawNullMarker(const Mat3& world, const Vec2& size,
     context_->DrawIndexed(6, 0, 0);
 }
 
+// Task 5.9: DrawText — one textured quad per Text layer. Assumes the
+// caller (RenderLayers) already ran TextRenderer::EnsureLayerCache so
+// `atlasSRV` is valid and matches the current TextProps. If atlasSRV
+// is null, silently no-op (rasterization failed — nothing to draw).
+void CompositionRenderer::DrawText(const Mat3& world, const Vec2& size,
+                                    unsigned int fillColor,
+                                    ID3D11ShaderResourceView* atlasSRV,
+                                    UINT logicalW, UINT logicalH) {
+    if (!context_ || !ps_text_ || !samp_linear_ || !atlasSRV) return;
+    ShapeCB cb{};
+    BuildShapeMVP(world, size, logicalW, logicalH, cb.mvp);
+    UnpackABGRToRGBAf(fillColor, cb.color);
+    // stroke / params fields unused by ps_text_ but zero them for safety.
+    cb.stroke[0] = cb.stroke[1] = cb.stroke[2] = cb.stroke[3] = 0.0f;
+    cb.params[0] = 3.0f; // "text" type marker (unused by shader; debug aid)
+    cb.params[1] = cb.params[2] = cb.params[3] = 0.0f;
+    cb.params2[0] = size.x * 0.5f;
+    cb.params2[1] = size.y * 0.5f;
+    cb.params2[2] = cb.params2[3] = 0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        std::memcpy(ms.pData, &cb, sizeof(cb));
+        context_->Unmap(cb_shape_, 0);
+    }
+    context_->PSSetShader(ps_text_, nullptr, 0);
+    context_->PSSetShaderResources(0, 1, &atlasSRV);
+    context_->PSSetSamplers(0, 1, &samp_linear_);
+    context_->DrawIndexed(6, 0, 0);
+    // Unbind the SRV so the next non-text draw doesn't accidentally sample it.
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    context_->PSSetShaderResources(0, 1, &nullSRV);
+}
+
 void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
                                        UINT targetW, UINT targetH,
                                        LayerManager& layerManager,
@@ -530,6 +606,19 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
                 DrawNullMarker(wm, sz, logicalW, logicalH); break;
             case ShapeType::Camera:
                 break;
+            case ShapeType::Text: {
+                // Task 5.9: Text layer. Uses the atlas dims (in pixels) as
+                // the quad size, so the DirectWrite-rasterized bitmap
+                // renders 1:1 at Scale=1. RenderEngine must have called
+                // TextRenderer::EnsureLayerCache before RenderLayers or
+                // the SRV will be null and DrawText silently no-ops.
+                if (layer.textSRV && layer.textTexW > 0 && layer.textTexH > 0) {
+                    const Vec2 atlasSz((float)layer.textTexW, (float)layer.textTexH);
+                    DrawText(wm, atlasSz, fillC, layer.textSRV.Get(),
+                             logicalW, logicalH);
+                }
+                break;
+            }
         }
     }
 }
