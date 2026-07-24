@@ -2480,12 +2480,25 @@ void RenderEngine::DrawViewportCanvas() {
                 // its first-pass write, then ping-pongs. To land the final
                 // result in a predictable SRV for the composite, always
                 // pass the OPPOSITE pool RT as destination.
-                effectManager.ApplyChain(effectManager.GetPingSRV(),
-                                         effectManager.GetPongRTV(),
-                                         perLayer);
-                // Composite pongSRV (final) over compRTV.
-                effectManager.CompositeSRVOver(effectManager.GetPongSRV(),
+                // ============ DIAGNOSTIC (Task 5.13-diag) ============
+                // Bypass ApplyChain entirely. Just composite pingSRV
+                // (which should contain the isolated shape drawn by
+                // RenderSingleLayer above) straight over compRTV.
+                //
+                // Read: if you see the ellipse rendered normally (WITHOUT
+                //   the chromatic RGB fringe), the shape draw works and
+                //   the bug lives inside ApplyChain / ps_chroma / pong.
+                // Read: if the ellipse STILL vanishes, the shape isn't
+                //   even landing in pingRTV — bug is in RenderSingleLayer
+                //   or in the clear/bind sequence right above.
+                //
+                // Passing `perLayer` to a no-op ApplyChain also lets us
+                // sanity-check that ApplyChain doesn't corrupt state.
+                // Comment / uncomment as needed.
+                (void)perLayer;
+                effectManager.CompositeSRVOver(effectManager.GetPingSRV(),
                                                compRTV);
+                // ============ END DIAGNOSTIC ============
             }
         }
     }
