@@ -63,6 +63,15 @@ public:
                     ID3D11RenderTargetView*   destinationRTV,
                     const std::vector<Effect>& effects);
 
+    // Task 5.13: composite an SRV over an RTV via SRC_ALPHA / INV_SRC_ALPHA
+    // blend. Used by the per-layer isolation dispatch to blit a filtered
+    // layer (from pingSRV) over the shared compRTV. Reads the source at
+    // full RT size — caller must ensure the source and destination have
+    // the same dims (they always do when both are our ping/pong RTs).
+    // Returns false if not initialized or if either handle is null.
+    bool CompositeSRVOver(ID3D11ShaderResourceView* srcSRV,
+                          ID3D11RenderTargetView*   dstRTV);
+
     // Direct access for the RenderEngine to blit intermediate results into
     // its own render target if it needs to. Both may be null before Initialize.
     ID3D11ShaderResourceView* GetPingSRV()   const { return ping_srv_; }
@@ -109,9 +118,24 @@ private:
 
     // One pixel shader per EffectType. Populated in Initialize().
     // Index = (int)EffectType. Slot may be null if compile failed — in that
-    // case the passthrough shader is used instead.
-    ID3D11PixelShader* effect_ps_[(int)EffectType::COUNT] = { nullptr, nullptr, nullptr, nullptr };
+    // case the passthrough shader is used instead. Zero-init via {} scales
+    // automatically when EffectType::COUNT grows.
+    ID3D11PixelShader* effect_ps_[(int)EffectType::COUNT] = {};
     ID3D11PixelShader* ps_passthrough_ = nullptr;
+
+    // Task 5.13: extra shaders for the per-layer isolation path.
+    //   ps_composite_ — plain SRV-over-RTV blit via alpha blend. Used to
+    //                   composite an isolated layer's post-effect result
+    //                   (in pingRTV) over the shared compRTV.
+    //   ps_dropshadow_offset_    — samples source with an offset+blur,
+    //                              tints by shadow color+opacity, writes
+    //                              a colored shadow into the destination.
+    //   ps_dropshadow_composite_ — samples TWO SRVs (blurred shadow at t0,
+    //                              original source at t1) and composites
+    //                              source-over-shadow into the destination.
+    ID3D11PixelShader* ps_composite_             = nullptr;
+    ID3D11PixelShader* ps_dropshadow_offset_     = nullptr;
+    ID3D11PixelShader* ps_dropshadow_composite_  = nullptr;
 
     UINT width_       = 0;
     UINT height_      = 0;

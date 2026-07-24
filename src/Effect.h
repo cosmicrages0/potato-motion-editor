@@ -20,6 +20,10 @@ enum class EffectType : int {
     DirectionalMotionBlur = 1,
     ChromaticAberration = 2,
     BlendMode           = 3, // Not a filter — sets how the layer composites over layers below
+    // Task 5.13: DropShadow — first per-layer isolation-mode effect.
+    // Runs two internal passes (offset+blur into pong, composite original
+    // over shadow into ping) via a dedicated shader that binds 2 SRVs.
+    DropShadow          = 4,
     COUNT
 };
 
@@ -81,6 +85,24 @@ struct Effect {
     static Effect MakeBlendMode(BlendMode mode) {
         Effect e; e.type = EffectType::BlendMode; e.displayName = "Blend Mode";
         e.params.p0[0] = (float)(int)mode;
+        return e;
+    }
+    // Task 5.13: Drop Shadow — 5-tap blurred offset copy of the layer,
+    // tinted by shadow color, composited behind the original.
+    //   p0.x = Distance (px)
+    //   p0.y = Angle (degrees, 0=right, 90=down)
+    //   p0.z = Softness (px, gaussian-ish radius)
+    //   p1.x = Opacity (0..1)
+    //   p2.xyz = Shadow color RGB (0..1)
+    static Effect MakeDropShadow() {
+        Effect e; e.type = EffectType::DropShadow; e.displayName = "Drop Shadow";
+        e.params.p0[0] = 5.0f;    // Distance
+        e.params.p0[1] = 135.0f;  // Angle (down-right, AE default)
+        e.params.p0[2] = 3.0f;    // Softness
+        e.params.p1[0] = 0.6f;    // Opacity
+        e.params.p2[0] = 0.0f;    // R
+        e.params.p2[1] = 0.0f;    // G
+        e.params.p2[2] = 0.0f;    // B (black shadow)
         return e;
     }
 };

@@ -793,3 +793,113 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
         context_->OMSetBlendState(blend_alpha_, blendFactor, 0xFFFFFFFF);
     }
 }
+
+// =============================================================================
+// Task 5.13: per-layer effect isolation helpers.
+//
+// ClearComp is a trivial RTV clear wrapped in the target/viewport bind
+// dance so callers don't have to know the pipeline state. Called once at
+// the top of every frame's per-layer loop before any layer draws.
+//
+// RenderSingleLayer factors out the per-layer body of RenderLayers (blend
+// state, visibility gate, opacity bake, per-shape dispatch). Same logic,
+// scoped to ONE layer, targeting a caller-supplied RTV. Used by the new
+// per-layer isolation path: layers WITH effects draw here into pingRTV
+// (transparent clear) then get their effect chain + composite back over
+// compRTV; layers WITHOUT effects draw here directly into compRTV.
+//
+// Deliberate design: RenderLayers is NOT refactored to call this. Both
+// paths are kept side-by-side because RenderLayers is what the export
+// pump still uses, and duplicating ~40 LOC of inner loop is cheaper than
+// risking a regression in the export path.
+// =============================================================================
+void CompositionRenderer::ClearComp(ID3D11RenderTargetView* rtv, const float rgba[4]) {
+    if (!initialized_ || !context_ || !rtv) return;
+    context_->OMSetRenderTargets(1, &rtv, nullptr);
+    context_->ClearRenderTargetView(rtv, rgba);
+}
+
+void CompositionRenderer::RenderSingleLayer(Layer& layer,
+                                             ID3D11RenderTargetView* targetRTV,
+                                             UINT targetW, UINT targetH,
+                                             LayerManager& layerManager,
+                                             UINT logicalW, UINT logicalH) {
+    if (!initialized_ || !context_ || !targetRTV) return;
+    if (targetW == 0 || targetH == 0) return;
+    if (!layer.isVisible) return;
+    if (layer.is3D)       return;
+    if (layer.type == ShapeType::Camera) return;
+
+    // Back-compat: caller sets logical=0 to default to viewport dims.
+    if (logicalW == 0) logicalW = targetW;
+    if (logicalH == 0) logicalH = targetH;
+
+    // Bind target + viewport. (Caller is responsible for the clear —
+    // isolation path clears to transparent, fast path clears to bgColor
+    // ONCE before the loop and then just accumulates via alpha blend.)
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)targetW, (float)targetH, 0.0f, 1.0f };
+    context_->RSSetViewports(1, &vp);
+    context_->OMSetRenderTargets(1, &targetRTV, nullptr);
+
+    // Pipeline state.
+    const float blendFactor[4] = { 0, 0, 0, 0 };
+    context_->IASetInputLayout(layout_);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const UINT stride = sizeof(QVert);
+    const UINT offset = 0;
+    context_->IASetVertexBuffers(0, 1, &vb_quad_, &stride, &offset);
+    context_->IASetIndexBuffer(ib_quad_, DXGI_FORMAT_R16_UINT, 0);
+    context_->VSSetShader(vs_, nullptr, 0);
+    context_->VSSetConstantBuffers(0, 1, &cb_shape_);
+    context_->PSSetConstantBuffers(0, 1, &cb_shape_);
+
+    // Per-layer blend state.
+    {
+        const int bi = (int)layer.blend;
+        ID3D11BlendState* bs = (bi >= 0 && bi < kBlendModeCount && blend_modes_[bi])
+                                    ? blend_modes_[bi]
+                                    : blend_alpha_;
+        context_->OMSetBlendState(bs, blendFactor, 0xFFFFFFFF);
+    }
+
+    const float compT = layerManager.CurrentCompTime();
+    const Mat3 wm = layerManager.GetWorldMatrix(layer.id);
+    const Vec2 sz = layer.transform.sizePixels.Evaluate(compT);
+
+    // Bake per-layer opacity into color alpha channel.
+    const float layerOp = layerManager.GetWorldOpacity(layer.id);
+    auto applyOp = [&](unsigned int c) -> unsigned int {
+        unsigned int a = (c >> 24) & 0xFFu;
+        a = (unsigned int)std::clamp((int)((float)a * layerOp), 0, 255);
+        return (c & 0x00FFFFFFu) | (a << 24);
+    };
+    const unsigned int fillC   = applyOp(layer.fillColor);
+    const unsigned int strokeC = applyOp(layer.strokeColor);
+    const float sw = layer.strokeWidth;
+    const float cr = layer.cornerRadius;
+
+    switch (layer.type) {
+        case ShapeType::Rectangle:
+            DrawRect(wm, sz, fillC, strokeC, sw, cr, logicalW, logicalH); break;
+        case ShapeType::Ellipse:
+            DrawEllipse(wm, sz, fillC, strokeC, sw, logicalW, logicalH); break;
+        case ShapeType::CustomPath:
+            DrawEllipse(wm, sz, fillC, strokeC, sw, logicalW, logicalH); break; // stub
+        case ShapeType::Null:
+            DrawNullMarker(wm, sz, logicalW, logicalH); break;
+        case ShapeType::Camera:
+            break;
+        case ShapeType::Text: {
+            if (layer.textSRV && layer.textTexW > 0 && layer.textTexH > 0) {
+                const Vec2 atlasSz((float)layer.textTexW, (float)layer.textTexH);
+                DrawText(wm, atlasSz, fillC, strokeC, sw,
+                         layer.textSRV.Get(),
+                         logicalW, logicalH);
+            }
+            break;
+        }
+    }
+
+    // Restore Normal blend for anything downstream.
+    context_->OMSetBlendState(blend_alpha_, blendFactor, 0xFFFFFFFF);
+}

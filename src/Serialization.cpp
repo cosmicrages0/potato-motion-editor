@@ -249,6 +249,7 @@ const char* EffectTypeToString(EffectType t) {
         case EffectType::DirectionalMotionBlur: return "DirectionalMotionBlur";
         case EffectType::ChromaticAberration:   return "ChromaticAberration";
         case EffectType::BlendMode:             return "BlendMode";
+        case EffectType::DropShadow:            return "DropShadow";   // Task 5.13
         case EffectType::COUNT:                 return "MotionTile";
     }
     return "MotionTile";
@@ -257,6 +258,7 @@ EffectType EffectTypeFromString(const std::string& s) {
     if (s == "DirectionalMotionBlur") return EffectType::DirectionalMotionBlur;
     if (s == "ChromaticAberration")   return EffectType::ChromaticAberration;
     if (s == "BlendMode")             return EffectType::BlendMode;
+    if (s == "DropShadow")            return EffectType::DropShadow;   // Task 5.13
     return EffectType::MotionTile;
 }
 

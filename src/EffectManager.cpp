@@ -190,6 +190,98 @@ float4 main(VSOut i) : SV_TARGET {
 )HLSL";
 
 // =============================================================================
+// Task 5.13: composite blit — sample the source SRV, output with alpha.
+// Blend state at draw time is SRC_ALPHA / INV_SRC_ALPHA, so this is a
+// standard "src over dst" composite. Used by CompositeSRVOver().
+// =============================================================================
+static const char* kPSComposite = R"HLSL(
+Texture2D    tex : register(t0);
+SamplerState smp : register(s0);
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+float4 main(VSOut i) : SV_TARGET {
+    return tex.Sample(smp, i.uv);
+}
+)HLSL";
+
+// =============================================================================
+// Task 5.13: Drop Shadow — offset+blur pass. Samples the source at a shifted
+// UV, applies a 5-tap gaussian-ish blur along the perpendicular axis for
+// softness, tints by shadow color and multiplies by opacity. Writes the
+// colored shadow into the destination (typically pongRTV).
+//
+// CB layout matches EffectParams:
+//   p0.x = Distance (px)
+//   p0.y = Angle (degrees, 0=right, 90=down)
+//   p0.z = Softness (px)
+//   p1.x = Opacity (0..1)
+//   p2.xyz = Shadow color RGB (0..1)
+//   p3.xy = RT dims (px, filled in per-frame by the caller so px->UV
+//           conversion is correct at any composition size)
+// =============================================================================
+static const char* kPSDropShadowOffset = R"HLSL(
+cbuffer EffectCB : register(b0) { float4 p0; float4 p1; float4 p2; float4 p3; };
+Texture2D    tex : register(t0);
+SamplerState smp : register(s0);
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+
+float4 main(VSOut i) : SV_TARGET {
+    float dist    = p0.x;
+    float ang     = radians(p0.y);
+    float soft    = max(p0.z, 0.0);
+    float opacity = saturate(p1.x);
+    float3 color  = p2.xyz;
+    float2 rtDim  = max(p3.xy, float2(1.0, 1.0));
+
+    // Offset applied INVERSELY on the sample coord — sampling further back
+    // gives the visual sense that the shadow shifted forward.
+    float2 offsetPx = float2(cos(ang), sin(ang)) * dist;
+    float2 offsetUV = offsetPx / rtDim;
+    float2 srcUV    = i.uv - offsetUV;
+
+    // 5-tap blur along the perpendicular axis for softness. Cheap; not a
+    // proper 2D gaussian but visually reads as 'blurred shadow' up to
+    // ~10 px softness which is what users actually crank to.
+    float2 perp = float2(-sin(ang), cos(ang)) * (soft / rtDim);
+    float alpha = 0.0;
+    alpha += tex.Sample(smp, srcUV - 2.0 * perp).a * 0.06;
+    alpha += tex.Sample(smp, srcUV - 1.0 * perp).a * 0.24;
+    alpha += tex.Sample(smp, srcUV                ).a * 0.40;
+    alpha += tex.Sample(smp, srcUV + 1.0 * perp).a * 0.24;
+    alpha += tex.Sample(smp, srcUV + 2.0 * perp).a * 0.06;
+
+    // Discard nearly-transparent pixels so the composite pass doesn't
+    // spend ROP bandwidth on empty shadow area.
+    if (alpha < 0.001) discard;
+    return float4(color, alpha * opacity);
+}
+)HLSL";
+
+// =============================================================================
+// Task 5.13: Drop Shadow composite. Samples TWO textures — the blurred
+// colored shadow (t0, from the offset pass) and the ORIGINAL untinted
+// source (t1, the input to the whole effect). Composites source-over-shadow
+// so the actual layer sits IN FRONT of its shadow. Blend state at draw
+// time is Normal — this shader outputs the final composited RGBA which
+// then blends onto whatever's below via the outer composite pass.
+// =============================================================================
+static const char* kPSDropShadowComposite = R"HLSL(
+Texture2D    shadowTex  : register(t0);
+Texture2D    sourceTex  : register(t1);
+SamplerState smp        : register(s0);
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+
+float4 main(VSOut i) : SV_TARGET {
+    float4 sh  = shadowTex.Sample(smp, i.uv);
+    float4 src = sourceTex.Sample(smp, i.uv);
+    // Alpha-over: source on top of shadow.
+    float outA = src.a + sh.a * (1.0 - src.a);
+    float3 outRGB = src.rgb * src.a + sh.rgb * sh.a * (1.0 - src.a);
+    if (outA > 0.001) outRGB /= outA;
+    return float4(outRGB, outA);
+}
+)HLSL";
+
+// =============================================================================
 // Vertex data: one fullscreen triangle in NDC with UVs.
 // (A triangle covers the entire screen more efficiently than a quad — one
 // fewer vertex shader invocation and no diagonal seam.)
@@ -255,6 +347,10 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
 
     // 3) Per-effect PS with pass-through fallback so a broken shader never
     //    takes down the app.
+    // Task 5.13: DropShadow slot in effect_ps_ stays null on purpose — the
+    // effect uses its own two-pass composite (ps_dropshadow_offset_ +
+    // ps_dropshadow_composite_) invoked directly from ApplyChain instead
+    // of the single-PS fullscreen dispatch used by simple effects.
     struct { EffectType t; const char* src; } entries[] = {
         { EffectType::MotionTile,             kPSMotionTile },
         { EffectType::DirectionalMotionBlur,  kPSMotionBlur },
@@ -267,6 +363,13 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
         // Note: if we assigned the passthrough as fallback, we do NOT own it
         // in the per-effect slot — Shutdown() must not release it twice.
     }
+
+    // Task 5.13: three extra PS for the per-layer isolation path.
+    // Non-fatal on failure — DropShadow / composite would just no-op, so
+    // the app stays runnable even if HLSL parsing hits a hardware quirk.
+    ps_composite_            = CompilePS(kPSComposite,            "main");
+    ps_dropshadow_offset_    = CompilePS(kPSDropShadowOffset,     "main");
+    ps_dropshadow_composite_ = CompilePS(kPSDropShadowComposite,  "main");
 
     // 4) Fullscreen triangle VB
     {
@@ -457,24 +560,116 @@ bool EffectManager::ApplyChain(ID3D11ShaderResourceView* sourceSRV,
         return true;
     }
 
-    // Ping-pong: we start reading from sourceSRV and writing to ping_rtv_.
-    // After the first pass, subsequent passes read the previous output SRV.
+    // Ping-pong: we start reading from sourceSRV and writing to whichever
+    // of the two pool RTs does NOT back sourceSRV — otherwise the first
+    // pass would try to bind the same texture as both SRV and RTV, which
+    // D3D11 refuses. When sourceSRV points OUTSIDE the pool (typical
+    // pre-5.13 case: compSRV or an atlas SRV), start on pingRTV. When it
+    // points AT pingSRV (Task 5.13 per-layer isolation path), start on
+    // pongRTV. When it points at pongSRV, start on pingRTV. This makes
+    // the function work correctly no matter which ping/pong texture the
+    // caller staged the source into.
     D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f };
     context_->RSSetViewports(1, &vp);
 
-    ID3D11ShaderResourceView* readSRV = sourceSRV;
-    ID3D11RenderTargetView*   writeRTV = ping_rtv_;
-    ID3D11ShaderResourceView* writeSRV = ping_srv_;
-    ID3D11RenderTargetView*   otherRTV = pong_rtv_;
-    ID3D11ShaderResourceView* otherSRV = pong_srv_;
+    ID3D11ShaderResourceView* readSRV  = sourceSRV;
+    ID3D11RenderTargetView*   writeRTV;
+    ID3D11ShaderResourceView* writeSRV;
+    ID3D11RenderTargetView*   otherRTV;
+    ID3D11ShaderResourceView* otherSRV;
+    if (sourceSRV == ping_srv_) {
+        writeRTV = pong_rtv_;  writeSRV = pong_srv_;
+        otherRTV = ping_rtv_;  otherSRV = ping_srv_;
+    } else {
+        writeRTV = ping_rtv_;  writeSRV = ping_srv_;
+        otherRTV = pong_rtv_;  otherSRV = pong_srv_;
+    }
+
+    // Task 5.13: parity-safe destination handling.
+    //
+    // Old code: last pass writes directly into destinationRTV. That breaks
+    // when destinationRTV is the same texture as readSRV on the last pass
+    // (e.g. dest=pongRTV, chain length 2 -> readSRV=pongSRV at pass 2).
+    // We can't bind the same texture as SRV and RTV in one draw.
+    //
+    // Fix: NEVER let the loop write directly to destinationRTV. Every
+    // pass, including the last, writes into a pool RT. After the loop,
+    // do ONE extra passthrough copy from the last-written pool SRV into
+    // destinationRTV. Costs one fullscreen quad per chain — trivial.
+    ID3D11ShaderResourceView* finalOutputSRV = nullptr;
 
     size_t applied = 0;
     for (const auto& eff : effects) {
         if (!eff.enabled) continue;
         const bool isLast = (++applied == enabledCount);
+        (void)isLast; // no longer differentiates dst — kept for clarity below
 
-        ID3D11RenderTargetView* dst = isLast ? destinationRTV : writeRTV;
+        // -------------------------------------------------------------
+        // Task 5.13: DropShadow is a COMPOUND effect — two internal
+        // passes with two SRVs bound simultaneously in pass 2. Handled
+        // out-of-band; the simple single-PS path below takes everything
+        // else.
+        // Pass 1 (offset+blur): writes colored shadow into writeRTV,
+        // reading only from readSRV. Safe because writeRTV backs a
+        // different texture than readSRV (post-swap invariant).
+        // Pass 2 (composite):   samples writeSRV (shadow) at t0 and
+        // readSRV (original) at t1, writes final composited RGBA into
+        // `dst`. When !isLast, dst is otherRTV (the free RT); when
+        // isLast, dst is the caller's destinationRTV.
+        // -------------------------------------------------------------
+        if (eff.type == EffectType::DropShadow &&
+            ps_dropshadow_offset_ && ps_dropshadow_composite_) {
+            // Upload params + inject RT dims into p3.xy for px->UV math.
+            EffectParams pp = eff.params;
+            pp.p3[0] = (float)width_;
+            pp.p3[1] = (float)height_;
+            D3D11_MAPPED_SUBRESOURCE ms1;
+            if (SUCCEEDED(context_->Map(cb_effect_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms1))) {
+                std::memcpy(ms1.pData, &pp, sizeof(EffectParams));
+                context_->Unmap(cb_effect_, 0);
+            }
+            // Pass 1: clear writeRTV to transparent so residual pixels
+            // from a previous effect or previous frame don't leak into
+            // the shadow. Then offset+blur into writeRTV from readSRV.
+            const float transparent[4] = { 0, 0, 0, 0 };
+            context_->OMSetRenderTargets(1, &writeRTV, nullptr);
+            context_->ClearRenderTargetView(writeRTV, transparent);
+            DrawFullscreenPass(ps_dropshadow_offset_, readSRV);
 
+            // Pass 2: composite. Bind t0=writeSRV (shadow), t1=readSRV.
+            // Task 5.13: always write into otherRTV (the free pool RT).
+            // Post-loop passthrough copies the final pool SRV into the
+            // caller's destinationRTV.
+            const float transparent2[4] = { 0, 0, 0, 0 };
+            context_->OMSetRenderTargets(1, &otherRTV, nullptr);
+            context_->ClearRenderTargetView(otherRTV, transparent2);
+            ID3D11ShaderResourceView* twoSRVs[2] = { writeSRV, readSRV };
+            const UINT stride = sizeof(FullscreenVert);
+            const UINT offset = 0;
+            context_->IASetInputLayout(input_layout_);
+            context_->IASetVertexBuffers(0, 1, &vb_fullscreen_, &stride, &offset);
+            context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context_->VSSetShader(vs_fullscreen_, nullptr, 0);
+            context_->PSSetShader(ps_dropshadow_composite_, nullptr, 0);
+            context_->PSSetConstantBuffers(0, 1, &cb_effect_);
+            context_->PSSetSamplers(0, 1, &linear_clamp_);
+            context_->PSSetShaderResources(0, 2, twoSRVs);
+            context_->Draw(3, 0);
+            // Unbind both SRVs so the next pass can bind them as RTVs.
+            ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+            context_->PSSetShaderResources(0, 2, nullSRVs);
+
+            // Composite result now lives in otherRTV/otherSRV.
+            finalOutputSRV = otherSRV;
+            readSRV = otherSRV;
+            std::swap(writeRTV, otherRTV);
+            std::swap(writeSRV, otherSRV);
+            continue;
+        }
+
+        // Task 5.13: simple effect always writes into pool writeRTV
+        // (never destinationRTV directly). Post-loop copies the final
+        // pool SRV into destinationRTV.
         // Upload params
         D3D11_MAPPED_SUBRESOURCE ms;
         if (SUCCEEDED(context_->Map(cb_effect_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
@@ -482,7 +677,7 @@ bool EffectManager::ApplyChain(ID3D11ShaderResourceView* sourceSRV,
             context_->Unmap(cb_effect_, 0);
         }
 
-        context_->OMSetRenderTargets(1, &dst, nullptr);
+        context_->OMSetRenderTargets(1, &writeRTV, nullptr);
 
         const int idx = (int)eff.type;
         ID3D11PixelShader* ps = (idx >= 0 && idx < (int)EffectType::COUNT)
@@ -490,14 +685,62 @@ bool EffectManager::ApplyChain(ID3D11ShaderResourceView* sourceSRV,
         if (!ps) ps = ps_passthrough_;
 
         DrawFullscreenPass(ps, readSRV);
+        finalOutputSRV = writeSRV;
 
-        if (!isLast) {
-            // Next pass reads what we just wrote.
-            readSRV  = writeSRV;
-            std::swap(writeRTV, otherRTV);
-            std::swap(writeSRV, otherSRV);
-        }
+        // Always swap after each pass — even the last one, so the
+        // finalOutputSRV pointer stays synchronised with what we just
+        // wrote.
+        readSRV  = writeSRV;
+        std::swap(writeRTV, otherRTV);
+        std::swap(writeSRV, otherSRV);
     }
+
+    // Task 5.13: post-loop copy from finalOutputSRV into destinationRTV.
+    // Passthrough shader is a plain SRV-to-RT blit. This handles all
+    // parity cases (even/odd effect count) AND the DropShadow output
+    // uniformly — the destination is guaranteed to be safe to bind
+    // because it's not one of our pool textures (unless caller
+    // deliberately passed one; if they did, we skip the copy and the
+    // result already sits in the right place).
+    if (finalOutputSRV) {
+        if (destinationRTV != ping_rtv_ &&
+            destinationRTV != pong_rtv_) {
+            // Normal case: destination is external (e.g. compRTV). Blit.
+            D3D11_VIEWPORT vp2 = { 0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f };
+            context_->RSSetViewports(1, &vp2);
+            context_->OMSetRenderTargets(1, &destinationRTV, nullptr);
+            DrawFullscreenPass(ps_passthrough_, finalOutputSRV);
+        } else if ((destinationRTV == ping_rtv_ && finalOutputSRV != ping_srv_) ||
+                   (destinationRTV == pong_rtv_ && finalOutputSRV != pong_srv_)) {
+            // Destination is a pool RT AND source is the other pool SRV
+            // (different texture) — safe to blit.
+            D3D11_VIEWPORT vp2 = { 0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f };
+            context_->RSSetViewports(1, &vp2);
+            context_->OMSetRenderTargets(1, &destinationRTV, nullptr);
+            DrawFullscreenPass(ps_passthrough_, finalOutputSRV);
+        }
+        // Otherwise: destination and source refer to the same pool
+        // texture. Result is already there — no copy needed.
+    }
+    return true;
+}
+
+// Task 5.13: composite one SRV over an RTV. Standard SRC_ALPHA /
+// INV_SRC_ALPHA blend. Used by the per-layer isolation path to blit a
+// filtered layer (pingSRV, containing the layer post-effects) over the
+// shared compRTV. Set the blend state locally so we don't rely on
+// whatever the caller left bound.
+bool EffectManager::CompositeSRVOver(ID3D11ShaderResourceView* srcSRV,
+                                     ID3D11RenderTargetView*   dstRTV) {
+    if (!initialized_ || !context_) return false;
+    if (!srcSRV || !dstRTV || !ps_composite_) return false;
+    D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)width_, (float)height_, 0.0f, 1.0f };
+    context_->RSSetViewports(1, &vp);
+    context_->OMSetRenderTargets(1, &dstRTV, nullptr);
+    // Alpha-over: our source RGBA composites onto whatever's in dst.
+    const float blendFactor[4] = { 0, 0, 0, 0 };
+    context_->OMSetBlendState(blend_normal_, blendFactor, 0xFFFFFFFF);
+    DrawFullscreenPass(ps_composite_, srcSRV);
     return true;
 }
 
@@ -511,6 +754,10 @@ void EffectManager::Shutdown() {
         effect_ps_[i] = nullptr;
     }
     if (ps_passthrough_) { ps_passthrough_->Release(); ps_passthrough_ = nullptr; }
+    // Task 5.13: extra PS for the per-layer isolation path.
+    if (ps_composite_)             { ps_composite_->Release();             ps_composite_             = nullptr; }
+    if (ps_dropshadow_offset_)     { ps_dropshadow_offset_->Release();     ps_dropshadow_offset_     = nullptr; }
+    if (ps_dropshadow_composite_)  { ps_dropshadow_composite_->Release();  ps_dropshadow_composite_  = nullptr; }
     if (vs_fullscreen_)  { vs_fullscreen_->Release();  vs_fullscreen_  = nullptr; }
     if (input_layout_)   { input_layout_->Release();   input_layout_   = nullptr; }
     if (vb_fullscreen_)  { vb_fullscreen_->Release();  vb_fullscreen_  = nullptr; }

@@ -77,6 +77,40 @@ public:
                       UINT logicalW = 0, UINT logicalH = 0,
                       float compDuration = 0.0f);
 
+    // -------------------------------------------------------------------
+    // Task 5.13: per-layer effect isolation helpers.
+    //
+    // RenderEngine now dispatches PER LAYER: layers with no effects go
+    // straight into compRTV (fast path), layers WITH effects go through
+    // the ping-pong isolation dance below. These small methods factor out
+    // the pieces:
+    //
+    //   ClearComp          — clear an RT to the composition background.
+    //                        Used at the top of every frame before the
+    //                        per-layer loop.
+    //   RenderSingleLayer  — draw ONE layer into a caller-supplied RT.
+    //                        Same visibility / trim gate + per-shape
+    //                        dispatch as RenderLayers but scoped to a
+    //                        single layer. Skips 3D / Camera silently.
+    //   CompositeOver      — blit srcSRV over dstRTV using standard
+    //                        SRC_ALPHA / INV_SRC_ALPHA blend. Used after
+    //                        an isolation-mode layer's effects finish
+    //                        writing to pingRTV.
+    //
+    // RenderLayers stays as a thin wrapper that internally calls
+    // RenderSingleLayer per layer for the fast-path use case. Backward-
+    // compat: every pre-5.13 caller of RenderLayers keeps working.
+    // -------------------------------------------------------------------
+    void ClearComp(ID3D11RenderTargetView* rtv, const float rgba[4]);
+    void RenderSingleLayer(Layer& layer,
+                           ID3D11RenderTargetView* targetRTV,
+                           UINT targetW, UINT targetH,
+                           LayerManager& layerManager,
+                           UINT logicalW, UINT logicalH);
+    // (The composite-over-RT blit lives in EffectManager since it owns
+    //  the fullscreen VS/PS + samp + ping-pong RTs already. See
+    //  EffectManager::CompositeSRVOver().)
+
 private:
     bool CreateShaders();
     bool CreateBuffers();

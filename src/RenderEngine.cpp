@@ -728,6 +728,8 @@ void RenderEngine::RenderAEDockingLayout() {
             if (ImGui::MenuItem("Add Motion Tile"))         addFx(Effect::MakeMotionTile());
             if (ImGui::MenuItem("Add Directional Motion Blur")) addFx(Effect::MakeMotionBlur());
             if (ImGui::MenuItem("Add Chromatic Aberration")) addFx(Effect::MakeChromaticAberration());
+            // Task 5.13: DropShadow — the per-layer isolation demonstrator.
+            if (ImGui::MenuItem("Add Drop Shadow"))         addFx(Effect::MakeDropShadow());
             ImGui::Separator();
             if (ImGui::BeginMenu("Add Blend Mode")) {
                 if (ImGui::MenuItem("Normal"))     addFx(Effect::MakeBlendMode(BlendMode::Normal));
@@ -2403,39 +2405,88 @@ void RenderEngine::DrawViewportCanvas() {
         // last frame. Fast-path when nothing changed (hash compare only).
         RefreshTextLayerCaches();
 
-        // Task 5.10: pass animEngine.duration as compDuration so the
-        // per-layer visibility gate can resolve the outPoint=-1 sentinel
-        // to "extends to comp end". Also feeds the trim gate that skips
-        // rendering trimmed-out layers entirely.
-        compRenderer.RenderLayers(compRTV, compTextureWidth, compTextureHeight,
-                                  layerManager, bgColor,
-                                  (UINT)compositionWidth, (UINT)compositionHeight,
-                                  animEngine.duration);
+        // -------------------------------------------------------------------
+        // Task 5.13: per-layer effect isolation. Complete rewrite of the
+        // previous composition-wide effect pooling.
+        //
+        // For each visible layer in draw order (matches CompositionRenderer's
+        // internal loop):
+        //   * If the layer has NO enabled effects: fast path — draw the
+        //     layer directly into compRTV via RenderSingleLayer. This is
+        //     Gemini's 'batching by default' from the RFC — typical scenes
+        //     are 80%+ effect-free layers that pay zero effect cost.
+        //   * If the layer HAS enabled effects: isolation path.
+        //       1. Clear pingRTV to transparent (so alpha compositing works).
+        //       2. Draw ONLY this layer into pingRTV.
+        //       3. Run its effect chain: ApplyChain(pingSRV -> pongRTV).
+        //          The chain's first pass detects pingSRV as source and
+        //          starts writing to pongRTV automatically (see the
+        //          same-texture-avoidance logic in ApplyChain).
+        //       4. Composite the final pongSRV (or pingSRV — parity of
+        //          effect count) over compRTV via CompositeSRVOver.
+        //     Both ping and pong are shared across every isolated layer
+        //     in the frame — VRAM stays at 2 * compRT size no matter how
+        //     many layers have effects. Matches the exact-2-RT constraint.
+        //
+        // Comp duration for the visibility gate is still animEngine.duration.
+        // Trim (in/out) check happens inside RenderSingleLayer's callers below.
+        // -------------------------------------------------------------------
+        // Start every frame by clearing compRTV to the user's bg color.
+        // (Was previously done by RenderLayers as part of its first pass.)
+        compRenderer.ClearComp(compRTV, bgColor);
 
-        // 2) If ANY layer has an enabled effect, run its chain against the
-        //    whole composition. NOTE: this is a composition-wide effect model
-        //    (all shapes go through the same chain), not per-layer effects.
-        //    We use the FIRST layer's effect stack that has enabled entries;
-        //    per-layer isolated effect passes will land in Task 5.5.
+        const float compT = layerManager.CurrentCompTime();
+        const float dur   = animEngine.duration;
         anyLayerHasEffects = false;
-        std::vector<Effect> combined;
         for (auto& layer : layerManager.Layers()) {
+            // Visibility + trim gate — mirror CompositionRenderer's rules.
             if (!layer.isVisible) continue;
-            for (auto& e : layer.effects) {
-                if (e.enabled) { combined.push_back(e); anyLayerHasEffects = true; }
+            if (layer.is3D)       continue;
+            if (layer.type == ShapeType::Camera) continue;
+            const float outT = (layer.outPoint < 0.0f)
+                                    ? (dur > 0.0f ? dur : 1e9f)
+                                    : layer.outPoint;
+            if (compT < layer.inPoint || compT > outT) continue;
+
+            const bool hasFx = layer.HasAnyEnabledEffect();
+            if (hasFx) anyLayerHasEffects = true;
+
+            if (!hasFx || !effectManager.IsReady()) {
+                // Fast path: draw straight into compRTV (batching by default).
+                compRenderer.RenderSingleLayer(layer, compRTV,
+                                               compTextureWidth, compTextureHeight,
+                                               layerManager,
+                                               (UINT)compositionWidth,
+                                               (UINT)compositionHeight);
+            } else {
+                // Isolation path.
+                effectManager.Resize(compTextureWidth, compTextureHeight);
+                const float transparent[4] = { 0, 0, 0, 0 };
+                compRenderer.ClearComp(effectManager.GetPingRTV(), transparent);
+                compRenderer.RenderSingleLayer(layer,
+                                               effectManager.GetPingRTV(),
+                                               compTextureWidth, compTextureHeight,
+                                               layerManager,
+                                               (UINT)compositionWidth,
+                                               (UINT)compositionHeight);
+                // Build a small vector of just this layer's enabled effects.
+                std::vector<Effect> perLayer;
+                perLayer.reserve(layer.effects.size());
+                for (const auto& e : layer.effects) {
+                    if (e.enabled) perLayer.push_back(e);
+                }
+                // Pick the destination: ApplyChain's parity-agnostic write
+                // path uses whichever pool RT ISN'T the source's texture as
+                // its first-pass write, then ping-pongs. To land the final
+                // result in a predictable SRV for the composite, always
+                // pass the OPPOSITE pool RT as destination.
+                effectManager.ApplyChain(effectManager.GetPingSRV(),
+                                         effectManager.GetPongRTV(),
+                                         perLayer);
+                // Composite pongSRV (final) over compRTV.
+                effectManager.CompositeSRVOver(effectManager.GetPongSRV(),
+                                               compRTV);
             }
-        }
-        if (anyLayerHasEffects && effectManager.IsReady()) {
-            // Resize ping-pong to match composition if it drifted.
-            effectManager.Resize(compTextureWidth, compTextureHeight);
-            // Run chain: read compSRV -> write into ping's RT -> ... -> final into compRTV.
-            // But we can't read and write the same texture in one pass; the
-            // chain writes to its own ping-pong then we need one more blit
-            // back into compTexture so the ImGui::Image below shows the
-            // filtered result. ApplyChain writes the FINAL result into
-            // whatever dstRTV we pass, so pass compRTV as final destination
-            // AFTER first blitting compSRV into ping (chain naturally handles this).
-            effectManager.ApplyChain(compSRV, compRTV, combined);
         }
     }
 
@@ -2930,6 +2981,8 @@ void RenderEngine::DrawEffectsPalettePanel() {
     addRow("Motion Tile",             "Repeats and (optionally) mirrors the layer across UV space.", Effect::MakeMotionTile);
     addRow("Directional Motion Blur", "Blurs the layer along an angle. Cap: 16 samples for potato GPUs.", Effect::MakeMotionBlur);
     addRow("Chromatic Aberration",    "Offsets R/G/B channels radially or along an angle.", Effect::MakeChromaticAberration);
+    // Task 5.13: DropShadow — first per-layer isolation-mode effect.
+    addRow("Drop Shadow",             "Colored offset+blurred copy behind the layer. Per-layer only.", Effect::MakeDropShadow);
 
     ImGui::Separator();
     ImGui::TextDisabled("Blend Modes");
@@ -3021,6 +3074,14 @@ void RenderEngine::DrawEffectControlsPanel() {
             if (ImGui::Combo("Mode", &mode, kNames, 6)) e.params.p0[0] = (float)mode;
             break;
         }
+        case EffectType::DropShadow:
+            // Task 5.13: Distance / Angle / Softness / Opacity / Color.
+            ImGui::SliderFloat("Distance (px)",   &e.params.p0[0], 0.0f, 100.0f);
+            ImGui::SliderFloat("Angle (deg)",     &e.params.p0[1], 0.0f, 360.0f);
+            ImGui::SliderFloat("Softness (px)",   &e.params.p0[2], 0.0f, 32.0f);
+            ImGui::SliderFloat("Opacity",         &e.params.p1[0], 0.0f, 1.0f);
+            ImGui::ColorEdit3("Shadow Color",     e.params.p2);
+            break;
         case EffectType::COUNT: break;
         }
         ImGui::Unindent();
@@ -3032,10 +3093,9 @@ void RenderEngine::DrawEffectControlsPanel() {
     if (moveEffectId >= 0) { MarkForSnapshot(); sel->MoveEffect(moveEffectId, moveDelta); }
     if (deleteId     >= 0) { MarkForSnapshot(); sel->RemoveEffectById(deleteId); }
 
-    ImGui::TextDisabled("Task 5.0: effects now visually apply to the whole");
-    ImGui::TextDisabled("composition (all enabled effects across all layers");
-    ImGui::TextDisabled("combine into one chain). Per-layer isolated passes");
-    ImGui::TextDisabled("land in Task 5.5.");
+    ImGui::TextDisabled("Task 5.13: effects now apply PER LAYER — adding an");
+    ImGui::TextDisabled("effect here only affects THIS layer, not the whole comp.");
+    ImGui::TextDisabled("Layers without effects skip the ping-pong dance entirely.");
 }
 
 // =============================================================================
@@ -4454,33 +4514,56 @@ void RenderEngine::PumpExportOneFrameIfActive() {
         // is BGRA and ffmpeg is told "bgra" (meaning bytes B,G,R,A),
         // everything lines up naturally with NO swap. The color shows
         // correctly.
-        // Task 5.8: export ALWAYS renders at full comp resolution (preview
-        // scale is a viewport-perf knob and doesn't touch the export path).
-        // After Task 6.1, export dims equal comp dims already — pass comp
-        // dims as logical for explicit safety even so.
-        // Task 5.10: same visibility gate as viewport — trimmed-out
-        // layers don't render in the exported MP4.
-        compRenderer.RenderLayers(rtv, (UINT)exportEngine.Width(),
-                                  (UINT)exportEngine.Height(),
-                                  layerManager, bg,
-                                  (UINT)compositionWidth, (UINT)compositionHeight,
-                                  animEngine.duration);
+        // Task 5.13: export uses the SAME per-layer isolation dispatch as
+        // the viewport (see DrawViewportCanvas for the full commentary).
+        // Layers without effects draw straight to the export RT (fast
+        // path). Layers with effects go through the ping-pong dance +
+        // composite over the export RT.
+        //
+        // Task 5.8 / 6.1: full comp resolution export, comp dims = export
+        // dims.
+        compRenderer.ClearComp(rtv, bg);
 
-        // Apply the effect chain if any layer has effects enabled.
-        if (anyLayerHasEffects && effectManager.IsReady()) {
-            effectManager.Resize((UINT)exportEngine.Width(),
-                                 (UINT)exportEngine.Height());
-            std::vector<Effect> combined;
-            for (auto& layer : layerManager.Layers()) {
-                if (!layer.isVisible) continue;
-                for (auto& e : layer.effects) {
-                    if (e.enabled) combined.push_back(e);
+        const float compT = layerManager.CurrentCompTime();
+        const float dur   = animEngine.duration;
+        effectManager.Resize((UINT)exportEngine.Width(),
+                             (UINT)exportEngine.Height());
+        for (auto& layer : layerManager.Layers()) {
+            if (!layer.isVisible) continue;
+            if (layer.is3D)       continue;
+            if (layer.type == ShapeType::Camera) continue;
+            const float outT = (layer.outPoint < 0.0f)
+                                    ? (dur > 0.0f ? dur : 1e9f)
+                                    : layer.outPoint;
+            if (compT < layer.inPoint || compT > outT) continue;
+
+            const bool hasFx = layer.HasAnyEnabledEffect();
+            if (!hasFx || !effectManager.IsReady()) {
+                compRenderer.RenderSingleLayer(layer, rtv,
+                                               (UINT)exportEngine.Width(),
+                                               (UINT)exportEngine.Height(),
+                                               layerManager,
+                                               (UINT)compositionWidth,
+                                               (UINT)compositionHeight);
+            } else {
+                const float transparent[4] = { 0, 0, 0, 0 };
+                compRenderer.ClearComp(effectManager.GetPingRTV(), transparent);
+                compRenderer.RenderSingleLayer(layer,
+                                               effectManager.GetPingRTV(),
+                                               (UINT)exportEngine.Width(),
+                                               (UINT)exportEngine.Height(),
+                                               layerManager,
+                                               (UINT)compositionWidth,
+                                               (UINT)compositionHeight);
+                std::vector<Effect> perLayer;
+                perLayer.reserve(layer.effects.size());
+                for (const auto& e : layer.effects) {
+                    if (e.enabled) perLayer.push_back(e);
                 }
-            }
-            if (!combined.empty()) {
-                // Chain reads from the export SRV -> writes into the export RTV.
-                effectManager.ApplyChain(exportEngine.GetShaderResourceView(),
-                                         rtv, combined);
+                effectManager.ApplyChain(effectManager.GetPingSRV(),
+                                         effectManager.GetPongRTV(),
+                                         perLayer);
+                effectManager.CompositeSRVOver(effectManager.GetPongSRV(), rtv);
             }
         }
     }
