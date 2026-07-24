@@ -65,11 +65,17 @@ public:
     //                  correct.
     // Backward-compat: when logicalW/H are 0 they default to targetW/H so
     // every pre-5.8 caller keeps rendering exactly as before.
+    // Task 5.10: added `compDuration` param so the per-layer visibility
+    // gate can resolve the `outPoint = -1` sentinel to "extends to comp
+    // end". Defaults to 0.0f for source-compat with pre-5.10 callers:
+    // then any negative sentinel is treated as "always visible" (also
+    // reproduces pre-5.10 behavior — the layer just draws every frame).
     void RenderLayers(ID3D11RenderTargetView* targetRTV,
                       UINT targetW, UINT targetH,
                       LayerManager& layerManager,
                       const float bgColor[4],
-                      UINT logicalW = 0, UINT logicalH = 0);
+                      UINT logicalW = 0, UINT logicalH = 0,
+                      float compDuration = 0.0f);
 
 private:
     bool CreateShaders();
@@ -137,6 +143,12 @@ private:
     ID3D11Buffer*         vb_quad_     = nullptr;   // 4 verts covering [-0.5,+0.5]
     ID3D11Buffer*         ib_quad_     = nullptr;   // 6 indices (two tris)
     ID3D11BlendState*     blend_alpha_ = nullptr;
+    // Task 5.10: per-layer blend states, indexed by (int)BlendMode.
+    // Precomputed at Initialize; released in ReleaseAll. Table lookup
+    // at draw time: OMSetBlendState(blend_modes_[(int)layer.blend]).
+    // Falls back to blend_alpha_ (Normal) for out-of-range values.
+    static constexpr int kBlendModeCount = 6; // matches Effect.h enum size
+    ID3D11BlendState*     blend_modes_[kBlendModeCount] = {};
 
     bool initialized_ = false;
 };

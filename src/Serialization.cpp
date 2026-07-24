@@ -260,6 +260,28 @@ EffectType EffectTypeFromString(const std::string& s) {
     return EffectType::MotionTile;
 }
 
+// Task 5.10: per-layer BlendMode <-> string. Same enum as EffectType's
+// BlendMode effect (Effect.h) — one BlendMode type in the codebase.
+const char* BlendModeToString(BlendMode b) {
+    switch (b) {
+        case BlendMode::Normal:     return "Normal";
+        case BlendMode::Additive:   return "Additive";
+        case BlendMode::Multiply:   return "Multiply";
+        case BlendMode::Screen:     return "Screen";
+        case BlendMode::Overlay:    return "Overlay";
+        case BlendMode::ColorDodge: return "ColorDodge";
+    }
+    return "Normal";
+}
+BlendMode BlendModeFromString(const std::string& s) {
+    if (s == "Additive")   return BlendMode::Additive;
+    if (s == "Multiply")   return BlendMode::Multiply;
+    if (s == "Screen")     return BlendMode::Screen;
+    if (s == "Overlay")    return BlendMode::Overlay;
+    if (s == "ColorDodge") return BlendMode::ColorDodge;
+    return BlendMode::Normal;
+}
+
 // ---- Effect <-> JSON --------------------------------------------------------
 json WriteEffect(const Effect& e) {
     json out;
@@ -347,6 +369,11 @@ json WriteLayer(const Layer& L) {
     out["strokeColor"]   = FillColorToHex(L.strokeColor);
     out["strokeWidth"]   = L.strokeWidth;
     out["cornerRadius"]  = L.cornerRadius;
+    // Task 5.10: trim + blend. Only emit non-default values so pre-5.10
+    // untrimmed unblended layers save byte-identical to before.
+    if (L.inPoint  != 0.0f)               out["inPoint"]  = L.inPoint;
+    if (L.outPoint >= 0.0f)               out["outPoint"] = L.outPoint; // sentinel -1 = omit
+    if (L.blend    != BlendMode::Normal)  out["blend"]    = BlendModeToString(L.blend);
     // Task 5.9: TextProps — only meaningful when type == Text, but emit
     // unconditionally when non-default so a manual retype in a text editor
     // preserves the block. Cheap; text data is tiny.
@@ -391,6 +418,11 @@ Layer ReadLayer(const json& j) {
     L.strokeColor   = FillColorFromHex(j.value("strokeColor", std::string("0xFF000000")), 0xFF000000u);
     L.strokeWidth   = j.value("strokeWidth",  0.0f);
     L.cornerRadius  = j.value("cornerRadius", 0.0f);
+    // Task 5.10: trim + blend. Missing => defaults reproduce pre-5.10
+    // behavior (visible entire comp, Normal blend). Zero migration cost.
+    L.inPoint       = j.value("inPoint",     0.0f);
+    L.outPoint      = j.value("outPoint",   -1.0f);   // sentinel
+    L.blend         = BlendModeFromString(j.value("blend", std::string("Normal")));
     // Task 5.9: TextProps. Missing on pre-5.9 files => defaults; on a non-
     // Text layer with only defaults, ignored downstream anyway.
     if (j.contains("textProps") && j["textProps"].is_object()) {

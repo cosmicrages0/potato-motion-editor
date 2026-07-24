@@ -112,6 +112,36 @@ bool LayerManager::DeleteLayerById(int id) {
     return true;
 }
 
+// Task 5.10: DuplicateLayer — deep-copy a layer (Layer is a POD-ish struct
+// with only value fields + ComPtr text atlases that AddRef safely on copy),
+// assign it a fresh id, and insert immediately AFTER the source in the
+// stack. Newly-duplicated layer is auto-selected.
+//
+// Adjustment #4 locked: no time offset. Duplicate at the same in/out as
+// the source — matches AE. Users can drag the trim bar to offset if
+// they want.
+//
+// ComPtr safety: Layer.textTex / textSRV are Microsoft::WRL::ComPtr
+// which AddRefs on copy — src and copy briefly share the atlas until
+// the next frame's EnsureLayerCache runs. Fast-path (hash match) makes
+// that a no-op; no double-free or dangling pointer risk.
+int LayerManager::DuplicateLayer(int srcId) {
+    const int srcIdx = IndexOfId(srcId);
+    if (srcIdx < 0) return -1;
+    Layer copy = layers[(size_t)srcIdx];
+    copy.id   = nextId++;
+    // Distinguish the duplicate in the layer list. AE convention.
+    copy.name = layers[(size_t)srcIdx].name + " copy";
+    // Insert at srcIdx + 1 so the duplicate renders ON TOP OF the source
+    // (Z-order = later in vector). If srcIdx is the last layer, insert
+    // still works — it just appends.
+    layers.insert(layers.begin() + (srcIdx + 1), std::move(copy));
+    RebuildIndex();
+    // Auto-select the new layer for immediate editing.
+    selectedLayerId = layers[(size_t)(srcIdx + 1)].id;
+    return selectedLayerId;
+}
+
 bool LayerManager::WouldCreateCycle(int childId, int candidateParentId) const {
     if (childId == candidateParentId) return true;        // self-parenting
     if (candidateParentId < 0)        return false;       // detach is always safe

@@ -147,6 +147,14 @@ private:
     // Task 6: Render Queue panel state (settings edited in UI live here)
     ExportEngine::Settings pendingExport;
     float                  pendingExportSeconds = 5.0f;
+    // Task 5.10 (user request #7b): auto-populate export duration from
+    // max(layer.outPoint) across visible layers when the Render Queue
+    // becomes visible. Once the user touches the field manually,
+    // exportDurationUserOverridden latches true and we stop clobbering
+    // their value on subsequent panel opens.
+    bool                   exportDurationUserOverridden = false;
+    bool                   renderQueueVisibleLastFrame  = false;
+    void                   RecomputeAutoExportDuration();
     bool                   showRenderQueue = false;
     bool                   showFfmpegMissingPopup = false;
 

@@ -265,6 +265,18 @@ void RenderEngine::HandleEvents(bool& running) {
         // timeline widths.
         if (event.type == SDL_KEYDOWN && !ImGui::GetIO().WantTextInput) {
             const SDL_Keycode k = event.key.keysym.sym;
+            // Task 5.10: Ctrl+D duplicates the selected layer (AE convention).
+            // Snapshot BEFORE the mutation per the Task 5.6 sync-snapshot
+            // rule so Ctrl+Z returns to pre-duplicate state.
+            const bool ctrlHeld = (event.key.keysym.mod & KMOD_CTRL) != 0;
+            if (ctrlHeld && k == SDLK_d) {
+                const int selId = layerManager.GetSelectedId();
+                if (selId != -1) {
+                    MarkForSnapshot();
+                    layerManager.DuplicateLayer(selId);
+                }
+                continue; // consume — don't fall through to Delete
+            }
             if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
                 const int selId = layerManager.GetSelectedId();
                 if (selId != -1) {
@@ -807,7 +819,19 @@ void RenderEngine::DrawTimelinePanel() {
     // the end of the strip almost immediately at the 1-second default and
     // couldn't extend it.
     ImGui::SetNextItemWidth(120.0f);
-    ImGui::SliderFloat("Duration (s)##tl", &animEngine.duration, 0.5f, 60.0f, "%.2f s");
+    ImGui::SliderFloat("##durSlider_tl", &animEngine.duration, 0.5f, 60.0f, "%.2f s");
+    if (ImGui::IsItemActivated()) MarkForSnapshot();
+    // Task 5.10 (user request #7a): pair the slider with a numeric input
+    // so users can click-to-type instead of drag. Both bind to the same
+    // float. Ctrl+click on the slider ALSO switches to text input (ImGui
+    // native behavior) but the extra visible input makes it discoverable.
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80.0f);
+    if (ImGui::InputFloat("Duration (s)##durInput_tl", &animEngine.duration,
+                          0.1f, 1.0f, "%.3f")) {
+        MarkForSnapshot();
+        if (animEngine.duration < 0.1f)  animEngine.duration = 0.1f;
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("(scrub playhead or drag it below)");
 
@@ -946,7 +970,10 @@ void RenderEngine::DrawTimelineStrip() {
     if (labelW < 100.0f) labelW = 100.0f;
     const float rulerH = 22.0f;
     const float rowH   = 18.0f;
-    const auto& layers = layerManager.Layers();
+    // Task 5.10: mutable ref so trim-bar drag can mutate in/out points
+    // directly. Diamond drag path already relies on mutation via
+    // property accessors, so this doesn't regress anything.
+    auto& layers = layerManager.Layers();
     const float bodyH  = rowH * std::max<int>(1, (int)layers.size());
     const float totalH = rulerH + bodyH + 4.0f;
 
@@ -994,7 +1021,7 @@ void RenderEngine::DrawTimelineStrip() {
     const float playheadX = TimeToX(animEngine.currentTime);
     constexpr float kNearPlayheadPixels = 10.0f;
     for (size_t i = 0; i < layers.size(); ++i) {
-        const Layer& layer = layers[i];
+        Layer& layer = layers[i];    // Task 5.10: mutable for trim-bar drag
         const float rowY0 = origin.y + rulerH + rowH * (float)i;
         const float rowYc = rowY0 + rowH * 0.5f;
 
@@ -1011,6 +1038,99 @@ void RenderEngine::DrawTimelineStrip() {
         // Track baseline
         dl->AddLine(ImVec2(trackX0, rowYc), ImVec2(trackX1, rowYc),
                     IM_COL32(60, 60, 70, 255), 1.0f);
+
+        // Task 5.10: trim bar. Sits BEHIND the keyframe diamonds so a
+        // diamond click-drag still wins the hit-test. Three interaction
+        // zones: left 6px = trim inPoint, right 6px = trim outPoint,
+        // middle = slip both (drag whole bar without changing length).
+        {
+            const float durSafe = (animEngine.duration > 0.001f) ? animEngine.duration : 1.0f;
+            const float outResolved = (layer.outPoint < 0.0f) ? durSafe : layer.outPoint;
+            const float barX0 = TimeToX(std::clamp(layer.inPoint,  0.0f, durSafe));
+            const float barX1 = TimeToX(std::clamp(outResolved,    0.0f, durSafe));
+            const float barY0 = rowYc - rowH * 0.35f;
+            const float barY1 = rowYc + rowH * 0.35f;
+
+            // Bar body (layer's fillColor at 40% alpha) + selection border.
+            const unsigned int fc = layer.fillColor;
+            const ImU32 barCol = ((unsigned int)std::clamp((int)(((fc >> 24) & 0xFFu) * 0.4f), 0, 255) << 24)
+                                 | (fc & 0x00FFFFFFu);
+            dl->AddRectFilled(ImVec2(barX0, barY0), ImVec2(barX1, barY1), barCol, 3.0f);
+            if (layer.id == selectedId) {
+                dl->AddRect(ImVec2(barX0, barY0), ImVec2(barX1, barY1),
+                            IM_COL32(255, 255, 255, 200), 3.0f, 0, 1.0f);
+            }
+
+            // Interaction zones (invisible buttons). Suppressed while a
+            // keyframe diamond drag is in flight so trim doesn't hijack it.
+            if (!diamondDragActive) {
+                const float handleW = 6.0f;
+                // Unique ID per layer + zone via ImGui id stack.
+                ImGui::PushID(layer.id * 100 + 91);
+                // Left handle (trim inPoint)
+                {
+                    ImGui::SetCursorScreenPos(ImVec2(barX0 - handleW*0.5f, barY0));
+                    ImGui::InvisibleButton("##trimL", ImVec2(handleW, barY1 - barY0));
+                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                    }
+                    if (ImGui::IsItemActivated()) MarkForSnapshot();
+                    if (ImGui::IsItemActive()) {
+                        const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
+                        float nv = layer.inPoint + dt;
+                        if (nv < 0.0f) nv = 0.0f;
+                        if (nv > outResolved - 0.01f) nv = outResolved - 0.01f;
+                        layer.inPoint = nv;
+                    }
+                }
+                // Right handle (trim outPoint) — materializes -1 sentinel
+                // to the resolved comp end so drag has a start value.
+                {
+                    ImGui::SetCursorScreenPos(ImVec2(barX1 - handleW*0.5f, barY0));
+                    ImGui::InvisibleButton("##trimR", ImVec2(handleW, barY1 - barY0));
+                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                    }
+                    if (ImGui::IsItemActivated()) {
+                        MarkForSnapshot();
+                        if (layer.outPoint < 0.0f) layer.outPoint = outResolved;
+                    }
+                    if (ImGui::IsItemActive()) {
+                        const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
+                        float nv = layer.outPoint + dt;
+                        if (nv < layer.inPoint + 0.01f) nv = layer.inPoint + 0.01f;
+                        if (nv > durSafe)               nv = durSafe;
+                        layer.outPoint = nv;
+                    }
+                }
+                // Middle (slip both together, preserving bar length).
+                {
+                    const float midW = std::max(0.0f, (barX1 - handleW) - (barX0 + handleW));
+                    if (midW > 0.0f) {
+                        ImGui::SetCursorScreenPos(ImVec2(barX0 + handleW*0.5f, barY0));
+                        ImGui::InvisibleButton("##trimMid", ImVec2(midW, barY1 - barY0));
+                        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+                        }
+                        if (ImGui::IsItemActivated()) {
+                            MarkForSnapshot();
+                            if (layer.outPoint < 0.0f) layer.outPoint = outResolved;
+                        }
+                        if (ImGui::IsItemActive()) {
+                            const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
+                            const float span = layer.outPoint - layer.inPoint;
+                            float ni = layer.inPoint + dt;
+                            // Clamp so the whole span stays in [0, durSafe].
+                            if (ni < 0.0f)                ni = 0.0f;
+                            if (ni + span > durSafe)      ni = durSafe - span;
+                            layer.inPoint  = ni;
+                            layer.outPoint = ni + span;
+                        }
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
 
         // Draw + hit-test each AnimatedProperty's keyframe diamonds.
         // Task 5.3: diamonds are now interactive — left-click to start drag,
@@ -1422,6 +1542,49 @@ void RenderEngine::DrawInspectorPanel() {
         if (ImGui::IsItemActivated()) MarkForSnapshot();
     }
 
+    // Task 5.10: Layer timing — in/out point. Numeric only (drag the bar
+    // in the timeline for graphical trimming). Sentinel outPoint=-1 is
+    // displayed as the comp duration so the user sees an actual number;
+    // typing back a value <0 restores the sentinel.
+    if (ImGui::CollapsingHeader("Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
+        float inPt  = sel->inPoint;
+        float outPt = (sel->outPoint < 0.0f) ? animEngine.duration : sel->outPoint;
+        if (ImGui::InputFloat("In (s)##inPt", &inPt, 0.1f, 1.0f, "%.3f")) {
+            MarkForSnapshot();
+            if (inPt < 0.0f) inPt = 0.0f;
+            if (inPt > outPt - 0.01f) inPt = std::max(0.0f, outPt - 0.01f);
+            sel->inPoint = inPt;
+        }
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+        if (ImGui::InputFloat("Out (s)##outPt", &outPt, 0.1f, 1.0f, "%.3f")) {
+            MarkForSnapshot();
+            if (outPt < sel->inPoint + 0.01f) outPt = sel->inPoint + 0.01f;
+            if (outPt > animEngine.duration)  outPt = animEngine.duration;
+            sel->outPoint = outPt;
+        }
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+        if (ImGui::Button("Reset (extend to comp end)")) {
+            MarkForSnapshot();
+            sel->outPoint = -1.0f;
+        }
+        ImGui::TextDisabled("Trim clips visibility only. Keyframe times don't shift.");
+    }
+
+    // Task 5.10: per-layer blend mode. Reuses Effect.h's BlendMode enum
+    // (6 modes). Overlay + ColorDodge are fixed-function approximations
+    // for v1 — true per-channel math needs a pixel shader (deferred).
+    if (ImGui::CollapsingHeader("Blend", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static const char* kBlendLabels[] = {
+            "Normal", "Additive", "Multiply", "Screen", "Overlay", "ColorDodge"
+        };
+        int bIdx = (int)sel->blend;
+        if (ImGui::Combo("Mode##layerBlend", &bIdx, kBlendLabels, 6)) {
+            MarkForSnapshot();
+            sel->blend = (BlendMode)bIdx;
+        }
+        ImGui::TextDisabled("Overlay / ColorDodge are approximations for v1.");
+    }
+
     // Task 5.7: Stroke controls. Live for every shape type. Setting width
     // to 0 (default) reproduces the pre-5.7 no-stroke look. MarkForSnapshot
     // fires on IsItemActivated (mouse-down) of each widget so Ctrl+Z
@@ -1586,7 +1749,18 @@ void RenderEngine::DrawInspectorPanel() {
         ImGui::SameLine();
         if (ImGui::Button("Reset")) animEngine.Reset();
         ImGui::Checkbox("Loop", &animEngine.isLooping);
-        ImGui::SliderFloat("Duration (s)", &animEngine.duration, 0.1f, 60.0f);
+        // Task 5.10 (user request #7a): slider + paired InputFloat for
+        // click-to-type. Both bind to animEngine.duration.
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SliderFloat("##durSlider_gl", &animEngine.duration, 0.1f, 60.0f);
+        if (ImGui::IsItemActivated()) MarkForSnapshot();
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputFloat("Duration (s)##durInput_gl", &animEngine.duration,
+                              0.1f, 1.0f, "%.3f")) {
+            MarkForSnapshot();
+            if (animEngine.duration < 0.1f) animEngine.duration = 0.1f;
+        }
         ImGui::Value("Time (s)", animEngine.currentTime);
     }
 
@@ -2080,9 +2254,14 @@ void RenderEngine::DrawViewportCanvas() {
         // last frame. Fast-path when nothing changed (hash compare only).
         RefreshTextLayerCaches();
 
+        // Task 5.10: pass animEngine.duration as compDuration so the
+        // per-layer visibility gate can resolve the outPoint=-1 sentinel
+        // to "extends to comp end". Also feeds the trim gate that skips
+        // rendering trimmed-out layers entirely.
         compRenderer.RenderLayers(compRTV, compTextureWidth, compTextureHeight,
                                   layerManager, bgColor,
-                                  (UINT)compositionWidth, (UINT)compositionHeight);
+                                  (UINT)compositionWidth, (UINT)compositionHeight,
+                                  animEngine.duration);
 
         // 2) If ANY layer has an enabled effect, run its chain against the
         //    whole composition. NOTE: this is a composition-wide effect model
@@ -3788,8 +3967,18 @@ void RenderEngine::DrawRenderQueuePanel() {
     ImGui::SetNextWindowSize(ImVec2(520, 400), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Render Queue", &showRenderQueue)) {
         ImGui::End();
+        renderQueueVisibleLastFrame = false;
         return;
     }
+
+    // Task 5.10 (user request #7b): auto-populate export duration from
+    // the timeline's last visible layer whenever the panel transitions
+    // from hidden -> visible. User override latches so we don't stomp a
+    // manually-typed value on subsequent re-opens.
+    if (!renderQueueVisibleLastFrame && !exportDurationUserOverridden) {
+        RecomputeAutoExportDuration();
+    }
+    renderQueueVisibleLastFrame = true;
 
     const auto& status = exportEngine.GetStatus();
 
@@ -3864,7 +4053,27 @@ void RenderEngine::DrawRenderQueuePanel() {
         }
 
         ImGui::SliderInt("Bitrate (kbps)", &pendingExport.bitrateKbps, 500, 50000);
-        ImGui::SliderFloat("Duration (s)", &pendingExportSeconds, 0.1f, 120.0f);
+        // Task 5.10 (user request #7b): slider + paired InputFloat for
+        // click-to-type. Both bind to pendingExportSeconds. Editing
+        // EITHER widget latches the "user override" flag so auto-populate
+        // stops firing on subsequent panel re-opens.
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::SliderFloat("##expDurSlider", &pendingExportSeconds, 0.1f, 120.0f)) {
+            exportDurationUserOverridden = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        if (ImGui::InputFloat("Duration (s)##expDurInput", &pendingExportSeconds,
+                              0.1f, 1.0f, "%.3f")) {
+            exportDurationUserOverridden = true;
+            if (pendingExportSeconds < 0.1f) pendingExportSeconds = 0.1f;
+        }
+        // Small reset button: re-enable auto and repopulate now.
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Auto##expDurAuto")) {
+            exportDurationUserOverridden = false;
+            RecomputeAutoExportDuration();
+        }
 
         char pathBuf[512];
         std::snprintf(pathBuf, sizeof(pathBuf), "%s", pendingExport.outputPath.c_str());
@@ -4100,10 +4309,13 @@ void RenderEngine::PumpExportOneFrameIfActive() {
         // scale is a viewport-perf knob and doesn't touch the export path).
         // After Task 6.1, export dims equal comp dims already — pass comp
         // dims as logical for explicit safety even so.
+        // Task 5.10: same visibility gate as viewport — trimmed-out
+        // layers don't render in the exported MP4.
         compRenderer.RenderLayers(rtv, (UINT)exportEngine.Width(),
                                   (UINT)exportEngine.Height(),
                                   layerManager, bg,
-                                  (UINT)compositionWidth, (UINT)compositionHeight);
+                                  (UINT)compositionWidth, (UINT)compositionHeight,
+                                  animEngine.duration);
 
         // Apply the effect chain if any layer has effects enabled.
         if (anyLayerHasEffects && effectManager.IsReady()) {
@@ -4703,4 +4915,25 @@ void RenderEngine::RefreshTextLayerCaches() {
     // Deferred favorites write. Runs at most once per frame; toggle bursts
     // collapse into one file write.
     if (favoritesDirty) SaveFontFavorites();
+}
+
+// =============================================================================
+// Task 5.10 (user request #7b): auto-populate export duration from timeline.
+// Scans visible layers for the largest resolved outPoint (sentinel -1 = comp
+// end), clamps to comp duration. Called on Render Queue panel show
+// transitions and on the "Auto" reset button.
+// =============================================================================
+void RenderEngine::RecomputeAutoExportDuration() {
+    float autoExtent = 0.0f;
+    for (const auto& L : layerManager.Layers()) {
+        if (!L.isVisible) continue;
+        const float end = (L.outPoint < 0.0f) ? animEngine.duration : L.outPoint;
+        if (end > autoExtent) autoExtent = end;
+    }
+    // Fallback: empty or all-hidden scene -> comp duration.
+    if (autoExtent < 0.1f) autoExtent = animEngine.duration;
+    // Never exceed comp duration (playback would just loop past that anyway).
+    if (autoExtent > animEngine.duration) autoExtent = animEngine.duration;
+    if (autoExtent < 0.1f) autoExtent = 0.1f;
+    pendingExportSeconds = autoExtent;
 }

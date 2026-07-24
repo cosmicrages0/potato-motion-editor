@@ -149,6 +149,26 @@ struct Layer {
     float        strokeWidth  = 0.0f;       // pixels; 0 => no stroke
     float        cornerRadius = 0.0f;       // pixels; 0 => sharp corners (Rect only)
 
+    // Task 5.10: in/out point in COMPOSITION time (seconds). Trims layer
+    // visibility on the timeline. inPoint = when layer appears;
+    // outPoint = when it disappears. Sentinel outPoint = -1.0f means
+    // "extends to comp end" — resolved at render time by comparing
+    // against animEngine.duration. Old .pmge files missing these fields
+    // default to (0, -1) which reproduces pre-5.10 behavior (visible
+    // for the entire comp) without any migration.
+    //
+    // Keyframe times stay in COMP time — trimming inPoint does NOT
+    // shift keyframes. Users who want to "slip animation with the
+    // layer" get a separate Alt-drag gesture in a later commit.
+    float inPoint  =  0.0f;
+    float outPoint = -1.0f;
+
+    // Task 5.10: per-layer blend mode. Reuses the SAME enum that Effect.h
+    // defines for the composition-wide BlendMode effect — one BlendMode
+    // type in the codebase. See CompositionRenderer for the 6 fixed-
+    // function blend states this drives.
+    BlendMode blend = BlendMode::Normal;
+
     // Task 5.9: TextProps + cache. Only used when type == ShapeType::Text.
     // Cache texture + hash-key are mutable so the const evaluator can trigger
     // a re-rasterize when props change (usual const-mutable convention for

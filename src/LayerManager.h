@@ -26,6 +26,13 @@ public:
     // Structural mutations. Return the id of the affected layer, or -1 on failure.
     int  AddLayer(ShapeType type, const std::string& nameHint = "");
     bool DeleteLayerById(int id);
+    // Task 5.10: deep-copy a layer + its per-field state, insert the
+    // duplicate immediately AFTER the source in the stack (so it renders
+    // on top of the original), assign a fresh id, and auto-select it.
+    // Duplicate keeps the source's inPoint/outPoint verbatim (matches AE
+    // behavior — no automatic time offset). Returns the new layer's id
+    // or -1 if srcId doesn't exist.
+    int  DuplicateLayer(int srcId);
 
     // Task 5.2: wipe all layers and reset id counter / selection. Called by
     // LoadProject before deserializing a saved file so the loaded scene

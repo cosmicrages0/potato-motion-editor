@@ -250,7 +250,9 @@ bool CompositionRenderer::CreateBuffers() {
         D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = kQuadIndices;
         if (FAILED(device_->CreateBuffer(&bd, &sd, &ib_quad_))) return false;
     }
-    // Standard alpha blend
+    // Standard alpha blend (kept as blend_alpha_ for backward compat with
+    // pre-5.10 code paths that don't consult layer.blend). Also used as
+    // the Normal entry in blend_modes_[Normal].
     {
         D3D11_BLEND_DESC bd = {};
         bd.RenderTarget[0].BlendEnable    = TRUE;
@@ -262,6 +264,43 @@ bool CompositionRenderer::CreateBuffers() {
         bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         if (FAILED(device_->CreateBlendState(&bd, &blend_alpha_))) return false;
+    }
+
+    // Task 5.10: six per-layer blend states, indexed by (int)BlendMode.
+    // Table matches Effect.h enum order: Normal, Additive, Multiply,
+    // Screen, Overlay, ColorDodge. Overlay + ColorDodge are fixed-function
+    // approximations of the true per-channel Photoshop math (real
+    // implementations need a pixel shader with dest sampling); both look
+    // "in the ballpark" and give users honest visual feedback vs a silent
+    // no-op. Full-fidelity shaders can land in a follow-up.
+    //
+    // Adjustment #5 from user's pre-doc review: Screen uses
+    // SrcBlend=INV_DEST_COLOR, DestBlend=ONE (proper Photoshop screen).
+    {
+        struct BlendSpec {
+            D3D11_BLEND src;
+            D3D11_BLEND dst;
+        };
+        static const BlendSpec kSpecs[kBlendModeCount] = {
+            { D3D11_BLEND_SRC_ALPHA,     D3D11_BLEND_INV_SRC_ALPHA }, // Normal
+            { D3D11_BLEND_SRC_ALPHA,     D3D11_BLEND_ONE          }, // Additive
+            { D3D11_BLEND_DEST_COLOR,    D3D11_BLEND_ZERO         }, // Multiply
+            { D3D11_BLEND_INV_DEST_COLOR,D3D11_BLEND_ONE          }, // Screen (locked)
+            { D3D11_BLEND_SRC_ALPHA,     D3D11_BLEND_INV_SRC_ALPHA }, // Overlay (approx=Normal for v1)
+            { D3D11_BLEND_ONE,           D3D11_BLEND_INV_SRC_COLOR}, // ColorDodge (approx)
+        };
+        for (int i = 0; i < kBlendModeCount; ++i) {
+            D3D11_BLEND_DESC bd = {};
+            bd.RenderTarget[0].BlendEnable    = TRUE;
+            bd.RenderTarget[0].SrcBlend       = kSpecs[i].src;
+            bd.RenderTarget[0].DestBlend      = kSpecs[i].dst;
+            bd.RenderTarget[0].BlendOp        = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].SrcBlendAlpha  = D3D11_BLEND_ONE;
+            bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+            bd.RenderTarget[0].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            if (FAILED(device_->CreateBlendState(&bd, &blend_modes_[i]))) return false;
+        }
     }
     // Task 5.9: linear sampler for text sprite bilinear filtering. Clamp
     // addressing so UVs slightly outside [0,1] (from float error at quad
@@ -292,6 +331,10 @@ bool CompositionRenderer::Initialize(ID3D11Device* device, ID3D11DeviceContext* 
 void CompositionRenderer::ReleaseAll() {
     if (samp_linear_)  { samp_linear_->Release();  samp_linear_  = nullptr; }
     if (blend_alpha_) { blend_alpha_->Release(); blend_alpha_ = nullptr; }
+    // Task 5.10: release the 6 per-layer blend states.
+    for (int i = 0; i < kBlendModeCount; ++i) {
+        if (blend_modes_[i]) { blend_modes_[i]->Release(); blend_modes_[i] = nullptr; }
+    }
     if (ib_quad_)     { ib_quad_->Release();     ib_quad_     = nullptr; }
     if (vb_quad_)     { vb_quad_->Release();     vb_quad_     = nullptr; }
     if (cb_shape_)    { cb_shape_->Release();    cb_shape_    = nullptr; }
@@ -537,7 +580,8 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
                                        UINT targetW, UINT targetH,
                                        LayerManager& layerManager,
                                        const float bgColor[4],
-                                       UINT logicalW, UINT logicalH) {
+                                       UINT logicalW, UINT logicalH,
+                                       float compDuration) {
     if (!initialized_ || !context_ || !targetRTV) return;
     if (targetW == 0 || targetH == 0) return;
 
@@ -573,10 +617,40 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
     // Task 5.1: sample AnimatedProperty at the LayerManager's frame comp time
     // so shape size matches whatever GetWorldMatrix() used for the transform.
     const float compT = layerManager.CurrentCompTime();
+    // Task 5.10: track the last blend state we bound so we don't spam
+    // OMSetBlendState across identically-blended sibling layers. Cheap
+    // but the driver still pays a few cycles per call — one less state
+    // change per layer adds up on comps with 50+ shapes.
+    int lastBlendBound = -1;
     for (auto& layer : layerManager.Layers()) {
         if (!layer.isVisible) continue;
         if (layer.is3D)       continue;
         if (layer.type == ShapeType::Camera) continue;
+
+        // Task 5.10: in/out visibility gate. Sentinel outPoint = -1 means
+        // "extends to comp end" so we resolve it here. compDuration = 0
+        // (source-compat default) means "no cutoff" — matches pre-5.10
+        // behavior where all layers always drew.
+        {
+            const float out = (layer.outPoint < 0.0f)
+                                 ? (compDuration > 0.0f ? compDuration : 1e9f)
+                                 : layer.outPoint;
+            if (compT < layer.inPoint || compT > out) continue;
+        }
+
+        // Task 5.10: pick the layer's blend state. Fall back to blend_alpha_
+        // (Normal) if the enum value is out-of-range or the corresponding
+        // state failed to create at init.
+        {
+            const int bi = (int)layer.blend;
+            ID3D11BlendState* bs = (bi >= 0 && bi < kBlendModeCount && blend_modes_[bi])
+                                        ? blend_modes_[bi]
+                                        : blend_alpha_;
+            if (bi != lastBlendBound) {
+                context_->OMSetBlendState(bs, blendFactor, 0xFFFFFFFF);
+                lastBlendBound = bi;
+            }
+        }
 
         const Mat3 wm = layerManager.GetWorldMatrix(layer.id);
         const Vec2 sz = layer.transform.sizePixels.Evaluate(compT);
@@ -620,5 +694,12 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
                 break;
             }
         }
+    }
+
+    // Task 5.10: restore the standard alpha blend so downstream passes
+    // (effect chain read-back, ImGui overlay, export copy) don't inherit
+    // whatever weird blend the last layer left bound.
+    if (lastBlendBound != (int)BlendMode::Normal) {
+        context_->OMSetBlendState(blend_alpha_, blendFactor, 0xFFFFFFFF);
     }
 }
