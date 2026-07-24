@@ -103,8 +103,14 @@ private:
     // by fillColor. Size is the R8 atlas dims in pixels (drives the quad's
     // world-space extent); world matrix places it in comp space just like
     // any other shape.
+    //
+    // Task 5.11-fix: optional stroke via 8-sample outline dilation in
+    // ps_text_. Pass strokeWidth = 0 to reproduce the pre-fix fill-only
+    // behavior; anything > 0 draws a stroke ring of `strokeColor` around
+    // every glyph edge, `strokeWidth` pixels thick.
     void DrawText(const Mat3& worldMatrix, const Vec2& size,
-                  unsigned int fillColor,
+                  unsigned int fillColor, unsigned int strokeColor,
+                  float strokeWidth,
                   ID3D11ShaderResourceView* atlasSRV,
                   UINT logicalW, UINT logicalH);
 

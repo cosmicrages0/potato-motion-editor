@@ -135,16 +135,100 @@ float4 main(VSOut i) : SV_TARGET {
 // Discard for near-zero coverage skips the vast majority of the quad
 // (any text bitmap is mostly empty pixels around the glyphs).
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Task 5.9 / 5.11-fix: text sprite pixel shader with optional stroke.
+//
+// Samples a per-layer R8_UNORM coverage atlas (produced by TextRenderer via
+// DirectWrite in grayscale mode) and tints by fill color. Optional stroke is
+// implemented via an 8-sample offset outline: the atlas is sampled 8 times
+// in a circle around the current pixel at a UV offset proportional to the
+// requested stroke width; the max coverage of those samples gives us a
+// dilated shape (the outline extent), and (dilated - fill) gives the stroke
+// ring. This is the same trick Figma / Canva use for outlined text. Looks
+// great up to ~10 px stroke; beyond that a proper SDF pipeline is needed
+// (deferred).
+//
+// cbuffer layout (same as shapes — see ShapeCB in header):
+//   color   = fill RGBA
+//   stroke  = stroke RGBA
+//   params  = (type, strokeWidth_px, cornerRadius_px, unused)
+//   params2 = (halfExtentX_px, halfExtentY_px, unused, unused)
+//
+// UV offset per sample = strokeWidth_px / (halfExtent * 2). Half-extent in
+// params2 is already HALF the atlas dims, so effective UV step is
+// strokeWidth / (2 * halfExtent).
+// -----------------------------------------------------------------------------
 static const char* kPSTextSrc = R"HLSL(
+cbuffer ShapeCB : register(b0) {
+    float4x4 mvp;
+    float4   color;
+    float4   stroke;
+    float4   params;   // .y = strokeWidth in pixels
+    float4   params2;  // .xy = halfExtent in pixels
+};
 Texture2D    texAtlas  : register(t0);
 SamplerState samLinear : register(s0);
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
+
 float4 main(VSOut i) : SV_TARGET {
     float coverage = texAtlas.Sample(samLinear, i.uv).r;
-    if (coverage < 0.001) discard;
-    float4 result = i.color;
-    result.a *= coverage;
-    return result;
+    float sw = params.y;
+
+    if (sw <= 0.001) {
+        // No stroke: fill-only, original v1 path.
+        if (coverage < 0.001) discard;
+        float4 result = color;
+        result.a *= coverage;
+        return result;
+    }
+
+    // Stroke path: 8-sample outline dilation.
+    // UV step = pixel offset / atlas dim. params2.xy is HALF the atlas
+    // dims, so full dim = 2 * params2.xy. Guard against zero-size atlas
+    // even though it shouldn't happen (RasterizeString clamps to 1x1).
+    float2 halfExt = max(params2.xy, float2(1.0, 1.0));
+    float2 uvStep = float2(sw, sw) / (halfExt * 2.0);
+
+    // 8 samples at pi/4 increments.
+    const float2 kDirs[8] = {
+        float2( 1.0,  0.0),
+        float2( 0.707,  0.707),
+        float2( 0.0,  1.0),
+        float2(-0.707,  0.707),
+        float2(-1.0,  0.0),
+        float2(-0.707, -0.707),
+        float2( 0.0, -1.0),
+        float2( 0.707, -0.707)
+    };
+    float dilated = coverage;
+    for (int s = 0; s < 8; ++s) {
+        float2 uv2 = i.uv + kDirs[s] * uvStep;
+        // Clamp to [0,1] so samples off the atlas edge (clamp addressing
+        // gives edge color = 0 for our R8 atlas — perfect).
+        uv2 = saturate(uv2);
+        float c = texAtlas.Sample(samLinear, uv2).r;
+        if (c > dilated) dilated = c;
+    }
+
+    // Discard fully-outside pixels (not in fill and not touched by any
+    // offset sample) so background layers show through around the text.
+    if (dilated < 0.001) discard;
+
+    // Composite: fill on top, stroke fills the ring (dilated - fill).
+    // Both premultiplied by their alpha channel before mixing so the
+    // fill-stroke edge is a clean transition, not a double-brighten.
+    // stroke coverage = max(dilated - coverage, 0) — the halo ring.
+    float strokeCoverage = max(dilated - coverage, 0.0);
+    // Weight stroke color first, then blend fill on top by fill coverage.
+    float4 sc = stroke;
+    sc.a    *= strokeCoverage;
+    float4 fc = color;
+    fc.a    *= coverage;
+    // Alpha-over: fc over sc. Result alpha = fc.a + sc.a * (1 - fc.a).
+    float outA = fc.a + sc.a * (1.0 - fc.a);
+    float3 outRGB = fc.rgb * fc.a + sc.rgb * sc.a * (1.0 - fc.a);
+    if (outA > 0.001) outRGB /= outA; // un-premultiply for the output register
+    return float4(outRGB, outA);
 }
 )HLSL";
 
@@ -547,20 +631,23 @@ void CompositionRenderer::DrawNullMarker(const Mat3& world, const Vec2& size,
 // `atlasSRV` is valid and matches the current TextProps. If atlasSRV
 // is null, silently no-op (rasterization failed — nothing to draw).
 void CompositionRenderer::DrawText(const Mat3& world, const Vec2& size,
-                                    unsigned int fillColor,
+                                    unsigned int fillColor, unsigned int strokeColor,
+                                    float strokeWidth,
                                     ID3D11ShaderResourceView* atlasSRV,
                                     UINT logicalW, UINT logicalH) {
     if (!context_ || !ps_text_ || !samp_linear_ || !atlasSRV) return;
     ShapeCB cb{};
     BuildShapeMVP(world, size, logicalW, logicalH, cb.mvp);
-    UnpackABGRToRGBAf(fillColor, cb.color);
-    // stroke / params fields unused by ps_text_ but zero them for safety.
-    cb.stroke[0] = cb.stroke[1] = cb.stroke[2] = cb.stroke[3] = 0.0f;
-    cb.params[0] = 3.0f; // "text" type marker (unused by shader; debug aid)
-    cb.params[1] = cb.params[2] = cb.params[3] = 0.0f;
+    UnpackABGRToRGBAf(fillColor,   cb.color);
+    UnpackABGRToRGBAf(strokeColor, cb.stroke);
+    cb.params[0] = 3.0f;                      // "text" type marker (debug aid)
+    cb.params[1] = std::max(0.0f, strokeWidth); // Task 5.11-fix: stroke width
+    cb.params[2] = 0.0f;
+    cb.params[3] = 0.0f;
     cb.params2[0] = size.x * 0.5f;
     cb.params2[1] = size.y * 0.5f;
-    cb.params2[2] = cb.params2[3] = 0.0f;
+    cb.params2[2] = 0.0f;
+    cb.params2[3] = 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(context_->Map(cb_shape_, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
@@ -688,7 +775,10 @@ void CompositionRenderer::RenderLayers(ID3D11RenderTargetView* targetRTV,
                 // the SRV will be null and DrawText silently no-ops.
                 if (layer.textSRV && layer.textTexW > 0 && layer.textTexH > 0) {
                     const Vec2 atlasSz((float)layer.textTexW, (float)layer.textTexH);
-                    DrawText(wm, atlasSz, fillC, layer.textSRV.Get(),
+                    // Task 5.11-fix: pass stroke color + width. ps_text_
+                    // 8-sample outline path fires when strokeWidth > 0.
+                    DrawText(wm, atlasSz, fillC, strokeC, sw,
+                             layer.textSRV.Get(),
                              logicalW, logicalH);
                 }
                 break;
