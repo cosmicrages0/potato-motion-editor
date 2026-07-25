@@ -124,16 +124,21 @@ UI, and ApplyChain. Design doc required.
 User: "drop shadow has a problem it makes the shape goes full transparent
 like black"
 
-Reproduces the pre-Task-5.13-fix2 vibe — sounds like Drop Shadow's
-2-pass composite (ps_dropshadow_composite_) is either:
-- Killing the source alpha (multiplying by 0 somewhere)
-- Or the shadow color is bleeding into the shape (opacity or blend math bug)
+**FIXED in Task 5.13-fix4** (commit 9af3c11) — fused two-pass DropShadow
+into a single-pass shader that eliminates the same-texture SRV+RTV bind
+conflict. Layer now keeps its color; shadow renders as an actual offset
+shadow at the configured Angle.
 
-Need to look at kPSDropShadowComposite HLSL — the alpha-over formula
-was written to sit source ON TOP of shadow, but if `src.a` is
-premultiplied twice (once by shape rasterizer, once by shader
-`src.rgb * src.a`), we get `src.rgb * src.a²` — dark and possibly
-underflow to zero.
+**FOLLOWUP (from Task 5.13-fix5 test)** — user: "drop shadow isnt that
+good the softness is still not gives that blurry vibe". The 13-tap 2D
+gaussian ring is a step up from the old 5-tap perpendicular line but
+still not truly smooth at softness > ~20 px. A cloud of ~13 samples
+can't approximate a large-radius blur well. Real fix: proper separable
+Gaussian (H pass + V pass, ~9 taps each = 18 samples with proper
+falloff, dramatically smoother than a 13-tap 2D). Needs an additional
+render target slot because DropShadow becomes 2-pass again but this
+time BOTH passes read from and write to different textures cleanly.
+Deferred as a proper effect-pipeline commit (~1-2 hr).
 
 ### 2.3 [BUG] Directional Motion Blur is static — S
 User: "direction blur also working but its a static"

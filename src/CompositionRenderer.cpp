@@ -182,15 +182,30 @@ float4 main(VSOut i) : SV_TARGET {
         return result;
     }
 
-    // Stroke path: 8-sample outline dilation.
+    // Stroke path: adaptive multi-ring outline dilation.
     // UV step = pixel offset / atlas dim. params2.xy is HALF the atlas
     // dims, so full dim = 2 * params2.xy. Guard against zero-size atlas
     // even though it shouldn't happen (RasterizeString clamps to 1x1).
+    //
+    // Task 5.11-fix-4 (quick-win #4): old 8-tap single-ring dilation
+    // stamped 8 visible ghost copies of the letter past ~15 px stroke
+    // width — the arc length between adjacent taps on the ring
+    // exceeded ~12 px so gaps opened. Fixed with a concentric-rings
+    // strategy that scales sample count with stroke width:
+    //   sw <=  8: 8 outer + 4 inner  = 12 taps
+    //   sw <= 20: 16 outer + 8 inner = 24 taps
+    //   sw >  20: 24 outer + 12 inner + 6 mid = 42 taps
+    // Inner ring at ~0.5*sw closes small gaps; outer at 1.0*sw is the
+    // real dilation edge. Extra taps only fire when actually needed so
+    // the small-stroke fast path stays cheap.
     float2 halfExt = max(params2.xy, float2(1.0, 1.0));
-    float2 uvStep = float2(sw, sw) / (halfExt * 2.0);
+    float2 uvStep  = float2(sw, sw) / (halfExt * 2.0);
+    float2 uvHalf  = uvStep * 0.5;
 
-    // 8 samples at pi/4 increments.
-    const float2 kDirs[8] = {
+    float dilated = coverage;
+
+    // Ring A: 8 taps at radius sw (always).
+    const float2 kOuter8[8] = {
         float2( 1.0,  0.0),
         float2( 0.707,  0.707),
         float2( 0.0,  1.0),
@@ -200,14 +215,64 @@ float4 main(VSOut i) : SV_TARGET {
         float2( 0.0, -1.0),
         float2( 0.707, -0.707)
     };
-    float dilated = coverage;
-    for (int s = 0; s < 8; ++s) {
-        float2 uv2 = i.uv + kDirs[s] * uvStep;
-        // Clamp to [0,1] so samples off the atlas edge (clamp addressing
-        // gives edge color = 0 for our R8 atlas — perfect).
-        uv2 = saturate(uv2);
+    [unroll] for (int s0 = 0; s0 < 8; ++s0) {
+        float2 uv2 = saturate(i.uv + kOuter8[s0] * uvStep);
         float c = texAtlas.Sample(samLinear, uv2).r;
         if (c > dilated) dilated = c;
+    }
+
+    // Ring B: 4 taps at radius sw*0.5 (always, cheap gap-fill).
+    const float2 kInner4[4] = {
+        float2( 1.0,  0.0),
+        float2( 0.0,  1.0),
+        float2(-1.0,  0.0),
+        float2( 0.0, -1.0)
+    };
+    [unroll] for (int s1 = 0; s1 < 4; ++s1) {
+        float2 uv2 = saturate(i.uv + kInner4[s1] * uvHalf);
+        float c = texAtlas.Sample(samLinear, uv2).r;
+        if (c > dilated) dilated = c;
+    }
+
+    // Ring C: extra 8 outer taps at pi/8 offset — only when sw > 8.
+    // Fills the halfway-arc gap on the outer ring.
+    if (sw > 8.0) {
+        const float2 kOuter8b[8] = {
+            float2( 0.924,  0.383),
+            float2( 0.383,  0.924),
+            float2(-0.383,  0.924),
+            float2(-0.924,  0.383),
+            float2(-0.924, -0.383),
+            float2(-0.383, -0.924),
+            float2( 0.383, -0.924),
+            float2( 0.924, -0.383)
+        };
+        [unroll] for (int s2 = 0; s2 < 8; ++s2) {
+            float2 uv2 = saturate(i.uv + kOuter8b[s2] * uvStep);
+            float c = texAtlas.Sample(samLinear, uv2).r;
+            if (c > dilated) dilated = c;
+        }
+    }
+
+    // Ring D: mid ring at sw*0.75 with 8 taps — only when sw > 16.
+    // Bridges outer and inner rings at large widths.
+    if (sw > 16.0) {
+        float2 uvMid = uvStep * 0.75;
+        const float2 kMid8[8] = {
+            float2( 1.0,  0.0),
+            float2( 0.707,  0.707),
+            float2( 0.0,  1.0),
+            float2(-0.707,  0.707),
+            float2(-1.0,  0.0),
+            float2(-0.707, -0.707),
+            float2( 0.0, -1.0),
+            float2( 0.707, -0.707)
+        };
+        [unroll] for (int s3 = 0; s3 < 8; ++s3) {
+            float2 uv2 = saturate(i.uv + kMid8[s3] * uvMid);
+            float c = texAtlas.Sample(samLinear, uv2).r;
+            if (c > dilated) dilated = c;
+        }
     }
 
     // Discard fully-outside pixels (not in fill and not touched by any
