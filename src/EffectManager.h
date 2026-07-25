@@ -27,12 +27,26 @@
 //   * Constant buffer is a single 64-byte upload per Effect, reused across
 //     the whole frame.
 //
-// Task 5 scope note:
-//   For Task 5 we ship the pipeline against the swap-chain back buffer as a
-//   post-comp effect (per-composition effects, not per-layer). Per-layer
-//   effect application requires each layer to render into a texture rather
-//   than directly into an ImDrawList. That layer-texture pipeline is
-//   scheduled for the deferred Task 5.0 Usability Pass.
+// Task 5.13 (per-layer isolation, shipped):
+//   Effects run PER LAYER via the ping-pong pool. For each layer with
+//   enabled effects: clear pingRTV to transparent, RenderSingleLayer
+//   into pingRTV, ApplyChain(pingSRV -> pongRTV), then CompositeSRVOver
+//   the pong result over the shared compRTV. Layers without effects
+//   fast-path straight into compRTV (batching by default).
+//
+// Task 5.13-fix2 hard-won invariant (rasterizer + DSS explicit binds):
+//   DrawFullscreenPass explicitly binds `rasterizer_none_` (CULL_NONE,
+//   FrontCounterClockwise=FALSE, DepthClipEnable=TRUE) and calls
+//   OMSetDepthStencilState(nullptr, 0). Our fullscreen triangle is CCW
+//   under +Y-up NDC, which is back-facing when CullMode=CULL_BACK is
+//   inherited from anywhere else in the pipeline. Silent culling of
+//   the composite quad = filtered layer vanishes with zero error output.
+//   Never remove those two lines without also proving no code path can
+//   leave CULL_BACK bound going into the effect pipeline.
+//
+// Task 5.13-fix2 also: ps_composite_ falls back to ps_passthrough_ on
+// compile failure (identical HLSL, guaranteed to exist). Shutdown()
+// guards against the alias case.
 // -----------------------------------------------------------------------------
 
 class EffectManager {
