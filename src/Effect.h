@@ -94,12 +94,19 @@ struct Effect {
     //   p0.z = Softness (px, gaussian-ish radius)
     //   p1.x = Opacity (0..1)
     //   p2.xyz = Shadow color RGB (0..1)
+    // Task 5.13-fix3 (quick-win #1): defaults bumped so first-drop is
+    // visible instead of hiding under the shape. Old defaults (D=5,
+    // Softness=3, Opacity=0.6) produced a shadow barely peeking out
+    // from behind the source, which read as "the shape turned black"
+    // for solid-color shapes with matching bg. AE/Photoshop defaults
+    // are closer to D=20, S=8, O=0.75 which shows the shadow clearly
+    // on first drop and is easier to dial back than to build up.
     static Effect MakeDropShadow() {
         Effect e; e.type = EffectType::DropShadow; e.displayName = "Drop Shadow";
-        e.params.p0[0] = 5.0f;    // Distance
+        e.params.p0[0] = 20.0f;   // Distance (px) — visible offset out of the gate
         e.params.p0[1] = 135.0f;  // Angle (down-right, AE default)
-        e.params.p0[2] = 3.0f;    // Softness
-        e.params.p1[0] = 0.6f;    // Opacity
+        e.params.p0[2] = 8.0f;    // Softness (px)
+        e.params.p1[0] = 0.75f;   // Opacity
         e.params.p2[0] = 0.0f;    // R
         e.params.p2[1] = 0.0f;    // G
         e.params.p2[2] = 0.0f;    // B (black shadow)
