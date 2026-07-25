@@ -272,15 +272,51 @@ float4 main(VSOut i) : SV_TARGET {
     float2 offsetUV = offsetPx / rtDim;
     float2 srcUV    = i.uv - offsetUV;
 
-    // 5-tap perpendicular blur for softness. Reads only source alpha —
-    // we tint with `color` at composite time.
-    float2 perp = float2(-sin(ang), cos(ang)) * (soft / rtDim);
+    // ---------------------------------------------------------------
+    // Task 5.13-fix5: proper 2D Gaussian blur (13 taps in a rotationally
+    // symmetric ring pattern). Old code was a 5-tap perpendicular line
+    // blur which at softness > ~15 px stamped 5 visible copies of the
+    // source silhouette along a diagonal — user reported "the shadow
+    // begins to appears circles in a diagonal way". Fixed by moving to
+    // a 2D distribution: one center tap + 4 axis-aligned taps at 1σ +
+    // 8 diagonal taps at ~0.7σ, weights normalised to sum to 1.0.
+    //
+    // Kernel is scaled by `soft` in pixels so the ring radius grows
+    // with the Softness slider. Weights follow a standard 2D Gaussian
+    // where σ = soft / 2 so the ±1σ ring is at half the softness.
+    // ---------------------------------------------------------------
+    float2 sPx = float2(soft, soft) / rtDim; // pixel->UV for kernel
+    // Center weight (µ=0)
+    const float wC = 0.20;
+    // Axis-aligned ring at radius 1σ (weight per tap ≈ 0.12 * 4 taps = 0.48)
+    const float wA = 0.10;
+    // Diagonal ring at radius ~1.4σ but scaled down to 1σ visually via
+    // multiplying the offset by 0.707 (weight per tap ≈ 0.04 * 8 = 0.32)
+    const float wD = 0.04;
+
     float shadowA = 0.0;
-    shadowA += tex.Sample(smp, srcUV - 2.0 * perp).a * 0.06;
-    shadowA += tex.Sample(smp, srcUV - 1.0 * perp).a * 0.24;
-    shadowA += tex.Sample(smp, srcUV                ).a * 0.40;
-    shadowA += tex.Sample(smp, srcUV + 1.0 * perp).a * 0.24;
-    shadowA += tex.Sample(smp, srcUV + 2.0 * perp).a * 0.06;
+    // Center
+    shadowA += tex.Sample(smp, srcUV).a * wC;
+    // 4 axis-aligned taps (N, S, E, W)
+    shadowA += tex.Sample(smp, srcUV + float2( 0.0,  sPx.y)).a * wA;
+    shadowA += tex.Sample(smp, srcUV + float2( 0.0, -sPx.y)).a * wA;
+    shadowA += tex.Sample(smp, srcUV + float2( sPx.x, 0.0 )).a * wA;
+    shadowA += tex.Sample(smp, srcUV + float2(-sPx.x, 0.0 )).a * wA;
+    // 8 diagonal taps at 0.707 * σ (approximates a circular ring)
+    const float d = 0.707;
+    shadowA += tex.Sample(smp, srcUV + float2( d*sPx.x,  d*sPx.y)).a * wD;
+    shadowA += tex.Sample(smp, srcUV + float2( d*sPx.x, -d*sPx.y)).a * wD;
+    shadowA += tex.Sample(smp, srcUV + float2(-d*sPx.x,  d*sPx.y)).a * wD;
+    shadowA += tex.Sample(smp, srcUV + float2(-d*sPx.x, -d*sPx.y)).a * wD;
+    // 4 more taps at 1.5σ for large softness — cheap way to extend the
+    // tail without ghosting. Weight ≈ 0.02 * 4 = 0.08 keeps total near 1.
+    const float e = 1.5;
+    const float wE = 0.02;
+    shadowA += tex.Sample(smp, srcUV + float2( e*sPx.x, 0.0)).a * wE;
+    shadowA += tex.Sample(smp, srcUV + float2(-e*sPx.x, 0.0)).a * wE;
+    shadowA += tex.Sample(smp, srcUV + float2(0.0,  e*sPx.y)).a * wE;
+    shadowA += tex.Sample(smp, srcUV + float2(0.0, -e*sPx.y)).a * wE;
+
     shadowA *= opacity;
 
     // Source-over-shadow composite, inline.

@@ -2012,6 +2012,33 @@ static ImVec2 ToScreen(const Vec2& worldPt, ImVec2 canvasOrigin) {
     return ImVec2(canvasOrigin.x + worldPt.x, canvasOrigin.y + worldPt.y);
 }
 
+// Quick-win #3 (bounding-box restyle): draw a 4-corner AE-style selection
+// bounding box in the same shadow-sandwich style as the anchor marker.
+// Dark 3-px stroke underneath for legibility on any bg, thin 1-px white
+// core on top. Corner handles = small filled white squares with a dark
+// outline sandwich, ~4 px total.
+static void DrawSelectionBox(ImDrawList* dl,
+                             const ImVec2 corners[4]) {
+    if (!dl) return;
+    const ImU32 shadow = IM_COL32(0,   0,   0,   200);
+    const ImU32 core   = IM_COL32(255, 255, 255, 255);
+    // Dark outline sandwich (bottom layer) — 3-px stroke.
+    dl->AddPolyline(corners, 4, shadow, ImDrawFlags_Closed, 3.0f);
+    // Bright core (top layer) — 1-px stroke.
+    dl->AddPolyline(corners, 4, core,   ImDrawFlags_Closed, 1.0f);
+    // Corner handles: 4-px square, dark outline sandwich then white fill.
+    const float R = 3.5f;   // half-size of handle
+    const float O = 4.5f;   // half-size of handle outline (1 px bigger)
+    for (int i = 0; i < 4; ++i) {
+        dl->AddRectFilled(ImVec2(corners[i].x - O, corners[i].y - O),
+                          ImVec2(corners[i].x + O, corners[i].y + O),
+                          shadow);
+        dl->AddRectFilled(ImVec2(corners[i].x - R, corners[i].y - R),
+                          ImVec2(corners[i].x + R, corners[i].y + R),
+                          core);
+    }
+}
+
 // Quick-win #2: AE-style anchor point marker. Small crosshair (`+`) with
 // a tiny dot at the exact pixel-center for precise clicking. Drawn with a
 // dark outline sandwich so it reads on both light and dark shape fills.
@@ -2139,22 +2166,17 @@ void RenderEngine::DrawSelectionGizmos(Layer& layer, const Mat3& worldMatrix,
     const Vec2 se = worldMatrix.TransformPoint(Vec2(w,    h));
     const Vec2 sw = worldMatrix.TransformPoint(Vec2(0.0f, h));
 
-    const ImVec2 pnw = ToScreen(nw, canvasOrigin);
-    const ImVec2 pne = ToScreen(ne, canvasOrigin);
-    const ImVec2 pse = ToScreen(se, canvasOrigin);
-    const ImVec2 psw = ToScreen(sw, canvasOrigin);
-
-    const ImU32 outline = IM_COL32(0, 255, 200, 255);
-    const ImU32 handle  = IM_COL32(255, 220, 60, 255);
-
-    const ImVec2 box[4] = { pnw, pne, pse, psw };
-    drawList->AddPolyline(box, 4, outline, ImDrawFlags_Closed, 1.5f);
-
-    const float R = 5.0f;
-    drawList->AddRectFilled(ImVec2(pnw.x-R, pnw.y-R), ImVec2(pnw.x+R, pnw.y+R), handle);
-    drawList->AddRectFilled(ImVec2(pne.x-R, pne.y-R), ImVec2(pne.x+R, pne.y+R), handle);
-    drawList->AddRectFilled(ImVec2(pse.x-R, pse.y-R), ImVec2(pse.x+R, pse.y+R), handle);
-    drawList->AddRectFilled(ImVec2(psw.x-R, psw.y-R), ImVec2(psw.x+R, psw.y+R), handle);
+    // Quick-win #3: unified AE-style bounding box (dark shadow + white core
+    // sandwich matching the anchor marker style). Replaces the old cyan
+    // outline + yellow corner squares which visually clashed with the new
+    // anchor crosshair.
+    const ImVec2 box[4] = {
+        ToScreen(nw, canvasOrigin),
+        ToScreen(ne, canvasOrigin),
+        ToScreen(se, canvasOrigin),
+        ToScreen(sw, canvasOrigin),
+    };
+    DrawSelectionBox(drawList, box);
 
     // Center move handle (anchor point in world space).
     // Quick-win #2: AE-style crosshair marker instead of the old 12-px
@@ -2605,16 +2627,9 @@ void RenderEngine::DrawViewportCanvas() {
             const ImVec2 p2 = CanvasToScreen(c2);
             const ImVec2 p3 = CanvasToScreen(c3);
 
-            const ImU32 outline = IM_COL32(0, 255, 200, 255);
-            const ImU32 handle  = IM_COL32(255, 220, 60, 255);
+            // Quick-win #3: unified AE-style bounding box style.
             const ImVec2 box[4] = { p0, p1, p2, p3 };
-            draw_list->AddPolyline(box, 4, outline, ImDrawFlags_Closed, 1.5f);
-
-            const float R = 5.0f;
-            draw_list->AddRectFilled(ImVec2(p0.x-R, p0.y-R), ImVec2(p0.x+R, p0.y+R), handle);
-            draw_list->AddRectFilled(ImVec2(p1.x-R, p1.y-R), ImVec2(p1.x+R, p1.y+R), handle);
-            draw_list->AddRectFilled(ImVec2(p2.x-R, p2.y-R), ImVec2(p2.x+R, p2.y+R), handle);
-            draw_list->AddRectFilled(ImVec2(p3.x-R, p3.y-R), ImVec2(p3.x+R, p3.y+R), handle);
+            DrawSelectionBox(draw_list, box);
             const Vec2 centerC = wm.TransformPoint(Vec2(anchorSel.x * w, anchorSel.y * h));
             DrawAnchorMarker(draw_list, CanvasToScreen(centerC));
 
@@ -2647,8 +2662,8 @@ void RenderEngine::DrawViewportCanvas() {
                     ImVec2(lbOrigin.x + projected[2].x, lbOrigin.y + projected[2].y),
                     ImVec2(lbOrigin.x + projected[3].x, lbOrigin.y + projected[3].y),
                 };
-                draw_list->AddPolyline(q, 4, IM_COL32(0, 255, 200, 255),
-                                       ImDrawFlags_Closed, 1.5f);
+                // Quick-win #3: unified selection box style for 3D layers too.
+                DrawSelectionBox(draw_list, q);
             }
         }
     }
