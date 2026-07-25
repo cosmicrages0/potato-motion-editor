@@ -2012,6 +2012,40 @@ static ImVec2 ToScreen(const Vec2& worldPt, ImVec2 canvasOrigin) {
     return ImVec2(canvasOrigin.x + worldPt.x, canvasOrigin.y + worldPt.y);
 }
 
+// Quick-win #2: AE-style anchor point marker. Small crosshair (`+`) with
+// a tiny dot at the exact pixel-center for precise clicking. Drawn with a
+// dark outline sandwich so it reads on both light and dark shape fills.
+//
+// Visual size stays small (10 px arm, 1.5 px dot) but the DRAG HIT
+// RADIUS in DrawSelectionGizmos is a separate constant (~14 px) so
+// ergonomics are unchanged — the user still has a fat clickable target,
+// they just don't see the fat clickable target.
+static void DrawAnchorMarker(ImDrawList* dl, ImVec2 centerScreen) {
+    if (!dl) return;
+    const float arm = 6.0f;    // half-length of each crosshair line (px)
+    const float dot = 1.5f;    // core dot radius (px)
+    const ImU32 shadow = IM_COL32(0,   0,   0,   200); // outline sandwich
+    const ImU32 core   = IM_COL32(255, 255, 255, 255); // bright core
+
+    // Dark 2-px-wide outline strokes so the crosshair is legible on any bg.
+    dl->AddLine(ImVec2(centerScreen.x - arm, centerScreen.y),
+                ImVec2(centerScreen.x + arm, centerScreen.y),
+                shadow, 3.0f);
+    dl->AddLine(ImVec2(centerScreen.x, centerScreen.y - arm),
+                ImVec2(centerScreen.x, centerScreen.y + arm),
+                shadow, 3.0f);
+    // Bright 1-px core lines on top.
+    dl->AddLine(ImVec2(centerScreen.x - arm, centerScreen.y),
+                ImVec2(centerScreen.x + arm, centerScreen.y),
+                core, 1.0f);
+    dl->AddLine(ImVec2(centerScreen.x, centerScreen.y - arm),
+                ImVec2(centerScreen.x, centerScreen.y + arm),
+                core, 1.0f);
+    // Center dot on top so the exact anchor pixel is unmistakable.
+    dl->AddCircleFilled(centerScreen, dot + 0.5f, shadow);
+    dl->AddCircleFilled(centerScreen, dot,        core);
+}
+
 void RenderEngine::DrawLayerShape(const Layer& layer, const Mat3& worldMatrix,
                                   float worldOpacity, ImVec2 canvasOrigin,
                                   ImDrawList* drawList) {
@@ -2122,10 +2156,13 @@ void RenderEngine::DrawSelectionGizmos(Layer& layer, const Mat3& worldMatrix,
     drawList->AddRectFilled(ImVec2(pse.x-R, pse.y-R), ImVec2(pse.x+R, pse.y+R), handle);
     drawList->AddRectFilled(ImVec2(psw.x-R, psw.y-R), ImVec2(psw.x+R, psw.y+R), handle);
 
-    // Center move handle (anchor point in world space)
+    // Center move handle (anchor point in world space).
+    // Quick-win #2: AE-style crosshair marker instead of the old 12-px
+    // filled red dot ("cartoonish anchor"). Hit-test radius in
+    // DrawSelectionGizmos is unchanged.
     const Vec2 anchor = layer.transform.anchorPoint.Evaluate(t);
     const Vec2 center = worldMatrix.TransformPoint(Vec2(anchor.x * w, anchor.y * h));
-    drawList->AddCircleFilled(ToScreen(center, canvasOrigin), 6.0f, IM_COL32(255, 80, 80, 255));
+    DrawAnchorMarker(drawList, ToScreen(center, canvasOrigin));
 }
 
 // Convert a viewport-panel screen point into composition ("world") space.
@@ -2579,7 +2616,7 @@ void RenderEngine::DrawViewportCanvas() {
             draw_list->AddRectFilled(ImVec2(p2.x-R, p2.y-R), ImVec2(p2.x+R, p2.y+R), handle);
             draw_list->AddRectFilled(ImVec2(p3.x-R, p3.y-R), ImVec2(p3.x+R, p3.y+R), handle);
             const Vec2 centerC = wm.TransformPoint(Vec2(anchorSel.x * w, anchorSel.y * h));
-            draw_list->AddCircleFilled(CanvasToScreen(centerC), 6.0f, IM_COL32(255, 80, 80, 255));
+            DrawAnchorMarker(draw_list, CanvasToScreen(centerC));
 
             HandleGizmoInteraction(*sel, wm, lbOrigin, lbSize);
         } else {
