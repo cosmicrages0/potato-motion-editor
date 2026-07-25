@@ -225,7 +225,30 @@ float4 main(VSOut i) : SV_TARGET {
 //   p3.xy = RT dims (px, filled in per-frame by the caller so px->UV
 //           conversion is correct at any composition size)
 // =============================================================================
-static const char* kPSDropShadowOffset = R"HLSL(
+// =============================================================================
+// Task 5.13-fix4: DropShadow FUSED single-pass shader.
+//
+// Old two-pass design (kPSDropShadowOffset + kPSDropShadowComposite) had a
+// fatal same-texture bind conflict in Pass 2: readSRV was ping_srv_ (source
+// shape), and otherRTV (the write target for Pass 2) was ping_rtv_ — same
+// texture. D3D11 silently unbinds one, so the composite draws garbage. In
+// the wild this presented as "shape goes fully black on drop-shadow apply".
+//
+// New single-pass design: one shader that samples the source at both the
+// current UV (to get the layer itself) AND at 5 taps around the shifted UV
+// (to build the blurred shadow alpha), then composites source-over-shadow
+// inline. Writes final RGBA into writeRTV (pong). Only READS ping and only
+// WRITES pong — no same-texture risk.
+//
+// CB layout unchanged from the old Offset pass:
+//   p0.x = Distance (px)
+//   p0.y = Angle (deg, 0=right, 90=down in UV space where +Y is down)
+//   p0.z = Softness (px, perpendicular-axis 5-tap gaussian-ish radius)
+//   p1.x = Opacity (0..1)
+//   p2.xyz = Shadow color RGB (0..1)
+//   p3.xy = RT dims (px, injected per-frame by ApplyChain for px->UV math)
+// =============================================================================
+static const char* kPSDropShadowFused = R"HLSL(
 cbuffer EffectCB : register(b0) { float4 p0; float4 p1; float4 p2; float4 p3; };
 Texture2D    tex : register(t0);
 SamplerState smp : register(s0);
@@ -239,50 +262,30 @@ float4 main(VSOut i) : SV_TARGET {
     float3 color  = p2.xyz;
     float2 rtDim  = max(p3.xy, float2(1.0, 1.0));
 
-    // Offset applied INVERSELY on the sample coord — sampling further back
-    // gives the visual sense that the shadow shifted forward.
+    // Source at current UV — the LAYER itself.
+    float4 src = tex.Sample(smp, i.uv);
+
+    // Shadow: sample the source alpha at a shifted UV. The shift is
+    // OPPOSITE the intended visual shadow direction, so sampling "up-left"
+    // of a pixel produces a shadow that visually appears down-right.
     float2 offsetPx = float2(cos(ang), sin(ang)) * dist;
     float2 offsetUV = offsetPx / rtDim;
     float2 srcUV    = i.uv - offsetUV;
 
-    // 5-tap blur along the perpendicular axis for softness. Cheap; not a
-    // proper 2D gaussian but visually reads as 'blurred shadow' up to
-    // ~10 px softness which is what users actually crank to.
+    // 5-tap perpendicular blur for softness. Reads only source alpha —
+    // we tint with `color` at composite time.
     float2 perp = float2(-sin(ang), cos(ang)) * (soft / rtDim);
-    float alpha = 0.0;
-    alpha += tex.Sample(smp, srcUV - 2.0 * perp).a * 0.06;
-    alpha += tex.Sample(smp, srcUV - 1.0 * perp).a * 0.24;
-    alpha += tex.Sample(smp, srcUV                ).a * 0.40;
-    alpha += tex.Sample(smp, srcUV + 1.0 * perp).a * 0.24;
-    alpha += tex.Sample(smp, srcUV + 2.0 * perp).a * 0.06;
+    float shadowA = 0.0;
+    shadowA += tex.Sample(smp, srcUV - 2.0 * perp).a * 0.06;
+    shadowA += tex.Sample(smp, srcUV - 1.0 * perp).a * 0.24;
+    shadowA += tex.Sample(smp, srcUV                ).a * 0.40;
+    shadowA += tex.Sample(smp, srcUV + 1.0 * perp).a * 0.24;
+    shadowA += tex.Sample(smp, srcUV + 2.0 * perp).a * 0.06;
+    shadowA *= opacity;
 
-    // Discard nearly-transparent pixels so the composite pass doesn't
-    // spend ROP bandwidth on empty shadow area.
-    if (alpha < 0.001) discard;
-    return float4(color, alpha * opacity);
-}
-)HLSL";
-
-// =============================================================================
-// Task 5.13: Drop Shadow composite. Samples TWO textures — the blurred
-// colored shadow (t0, from the offset pass) and the ORIGINAL untinted
-// source (t1, the input to the whole effect). Composites source-over-shadow
-// so the actual layer sits IN FRONT of its shadow. Blend state at draw
-// time is Normal — this shader outputs the final composited RGBA which
-// then blends onto whatever's below via the outer composite pass.
-// =============================================================================
-static const char* kPSDropShadowComposite = R"HLSL(
-Texture2D    shadowTex  : register(t0);
-Texture2D    sourceTex  : register(t1);
-SamplerState smp        : register(s0);
-struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
-
-float4 main(VSOut i) : SV_TARGET {
-    float4 sh  = shadowTex.Sample(smp, i.uv);
-    float4 src = sourceTex.Sample(smp, i.uv);
-    // Alpha-over: source on top of shadow.
-    float outA = src.a + sh.a * (1.0 - src.a);
-    float3 outRGB = src.rgb * src.a + sh.rgb * sh.a * (1.0 - src.a);
+    // Source-over-shadow composite, inline.
+    float outA    = src.a + shadowA * (1.0 - src.a);
+    float3 outRGB = src.rgb * src.a + color * shadowA * (1.0 - src.a);
     if (outA > 0.001) outRGB /= outA;
     return float4(outRGB, outA);
 }
@@ -354,10 +357,10 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
 
     // 3) Per-effect PS with pass-through fallback so a broken shader never
     //    takes down the app.
-    // Task 5.13: DropShadow slot in effect_ps_ stays null on purpose — the
-    // effect uses its own two-pass composite (ps_dropshadow_offset_ +
-    // ps_dropshadow_composite_) invoked directly from ApplyChain instead
-    // of the single-PS fullscreen dispatch used by simple effects.
+    // Task 5.13-fix4: DropShadow slot in effect_ps_ stays null on purpose —
+    // the effect uses ps_dropshadow_fused_ (single-pass fused shader)
+    // dispatched via a special branch in ApplyChain that also injects RT
+    // dims into cb.p3.xy for px->UV math.
     struct { EffectType t; const char* src; } entries[] = {
         { EffectType::MotionTile,             kPSMotionTile },
         { EffectType::DirectionalMotionBlur,  kPSMotionBlur },
@@ -375,8 +378,11 @@ bool EffectManager::Initialize(ID3D11Device* device, ID3D11DeviceContext* contex
     // Non-fatal on failure — DropShadow / composite would just no-op, so
     // the app stays runnable even if HLSL parsing hits a hardware quirk.
     ps_composite_            = CompilePS(kPSComposite,            "main");
-    ps_dropshadow_offset_    = CompilePS(kPSDropShadowOffset,     "main");
-    ps_dropshadow_composite_ = CompilePS(kPSDropShadowComposite,  "main");
+    // Task 5.13-fix4: single fused DropShadow PS. Old two-pass shaders
+    // (offset + composite) had a same-texture SRV+RTV bind conflict on
+    // Pass 2 that silently produced garbage. Fused version writes final
+    // composited RGBA in one pass from a single readSRV -> writeRTV bind.
+    ps_dropshadow_fused_     = CompilePS(kPSDropShadowFused,      "main");
 
     // Task 5.13-fix2: if composite shader compilation failed (unlikely but
     // not impossible on some drivers), fall back to the passthrough PS —
@@ -680,21 +686,18 @@ bool EffectManager::ApplyChain(ID3D11ShaderResourceView* sourceSRV,
         (void)isLast; // no longer differentiates dst — kept for clarity below
 
         // -------------------------------------------------------------
-        // Task 5.13: DropShadow is a COMPOUND effect — two internal
-        // passes with two SRVs bound simultaneously in pass 2. Handled
-        // out-of-band; the simple single-PS path below takes everything
-        // else.
-        // Pass 1 (offset+blur): writes colored shadow into writeRTV,
-        // reading only from readSRV. Safe because writeRTV backs a
-        // different texture than readSRV (post-swap invariant).
-        // Pass 2 (composite):   samples writeSRV (shadow) at t0 and
-        // readSRV (original) at t1, writes final composited RGBA into
-        // `dst`. When !isLast, dst is otherRTV (the free RT); when
-        // isLast, dst is the caller's destinationRTV.
+        // Task 5.13-fix4: DropShadow uses the FUSED single-pass shader.
+        // Reads source at readSRV, writes final composited RGBA into
+        // writeRTV. Identical bind pattern to a simple effect except we
+        // must inject the RT dims into cb.p3.xy for px->UV math inside
+        // the shader (Distance and Softness are in pixels).
+        //
+        // The old two-pass design bound readSRV as t1 while also using
+        // otherRTV = ping_rtv_ as the render target — same texture as
+        // readSRV — which D3D11 silently drops. See kPSDropShadowFused
+        // comment block above for full history.
         // -------------------------------------------------------------
-        if (eff.type == EffectType::DropShadow &&
-            ps_dropshadow_offset_ && ps_dropshadow_composite_) {
-            // Upload params + inject RT dims into p3.xy for px->UV math.
+        if (eff.type == EffectType::DropShadow && ps_dropshadow_fused_) {
             EffectParams pp = eff.params;
             pp.p3[0] = (float)width_;
             pp.p3[1] = (float)height_;
@@ -703,40 +706,10 @@ bool EffectManager::ApplyChain(ID3D11ShaderResourceView* sourceSRV,
                 std::memcpy(ms1.pData, &pp, sizeof(EffectParams));
                 context_->Unmap(cb_effect_, 0);
             }
-            // Pass 1: clear writeRTV to transparent so residual pixels
-            // from a previous effect or previous frame don't leak into
-            // the shadow. Then offset+blur into writeRTV from readSRV.
-            const float transparent[4] = { 0, 0, 0, 0 };
             context_->OMSetRenderTargets(1, &writeRTV, nullptr);
-            context_->ClearRenderTargetView(writeRTV, transparent);
-            DrawFullscreenPass(ps_dropshadow_offset_, readSRV);
-
-            // Pass 2: composite. Bind t0=writeSRV (shadow), t1=readSRV.
-            // Task 5.13: always write into otherRTV (the free pool RT).
-            // Post-loop passthrough copies the final pool SRV into the
-            // caller's destinationRTV.
-            const float transparent2[4] = { 0, 0, 0, 0 };
-            context_->OMSetRenderTargets(1, &otherRTV, nullptr);
-            context_->ClearRenderTargetView(otherRTV, transparent2);
-            ID3D11ShaderResourceView* twoSRVs[2] = { writeSRV, readSRV };
-            const UINT stride = sizeof(FullscreenVert);
-            const UINT offset = 0;
-            context_->IASetInputLayout(input_layout_);
-            context_->IASetVertexBuffers(0, 1, &vb_fullscreen_, &stride, &offset);
-            context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context_->VSSetShader(vs_fullscreen_, nullptr, 0);
-            context_->PSSetShader(ps_dropshadow_composite_, nullptr, 0);
-            context_->PSSetConstantBuffers(0, 1, &cb_effect_);
-            context_->PSSetSamplers(0, 1, &linear_clamp_);
-            context_->PSSetShaderResources(0, 2, twoSRVs);
-            context_->Draw(3, 0);
-            // Unbind both SRVs so the next pass can bind them as RTVs.
-            ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
-            context_->PSSetShaderResources(0, 2, nullSRVs);
-
-            // Composite result now lives in otherRTV/otherSRV.
-            finalOutputSRV = otherSRV;
-            readSRV = otherSRV;
+            DrawFullscreenPass(ps_dropshadow_fused_, readSRV);
+            finalOutputSRV = writeSRV;
+            readSRV  = writeSRV;
             std::swap(writeRTV, otherRTV);
             std::swap(writeSRV, otherSRV);
             continue;
@@ -835,8 +808,8 @@ void EffectManager::Shutdown() {
         ps_composite_->Release();
     }
     ps_composite_ = nullptr;
-    if (ps_dropshadow_offset_)     { ps_dropshadow_offset_->Release();     ps_dropshadow_offset_     = nullptr; }
-    if (ps_dropshadow_composite_)  { ps_dropshadow_composite_->Release();  ps_dropshadow_composite_  = nullptr; }
+    // Task 5.13-fix4: fused DropShadow PS replaces the old offset+composite pair.
+    if (ps_dropshadow_fused_)      { ps_dropshadow_fused_->Release();      ps_dropshadow_fused_      = nullptr; }
     if (ps_passthrough_) { ps_passthrough_->Release(); ps_passthrough_ = nullptr; }
     if (vs_fullscreen_)  { vs_fullscreen_->Release();  vs_fullscreen_  = nullptr; }
     if (input_layout_)   { input_layout_->Release();   input_layout_   = nullptr; }

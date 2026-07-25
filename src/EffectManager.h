@@ -157,15 +157,17 @@ private:
     //   ps_composite_ — plain SRV-over-RTV blit via alpha blend. Used to
     //                   composite an isolated layer's post-effect result
     //                   (in pingRTV) over the shared compRTV.
-    //   ps_dropshadow_offset_    — samples source with an offset+blur,
-    //                              tints by shadow color+opacity, writes
-    //                              a colored shadow into the destination.
-    //   ps_dropshadow_composite_ — samples TWO SRVs (blurred shadow at t0,
-    //                              original source at t1) and composites
-    //                              source-over-shadow into the destination.
-    ID3D11PixelShader* ps_composite_             = nullptr;
-    ID3D11PixelShader* ps_dropshadow_offset_     = nullptr;
-    ID3D11PixelShader* ps_dropshadow_composite_  = nullptr;
+    //   ps_dropshadow_fused_ — Task 5.13-fix4: single-pass DropShadow.
+    //                          Samples source at current UV (layer) AND at
+    //                          5 taps around a shifted UV (blurred shadow
+    //                          alpha), composites source-over-shadow
+    //                          inline, writes final RGBA in one pass. The
+    //                          old two-pass design (offset+composite)
+    //                          hit a same-texture SRV+RTV bind conflict
+    //                          on Pass 2 that silently produced garbage
+    //                          — "shape goes black on drop-shadow apply".
+    ID3D11PixelShader* ps_composite_       = nullptr;
+    ID3D11PixelShader* ps_dropshadow_fused_ = nullptr;
 
     UINT width_       = 0;
     UINT height_      = 0;
