@@ -280,11 +280,23 @@ struct AnimatedProperty {
 
     // -------------------------------------------------------------------------
     // AE stopwatch toggle.
+    // Task 5.14-hotfix (B2): when turning OFF, SNAPSHOT the currently-
+    // evaluated value into staticValue BEFORE clearing keyframes. Without
+    // this, disabling the stopwatch snaps the layer back to whatever
+    // staticValue held originally (often the very first value the property
+    // was constructed with — e.g. Vec3(0) rotation or Vec3(1,1,1) scale),
+    // producing a visible pose jump. Freezing at the current pose matches
+    // AE's actual behavior AND makes it obvious the property has "opted
+    // out" of animation without discarding the visible frame.
     // -------------------------------------------------------------------------
     void ToggleStopwatch(float t) {
         if (stopwatchEnabled) {
-            stopwatchEnabled = false;
+            // Snapshot current evaluated value BEFORE clearing so the
+            // layer stays visually at its current pose.
+            const T frozen = Evaluate(t);
             keyframes.clear();
+            stopwatchEnabled = false;
+            staticValue = frozen;
         } else {
             stopwatchEnabled = true;
             SetValue(t, staticValue);

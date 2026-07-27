@@ -2731,8 +2731,14 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
     }
 
     // Click-to-select any layer under the mouse (only when not dragging a handle)
+    // Task 5.14-hotfix (B1): if the click hits NO layer, deselect (matches AE).
+    // Without this, the bounding box + anchor of the previously-selected layer
+    // stayed visible until the user added another layer or clicked a different
+    // shape — dead cursor territory. Now clicking empty canvas clears the
+    // selection cleanly.
     if (activeGizmo == GizmoMode::None && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         auto& L = layerManager.Layers();
+        bool hitAny = false;
         for (auto it = L.rbegin(); it != L.rend(); ++it) {
             if (!it->isVisible) continue;
             if (it->is3D || it->type == ShapeType::Camera) continue;
@@ -2743,8 +2749,15 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
             if (local.x >= 0.0f && local.x <= sizeIt.x &&
                 local.y >= 0.0f && local.y <= sizeIt.y) {
                 layerManager.SetSelectedId(it->id);
+                hitAny = true;
                 break;
             }
+        }
+        if (!hitAny && layerManager.GetSelectedId() >= 0) {
+            // Empty canvas click => deselect. Snapshot so Ctrl+Z can restore
+            // the previous selection.
+            MarkForSnapshot();
+            layerManager.SetSelectedId(-1);
         }
     }
 
