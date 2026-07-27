@@ -244,6 +244,23 @@ std::size_t TextRenderer::ComputeCacheKey(const TextProps& p) {
 // =============================================================================
 // Rasterize a string into an R8 coverage bitmap
 // =============================================================================
+// Quick-win #7 (text oversample): render the atlas at kTextOversample x the
+// requested font size so that when the user zooms the viewport or scales
+// the text layer above 1:1, bilinear filtering has extra source pixels to
+// resolve into a crisp image instead of a blurry stretch of the exact-size
+// bitmap. 2x is the sweet spot: 4x the VRAM per text layer (~128 KB total
+// even for a long headline) buys crisp text up to ~200% effective zoom.
+// Beyond ~200% we're back to bilinear-stretching the oversampled atlas and
+// blur returns — the proper fix past that point is adaptive re-rasterize
+// (parked on the backlog).
+//
+// The caller-visible dims (outW/outH) are returned in VISUAL pixels — the
+// atlas texture itself is the 2x-oversampled size. Everything downstream
+// (MVP quad, stroke UV math, gizmo hit-box, sizePixels auto-grow) uses
+// visual dims so the layer's on-screen footprint stays correct; only the
+// texture-sample side of the pipeline sees the extra pixels.
+static constexpr int kTextOversample = 2;
+
 bool TextRenderer::RasterizeString(const TextProps& props,
                                     std::vector<unsigned char>& outPixels,
                                     int& outW, int& outH) {
@@ -326,12 +343,16 @@ bool TextRenderer::RasterizeString(const TextProps& props,
     }
     if (actualFamily.empty()) actualFamily = L"Segoe UI";
 
+    // Quick-win #7: multiply font size by kTextOversample. DirectWrite
+    // rasterizes glyphs at this bigger size; when we hand the atlas to
+    // the shader with a quad sized at VISUAL pixels, bilinear filtering
+    // does a high-quality downsample per screen pixel.
     ComPtr<IDWriteTextFormat> format;
     HRESULT hr = factory_->CreateTextFormat(
         actualFamily.c_str(),
         collection.Get(),
         weight, style, DWRITE_FONT_STRETCH_NORMAL,
-        props.fontSize,
+        props.fontSize * (float)kTextOversample,
         L"en-us",
         format.GetAddressOf());
     if (FAILED(hr) || !format) return false;
@@ -523,17 +544,27 @@ bool TextRenderer::EnsureLayerCache(Layer& layer, ID3D11Device* device) {
         layer.textTexH = 0;
         return false;
     }
-    layer.textTexW     = w;
-    layer.textTexH     = h;
+    // Quick-win #7: the atlas texture is uploaded at RasterizeString's
+    // return dims (2x-oversampled). Everything downstream that stamps a
+    // visual quad on screen uses the DIVIDED dims — the MVP quad, stroke
+    // uvStep half-extent, gizmo hit-box, and sizePixels auto-grow. This
+    // way the layer's on-screen footprint stays at the visual size the
+    // user asked for while the atlas holds 4x the pixel data per screen
+    // pixel to keep the glyphs crisp under zoom / scale.
+    // Ceiling divide so odd-atlas-width doesn't lose a visual pixel.
+    const int visualW = std::max(1, (w + kTextOversample - 1) / kTextOversample);
+    const int visualH = std::max(1, (h + kTextOversample - 1) / kTextOversample);
+    layer.textTexW     = visualW;
+    layer.textTexH     = visualH;
     layer.textCacheKey = key;
 
-    // Task 5.9-fix (auto-grow bounding box): mirror the atlas dims into
+    // Task 5.9-fix (auto-grow bounding box): mirror the VISUAL dims into
     // sizePixels.staticValue so the gizmo hit-box matches what's actually
     // on screen. Only touch it when the size stopwatch is OFF — if the
     // user has size keyframes they explicitly want a fixed rect, don't
     // stomp those.
     if (!layer.transform.sizePixels.stopwatchEnabled) {
-        layer.transform.sizePixels.staticValue = Vec2((float)w, (float)h);
+        layer.transform.sizePixels.staticValue = Vec2((float)visualW, (float)visualH);
     }
     return true;
 }
