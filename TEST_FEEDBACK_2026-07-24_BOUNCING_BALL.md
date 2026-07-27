@@ -287,12 +287,19 @@ User: "if i adjust x or y value and then toggle the link button then the
 x or y should be equal to each other and the total scale should work
 without the toggle button"
 
-Currently if scale is X=1.5, Y=0.8, then user clicks the link chain
-icon, we probably do nothing until the next edit. Should:
-- On link toggle ON: set both X and Y to the AVERAGE (or the LAST-edited value)
-- Keep them equal on every subsequent edit until toggled off
+**RESOLVED as no-op (2026-07-25).** On re-read with user, they confirmed
+they want pure AE behavior: link toggle PRESERVES the current X:Y:Z
+ratio (does NOT snap-equalize on toggle). Current implementation in
+DrawInspectorPanel at RenderEngine.cpp:1576 already does this — ratio
+preservation via applyLink() lambda. No code change needed.
 
-Small fix, high UX value.
+Original feedback likely meant "when I click link and then drag one
+axis, all three should update together" — which is exactly what pure
+AE does. The word "equal" in the report was ambiguous.
+
+If a future user actually wants Photoshop-style snap-to-equal on
+toggle, that's a 1-line addition to the linkedScale=!linkedScale
+handler: `if (linkedScale) { scl.y = scl.x; scl.z = scl.x; sel->transform.scale.SetValue(t, scl); }`.
 
 ---
 

@@ -377,7 +377,13 @@ private:
     ImVec2 cameraDragLastMouse = ImVec2(0, 0);
 
     // Gizmo interaction state — sticky across frames while dragging.
-    enum class GizmoMode { None, Move, ScaleNW, ScaleNE, ScaleSW, ScaleSE };
+    // Quick-win #6: added N/E/S/W mid-side handles for single-axis scale.
+    // Corner handles (NW/NE/SE/SW) scale both axes; mid-side handles lock
+    // one axis via the existing startDX=0 or startDY=0 short-circuit in
+    // the drag math (Vec2 handleLocalStart placement drives which axis).
+    enum class GizmoMode { None, Move,
+                           ScaleNW, ScaleNE, ScaleSW, ScaleSE,
+                           ScaleN,  ScaleE,  ScaleS,  ScaleW };
     GizmoMode activeGizmo = GizmoMode::None;
     Vec2 dragStartMouseLocal   = { 0.0f, 0.0f };
     Vec2 dragStartPosition     = { 0.0f, 0.0f };

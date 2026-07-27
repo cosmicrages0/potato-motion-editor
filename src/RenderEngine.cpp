@@ -2017,8 +2017,14 @@ static ImVec2 ToScreen(const Vec2& worldPt, ImVec2 canvasOrigin) {
 // Dark 3-px stroke underneath for legibility on any bg, thin 1-px white
 // core on top. Corner handles = small filled white squares with a dark
 // outline sandwich, ~4 px total.
+//
+// Quick-win #6: optional mid-side handles (N/E/S/W midpoints of each edge)
+// for single-axis scaling. Passed as an extra bool because the 3D-layer
+// selection path only shows corners (mid-side scale on a 3D quad would
+// need per-axis basis math that we don't have yet).
 static void DrawSelectionBox(ImDrawList* dl,
-                             const ImVec2 corners[4]) {
+                             const ImVec2 corners[4],
+                             bool drawMidHandles = true) {
     if (!dl) return;
     const ImU32 shadow = IM_COL32(0,   0,   0,   200);
     const ImU32 core   = IM_COL32(255, 255, 255, 255);
@@ -2029,13 +2035,24 @@ static void DrawSelectionBox(ImDrawList* dl,
     // Corner handles: 4-px square, dark outline sandwich then white fill.
     const float R = 3.5f;   // half-size of handle
     const float O = 4.5f;   // half-size of handle outline (1 px bigger)
-    for (int i = 0; i < 4; ++i) {
-        dl->AddRectFilled(ImVec2(corners[i].x - O, corners[i].y - O),
-                          ImVec2(corners[i].x + O, corners[i].y + O),
-                          shadow);
-        dl->AddRectFilled(ImVec2(corners[i].x - R, corners[i].y - R),
-                          ImVec2(corners[i].x + R, corners[i].y + R),
-                          core);
+    auto handleAt = [&](const ImVec2& p) {
+        dl->AddRectFilled(ImVec2(p.x - O, p.y - O),
+                          ImVec2(p.x + O, p.y + O), shadow);
+        dl->AddRectFilled(ImVec2(p.x - R, p.y - R),
+                          ImVec2(p.x + R, p.y + R), core);
+    };
+    for (int i = 0; i < 4; ++i) handleAt(corners[i]);
+    // Mid-side handles: N=mid(NW,NE), E=mid(NE,SE), S=mid(SE,SW), W=mid(SW,NW).
+    // Convention matches the CompositionRenderer corner order
+    //   corners[0]=NW, [1]=NE, [2]=SE, [3]=SW.
+    if (drawMidHandles) {
+        auto mid = [](const ImVec2& a, const ImVec2& b) {
+            return ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+        };
+        handleAt(mid(corners[0], corners[1])); // N
+        handleAt(mid(corners[1], corners[2])); // E
+        handleAt(mid(corners[2], corners[3])); // S
+        handleAt(mid(corners[3], corners[0])); // W
     }
 }
 
@@ -2234,12 +2251,27 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
     const bool active  = ImGui::IsItemActive();
 
     // Begin drag on click
+    // Quick-win #6: mid-side handles for single-axis scale.
+    // Corner order convention: NW=(0,0), NE=(w,0), SE=(w,h), SW=(0,h).
+    // Midpoints: N=mid(NW,NE), E=mid(NE,SE), S=mid(SE,SW), W=mid(SW,NW).
+    const Vec2 mN = Vec2((nw.x + ne.x) * 0.5f, (nw.y + ne.y) * 0.5f);
+    const Vec2 mE = Vec2((ne.x + se.x) * 0.5f, (ne.y + se.y) * 0.5f);
+    const Vec2 mS = Vec2((se.x + sw.x) * 0.5f, (se.y + sw.y) * 0.5f);
+    const Vec2 mW = Vec2((sw.x + nw.x) * 0.5f, (sw.y + nw.y) * 0.5f);
+
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && activeGizmo == GizmoMode::None) {
         GizmoMode mode = GizmoMode::None;
+        // Corners first (they win over mid-handles if the mouse is near a
+        // corner where the two hit-regions overlap).
         if      (dist(mouseCanvas, nw) < kHit) mode = GizmoMode::ScaleNW;
         else if (dist(mouseCanvas, ne) < kHit) mode = GizmoMode::ScaleNE;
         else if (dist(mouseCanvas, se) < kHit) mode = GizmoMode::ScaleSE;
         else if (dist(mouseCanvas, sw) < kHit) mode = GizmoMode::ScaleSW;
+        // Mid-side single-axis handles.
+        else if (dist(mouseCanvas, mN) < kHit) mode = GizmoMode::ScaleN;
+        else if (dist(mouseCanvas, mE) < kHit) mode = GizmoMode::ScaleE;
+        else if (dist(mouseCanvas, mS) < kHit) mode = GizmoMode::ScaleS;
+        else if (dist(mouseCanvas, mW) < kHit) mode = GizmoMode::ScaleW;
         else if (dist(mouseCanvas, center) < kHit + 2.0f) mode = GizmoMode::Move;
         else {
             const Mat3 inv = worldMatrix.InverseAffine();
@@ -2283,10 +2315,20 @@ void RenderEngine::HandleGizmoInteraction(Layer& layer, const Mat3& worldMatrix,
 
             Vec2 handleLocalStart;
             switch (activeGizmo) {
+                // Corner handles — both axes scale.
                 case GizmoMode::ScaleNW: handleLocalStart = Vec2(0.0f,             0.0f);             break;
                 case GizmoMode::ScaleNE: handleLocalStart = Vec2(dragStartSize.x,  0.0f);             break;
                 case GizmoMode::ScaleSE: handleLocalStart = Vec2(dragStartSize.x,  dragStartSize.y);  break;
                 case GizmoMode::ScaleSW: handleLocalStart = Vec2(0.0f,             dragStartSize.y);  break;
+                // Quick-win #6: mid-side handles — one axis locks via the
+                // startDX=0 / startDY=0 short-circuit further down (sx or
+                // sy falls to 1.0 when the anchor-relative offset is 0).
+                // N/S handles sit on the anchor's X-column so startDX=0 -> sx=1.
+                // E/W handles sit on the anchor's Y-row    so startDY=0 -> sy=1.
+                case GizmoMode::ScaleN:  handleLocalStart = Vec2(anchorLocal.x,    0.0f);             break;
+                case GizmoMode::ScaleE:  handleLocalStart = Vec2(dragStartSize.x,  anchorLocal.y);    break;
+                case GizmoMode::ScaleS:  handleLocalStart = Vec2(anchorLocal.x,    dragStartSize.y);  break;
+                case GizmoMode::ScaleW:  handleLocalStart = Vec2(0.0f,             anchorLocal.y);    break;
                 default: handleLocalStart = anchorLocal; break;
             }
             const float startDX = handleLocalStart.x - anchorLocal.x;
@@ -2662,8 +2704,11 @@ void RenderEngine::DrawViewportCanvas() {
                     ImVec2(lbOrigin.x + projected[2].x, lbOrigin.y + projected[2].y),
                     ImVec2(lbOrigin.x + projected[3].x, lbOrigin.y + projected[3].y),
                 };
-                // Quick-win #3: unified selection box style for 3D layers too.
-                DrawSelectionBox(draw_list, q);
+                // Quick-win #3: unified selection box style for 3D layers.
+                // No mid-side handles here — 3D single-axis scale would
+                // need per-axis basis math we don't compute for the
+                // projected quad. Corners only.
+                DrawSelectionBox(draw_list, q, /*drawMidHandles=*/false);
             }
         }
     }
@@ -4486,6 +4531,11 @@ void RenderEngine::DrawDebugPanel() {
         case GizmoMode::ScaleNE: modeName = "ScaleNE"; break;
         case GizmoMode::ScaleSW: modeName = "ScaleSW"; break;
         case GizmoMode::ScaleSE: modeName = "ScaleSE"; break;
+        // Quick-win #6: mid-side handles.
+        case GizmoMode::ScaleN:  modeName = "ScaleN";  break;
+        case GizmoMode::ScaleE:  modeName = "ScaleE";  break;
+        case GizmoMode::ScaleS:  modeName = "ScaleS";  break;
+        case GizmoMode::ScaleW:  modeName = "ScaleW";  break;
     }
     ImGui::Text("Active: %s   Drag layer id: %d", modeName, dragLayerId);
     ImGui::Text("Drag start mouse (canvas): (%.1f, %.1f)",
