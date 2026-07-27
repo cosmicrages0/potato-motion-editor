@@ -214,25 +214,27 @@ important for readability.
 User: "why our canvas looks like old paint graphics i know we are doing in
 c++, i think is it because we dont have AA anti aliasing on shapes"
 
-Our shape SDF pixel shader DOES do 1-pixel-wide edge smoothing (Iñigo
-Quílez SDF-with-fwidth trick). So basic AA is on. What's probably
-happening:
-- The shape's rasterization is fine
-- BUT the **letterbox display** — where compRTV gets scaled into the
-  viewport panel — is using point sampling (no linear filtering) when
-  the panel is at a different size than compRTV
-- Result: at fractional zoom, edges look chunky
+**PARTIALLY RESOLVED (2026-07-25):** After investigation, text-only issue.
+Quick-win #7 (`ca1fcf0`) 2x oversamples the text atlas so text stays crisp
+under zoom / scale up to ~200%. User confirmed shapes look fine (SDF AA
+already working via Iñigo Quílez fwidth trick).
 
-Also possible: no MSAA on compRTV itself (currently 1 sample). Bumping
-to 4 samples costs 4× VRAM for the composition RT but gives crisp
-edges regardless of zoom. Not free.
+**Follow-up (2026-07-25):** user wants per-shape AA options:
+> "we give options on shapes like little antialiasing or crisp, or a
+> toggle button for all the elements shapes etc will have feature like
+> to doesnt stressed out the computer, we gives options like crisp
+> detailed, smooth edges, and antialiasing"
 
-Fix candidates:
-- (Easy) Ensure the ImGui `AddImage` for compSRV uses linear sampling
-  — but this is per-ImGui-backend, need to check
-- (Medium) Add supersample option: render compRTV at 2× logical res
-  then downsample on display. Sharper but 4× more work.
-- (Big) True MSAA on the RT
+Concrete design (parked, medium task):
+- Per-layer enum: `AAMode { Crisp=0, Smooth=1, HighQuality=2 }`
+  - Crisp: no AA, hard edges (fastest, for pixel-art / retro looks)
+  - Smooth: current 1-pixel SDF AA (default, what we have now)
+  - HighQuality: 2-pixel SDF AA + 4-tap supersample inside the pixel shader
+- Global default in Composition Settings ("Default shape AA")
+- Per-layer override in Inspector (dropdown next to shape type)
+- Serialization: optional field in .pmge, defaults to Smooth for old files
+- ~40 LOC change: enum + shader branch on cb.params[3] + UI dropdown +
+  serialization roundtrip
 
 ### 4.2 [POLISH] Anchor point too big, looks cartoonish — S
 User: "the anchor point is looking like cartoonish, the anchor point is
