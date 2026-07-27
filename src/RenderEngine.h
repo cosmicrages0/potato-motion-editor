@@ -209,6 +209,18 @@ private:
     DiamondHit  draggedDiamond;
     bool        diamondDragActive = false;
 
+    // Task 5.15: while any inline drag-float value editor is active
+    // (in the timeline strip sub-rows), suspend the anim clock so
+    // playback doesn't spam keyframes across frames while the user
+    // is dragging. Same freeze-clock pattern as gizmo/diamond drag.
+    bool        inspectorValueDragActive = false;
+
+    // Task 5.15: which property the graph editor is currently focused on.
+    // -1 = fall back to selected layer + default property. Set by the
+    // per-property graph icon click in the timeline sub-rows.
+    int             graphFocusedLayerId   = -1;
+    DiamondProperty graphFocusedProperty  = DiamondProperty::Position;
+
     // Task 5.14: pre-allocated row layout scratch for the twirl-down
     // timeline. Populated fresh each frame (clear + push, never resized),
     // reserved to 2048 rows in Initialize() so the frame loop never
@@ -248,8 +260,12 @@ private:
     // NOT in .pmge — editor state, matches how preview scale / dock layout
     // are handled today.
     // -------------------------------------------------------------------------
-    enum class BottomPaneMode : int { Bars = 0, Graph = 1 };
+    // Task 5.15: SideBySide mode splits the bottom dock into strip
+    // (left) + graph editor (right) with a persistable splitter.
+    // Shift+F3 cycles Bars -> Graph -> SideBySide -> Bars.
+    enum class BottomPaneMode : int { Bars = 0, Graph = 1, SideBySide = 2 };
     BottomPaneMode bottomPaneMode      = BottomPaneMode::Bars;
+    float          bottomPaneGraphSplit = 0.60f;  // strip fraction in SideBySide
     float          bottomPaneSplitFrac = 0.30f;   // 0.15 .. 0.60
     bool           bottomDockSettingsRegistered = false;
     void           RegisterBottomDockSettings(); // one-time ini-handler install

@@ -8,10 +8,13 @@
 #include <wrl/client.h>   // Task 5.9: Microsoft::WRL::ComPtr
 
 #include <string>
+#include <string_view>   // Task 5.15: property-path lookup w/o temp alloc
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>       // Task 5.15: std::memcmp for path comparisons
 
 #include "MathTypes.h"
 #include "AnimationEngine.h"
@@ -212,6 +215,118 @@ struct Layer {
             if (*it == effectId) { expandedEffectIds.erase(it); return; }
         }
         expandedEffectIds.push_back(effectId);
+    }
+
+    // -----------------------------------------------------------------
+    // Task 5.15: lazy property revelation for the timeline sub-rows.
+    //
+    // Instead of Task 5.14's "twirl Transform open -> show all 6
+    // properties" model, sub-rows appear only for properties the user
+    // has touched. Each entry pairs a property path (a stable string
+    // key) with a bitmask of reveal reasons.
+    //
+    // Reveal reasons stack:
+    //   Explicit  = user right-clicked "Show in Timeline". STICKY —
+    //               auto-hide is skipped entirely when this bit is set.
+    //   Modified  = staticValue differs from constructionDefault.
+    //   Animated  = has keyframes OR stopwatch is on.
+    //
+    // Auto-hide per-frame check (row-list build):
+    //   if !(flags & Explicit) AND
+    //      ((flags & Modified) => IsAtConstructionDefault()) AND
+    //      ((flags & Animated) => keyframes.empty() && !stopwatchEnabled)
+    //   -> drop the entry entirely.
+    //
+    // Paths in use (v1):
+    //   "transform.position", "transform.rotation", "transform.scale",
+    //   "transform.opacity",  "transform.anchor",   "transform.size"
+    // Future paths (Commit 22 territory):
+    //   "fill.color", "stroke.color", "stroke.width",
+    //   "effect:<effectId>:<paramName>"
+    //
+    // Serialised to .pmge so reopened projects preserve the visible
+    // sub-row layout. Old files without the field get a migration pass
+    // (see Serialization.cpp).
+    // -----------------------------------------------------------------
+    enum RevealFlags : uint8_t {
+        Reveal_None     = 0,
+        Reveal_Explicit = 1u << 0,
+        Reveal_Modified = 1u << 1,
+        Reveal_Animated = 1u << 2,
+    };
+    struct RevealedProperty {
+        std::string path;    // owned; small n, rare mutations
+        uint8_t     flags = 0;
+    };
+    mutable std::vector<RevealedProperty> revealedProperties;
+
+    // string_view lookups avoid temporary allocations from string literals.
+    bool IsPropertyRevealed(std::string_view path) const {
+        for (const auto& r : revealedProperties) {
+            if (r.path.size() == path.size() &&
+                std::memcmp(r.path.data(), path.data(), path.size()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    uint8_t GetRevealFlags(std::string_view path) const {
+        for (const auto& r : revealedProperties) {
+            if (r.path.size() == path.size() &&
+                std::memcmp(r.path.data(), path.data(), path.size()) == 0) {
+                return r.flags;
+            }
+        }
+        return 0;
+    }
+    void RevealProperty(std::string_view path, uint8_t reason) const {
+        for (auto& r : revealedProperties) {
+            if (r.path.size() == path.size() &&
+                std::memcmp(r.path.data(), path.data(), path.size()) == 0) {
+                r.flags |= reason;
+                // Task 5.15: auto-open the group so the user sees the
+                // sub-row appear immediately after touching a property.
+                AutoExpandGroupForPath(path);
+                return;
+            }
+        }
+        RevealedProperty rp;
+        rp.path.assign(path.data(), path.size());
+        rp.flags = reason;
+        revealedProperties.push_back(std::move(rp));
+        AutoExpandGroupForPath(path);
+    }
+
+private:
+    // Task 5.15: reveal auto-opens the containing group so the new
+    // sub-row is actually visible. "transform.*" -> Expand_Transform;
+    // "effect:*" -> Expand_Effects. Called from RevealProperty.
+    void AutoExpandGroupForPath(std::string_view path) const {
+        if (path.size() >= 10 && std::memcmp(path.data(), "transform.", 10) == 0) {
+            timelineExpandMask |= Expand_Transform;
+        } else if (path.size() >= 7 && std::memcmp(path.data(), "effect:", 7) == 0) {
+            timelineExpandMask |= Expand_Effects;
+        }
+    }
+public:
+    void ClearRevealFlag(std::string_view path, uint8_t reason) const {
+        for (auto it = revealedProperties.begin(); it != revealedProperties.end(); ++it) {
+            if (it->path.size() == path.size() &&
+                std::memcmp(it->path.data(), path.data(), path.size()) == 0) {
+                it->flags &= ~reason;
+                if (it->flags == 0) revealedProperties.erase(it);
+                return;
+            }
+        }
+    }
+    void HideProperty(std::string_view path) const {
+        for (auto it = revealedProperties.begin(); it != revealedProperties.end(); ++it) {
+            if (it->path.size() == path.size() &&
+                std::memcmp(it->path.data(), path.data(), path.size()) == 0) {
+                revealedProperties.erase(it);
+                return;
+            }
+        }
     }
 
     Effect* AddEffect(const Effect& proto) {

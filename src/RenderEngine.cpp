@@ -389,9 +389,13 @@ void RenderEngine::BeginFrame() {
     // Alight behavior: dragging silently suspends the clock; releasing
     // resumes playback where it left off. isPlaying is left untouched
     // so no explicit re-Play is needed.
+    // Task 5.15: also freeze on inline drag-float editing in the
+    // timeline sub-rows (`inspectorValueDragActive`). Prevents key
+    // spam when a user scrubs a value during playback.
     const bool anyDragActive =
         (activeGizmo != GizmoMode::None) ||
-        diamondDragActive;
+        diamondDragActive ||
+        inspectorValueDragActive;
     if (!anyDragActive) {
         animEngine.Update(deltaTime);
     }
@@ -849,14 +853,22 @@ void RenderEngine::DrawTimelinePanel() {
         if (graphSel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.52f, 0.85f, 1.0f));
         if (ImGui::Button("Graph##paneMode")) bottomPaneMode = BottomPaneMode::Graph;
         if (graphSel) ImGui::PopStyleColor();
+        // Task 5.15: SideBySide toggle. Third-mode button.
+        ImGui::SameLine();
+        const bool sideSel = (bottomPaneMode == BottomPaneMode::SideBySide);
+        if (sideSel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.52f, 0.85f, 1.0f));
+        if (ImGui::Button("Side##paneMode")) bottomPaneMode = BottomPaneMode::SideBySide;
+        if (sideSel) ImGui::PopStyleColor();
     }
-    // Global Shift+F3 shortcut — only fires when the Timeline is focused
-    // OR nobody's typing text (so it doesn't fire mid-input).
+    // Task 5.15: Shift+F3 cycles Bars -> Graph -> SideBySide -> Bars.
     if (!ImGui::GetIO().WantTextInput &&
         ImGui::IsKeyPressed(ImGuiKey_F3) &&
         (ImGui::GetIO().KeyShift)) {
-        bottomPaneMode = (bottomPaneMode == BottomPaneMode::Bars)
-                            ? BottomPaneMode::Graph : BottomPaneMode::Bars;
+        switch (bottomPaneMode) {
+            case BottomPaneMode::Bars:       bottomPaneMode = BottomPaneMode::Graph;      break;
+            case BottomPaneMode::Graph:      bottomPaneMode = BottomPaneMode::SideBySide; break;
+            case BottomPaneMode::SideBySide: bottomPaneMode = BottomPaneMode::Bars;       break;
+        }
     }
 
     // Task 5.0-b: composition duration is now editable directly from the
@@ -891,8 +903,54 @@ void RenderEngine::DrawTimelinePanel() {
     //                 the bottom dock with the Timeline anymore).
     if (bottomPaneMode == BottomPaneMode::Bars) {
         DrawTimelineStrip();
-    } else {
+    } else if (bottomPaneMode == BottomPaneMode::Graph) {
         DrawGraphEditor();
+    } else {
+        // Task 5.15: SideBySide. Split content area horizontally using
+        // two ImGui child windows so each panel gets its own scroll
+        // context. Splitter is a simple width-drag in the middle.
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float minPct = 0.20f, maxPct = 0.85f;
+        if (bottomPaneGraphSplit < minPct) bottomPaneGraphSplit = minPct;
+        if (bottomPaneGraphSplit > maxPct) bottomPaneGraphSplit = maxPct;
+        const float leftW  = std::max(120.0f, avail.x * bottomPaneGraphSplit);
+        const float splW   = 6.0f;
+        const float rightW = std::max(120.0f, avail.x - leftW - splW);
+        if (ImGui::BeginChild("##paneStrip", ImVec2(leftW, avail.y), false,
+                              ImGuiWindowFlags_NoScrollbar)) {
+            DrawTimelineStrip();
+        }
+        ImGui::EndChild();
+        ImGui::SameLine();
+        // Splitter — vertical drag handle.
+        {
+            const ImVec2 spOrigin = ImGui::GetCursorScreenPos();
+            ImGui::InvisibleButton("##paneSplit", ImVec2(splW, avail.y));
+            const bool hov = ImGui::IsItemHovered();
+            const bool act = ImGui::IsItemActive();
+            ImDrawList* dl2 = ImGui::GetWindowDrawList();
+            if (dl2) {
+                dl2->AddRectFilled(spOrigin,
+                                   ImVec2(spOrigin.x + splW, spOrigin.y + avail.y),
+                                   (hov || act) ? IM_COL32(120, 140, 200, 180)
+                                                : IM_COL32(60, 60, 70, 200));
+            }
+            if (hov || act) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            if (act) {
+                const float dx = ImGui::GetIO().MouseDelta.x;
+                if (dx != 0.0f && avail.x > 1.0f) {
+                    bottomPaneGraphSplit += dx / avail.x;
+                    if (bottomPaneGraphSplit < minPct) bottomPaneGraphSplit = minPct;
+                    if (bottomPaneGraphSplit > maxPct) bottomPaneGraphSplit = maxPct;
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::BeginChild("##paneGraph", ImVec2(rightW, avail.y), false,
+                              ImGuiWindowFlags_NoScrollbar)) {
+            DrawGraphEditor();
+        }
+        ImGui::EndChild();
     }
 }
 
@@ -975,9 +1033,52 @@ void RenderEngine::DrawTimelineStrip() {
             timelineRows_.push_back(r);
             yCursor += kHeaderRowH;
 
-            // Transform sub-rows (6 properties).
+            // Task 5.15: lazy transform sub-rows. Instead of blindly
+            // emitting all 6 properties when Expand_Transform is set,
+            // check each property against the layer's revealedProperties
+            // set. Also run auto-hide: if a property is only revealed
+            // via Modified or Animated (not Explicit) AND its state no
+            // longer justifies the reveal, drop the entry so the sub-row
+            // disappears cleanly the next frame.
+            //
+            // Auto-hide runs BEFORE the layout so the row-list reflects
+            // the post-hide state. This is safe because auto-hide only
+            // ever REMOVES entries — it can't cause a reveal/hide race
+            // (the Explicit bit is sticky per DeepSeek review).
+            auto autoHideCheck = [&](const char* path, auto& prop) {
+                const uint8_t f = L.GetRevealFlags(std::string_view(path));
+                if (f == 0) return; // not revealed, nothing to do
+                if (f & (uint8_t)Layer::Reveal_Explicit) return; // sticky
+                bool stillModified = !prop.IsAtConstructionDefault();
+                bool stillAnimated = prop.HasStopwatch() || !prop.keyframes.empty();
+                bool keep = false;
+                if ((f & (uint8_t)Layer::Reveal_Modified) && stillModified) keep = true;
+                if ((f & (uint8_t)Layer::Reveal_Animated) && stillAnimated) keep = true;
+                if (!keep) L.HideProperty(std::string_view(path));
+            };
+            autoHideCheck("transform.position", L.transform.position);
+            autoHideCheck("transform.rotation", L.transform.rotation);
+            autoHideCheck("transform.scale",    L.transform.scale);
+            autoHideCheck("transform.opacity",  L.transform.opacity);
+            autoHideCheck("transform.anchor",   L.transform.anchorPoint);
+            autoHideCheck("transform.size",     L.transform.sizePixels);
+
+            // Emit a sub-row per REVEALED transform property. Order
+            // matches DiamondProperty enum so subIndex still lines up
+            // with the switch in the draw dispatch.
+            static const char* kTransformPaths[6] = {
+                "transform.position",  // DiamondProperty::Position
+                "transform.rotation",  // DiamondProperty::Rotation
+                "transform.scale",     // DiamondProperty::Scale
+                "transform.opacity",   // DiamondProperty::Opacity
+                "transform.anchor",    // DiamondProperty::Anchor
+                "transform.size",      // DiamondProperty::Size
+            };
             if (L.timelineExpandMask & Layer::Expand_Transform) {
                 for (int p = 0; p < 6; ++p) {
+                    if (!L.IsPropertyRevealed(std::string_view(kTransformPaths[p]))) {
+                        continue;
+                    }
                     TimelineRow sr{};
                     sr.layerId  = L.id;
                     sr.kind     = TimelineRow::TransformProp;
@@ -1004,9 +1105,24 @@ void RenderEngine::DrawTimelineStrip() {
                     timelineRows_.push_back(er);
                     yCursor += kSubRowH;
 
+                    // Task 5.15: effect PARAM sub-rows are lazy too. Only
+                    // emit when a specific param is revealed via
+                    // "effect:<id>:<name>" path. Commit 22 will add the
+                    // reveal hooks (edit param in Inspector -> reveal;
+                    // stopwatch on -> reveal) alongside AnimatedProperty
+                    // wrapping of the params. For v1 of Commit 19 there
+                    // are no such revealed entries yet, so twirling an
+                    // effect open shows just its header row — cleaner
+                    // than dumping 5 read-only param readouts on the user.
                     if (L.IsEffectExpanded(e.id)) {
                         const int nParams = effectParamCount(e.type);
                         for (int pi = 0; pi < nParams; ++pi) {
+                            char pathBuf[64];
+                            std::snprintf(pathBuf, sizeof(pathBuf),
+                                          "effect:%d:%d", e.id, pi);
+                            if (!L.IsPropertyRevealed(std::string_view(pathBuf))) {
+                                continue;
+                            }
                             TimelineRow pr{};
                             pr.layerId  = L.id;
                             pr.kind     = TimelineRow::EffectParam;
@@ -1247,14 +1363,44 @@ void RenderEngine::DrawTimelineStrip() {
         // Row-kind dispatch
         // ===============================================================
         if (row.kind == TimelineRow::LayerHeader) {
-            // --- Twirl icon (Transform) at very left --------------------
-            const float twirlSize = 14.0f;
-            const ImVec2 twirlPos(origin.x + 7.0f, absYc);
-            drawTwirl(dl, twirlPos, (layer.timelineExpandMask & Layer::Expand_Transform) != 0);
+            // Task 5.15: label column layout redefined per user feedback.
+            //   OLD:  [twirl 14px] [Vis 18px] [Name flex] [Parent 90px] [fx chip]
+            //   NEW:  [Vis 18px] [twirl 14px] [Blend 60px] [Name flex] [fx chip]
+            // Parent combo removed — belongs in the Inspector, not the strip
+            // (matches AE 2025 — parent is a structural attribute, not a
+            // timing one).
+            const float visW    = 18.0f;
+            const float twirlW  = 14.0f;
+            const float blendW  = 60.0f;
+            const bool  showBlendCol = (trackX0 - origin.x) > 200.0f;
+            const bool  hasEffects   = !layer.effects.empty();
+            const float fxChipW = hasEffects ? 22.0f : 0.0f;
+            const float visX   = origin.x + 2.0f;
+            const float twirlX = visX + visW + 2.0f;
+            const float blendX = twirlX + twirlW + 4.0f;
+            const float nameX0 = showBlendCol ? (blendX + blendW + 6.0f)
+                                              : (twirlX + twirlW + 6.0f);
+            const float nameX1 = origin.x + (trackX0 - origin.x) - fxChipW - 6.0f;
+
+            // --- Vis checkbox (FIRST now) --------------------------------
             {
+                ImGui::PushID((int)(0x7B000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(visX, absY0 + 2.0f));
+                bool vis = layer.isVisible;
+                if (ImGui::Checkbox("##vis", &vis)) {
+                    MarkForSnapshot();
+                    layer.isVisible = vis;
+                }
+                ImGui::PopID();
+            }
+            // --- Twirl icon (Transform expand) --------------------------
+            {
+                const ImVec2 twirlPos(twirlX + 6.0f, absYc);
+                drawTwirl(dl, twirlPos,
+                          (layer.timelineExpandMask & Layer::Expand_Transform) != 0);
                 ImGui::PushID((int)(0x71000000 | layer.id));
-                ImGui::SetCursorScreenPos(ImVec2(origin.x + 0.0f, absY0 + 2.0f));
-                ImGui::InvisibleButton("##twirlXform", ImVec2(twirlSize, row.rowH - 4.0f));
+                ImGui::SetCursorScreenPos(ImVec2(twirlX, absY0 + 2.0f));
+                ImGui::InvisibleButton("##twirlXform", ImVec2(twirlW, row.rowH - 4.0f));
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                     MarkForSnapshot();
                     layer.timelineExpandMask ^= Layer::Expand_Transform;
@@ -1262,27 +1408,26 @@ void RenderEngine::DrawTimelineStrip() {
                 if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
                 ImGui::PopID();
             }
-            // Layout inside labelW (after the twirl icon):
-            //   [twirl 14px] [Vis 18px] [Name flex] [Parent combo] [fx chip]
-            const float twirlW  = 14.0f;
-            const float visW    = 18.0f;
-            const float parentW = 90.0f;
-            const bool  showParentCol = (trackX0 - origin.x) > 260.0f;
-            const bool  hasEffects    = !layer.effects.empty();
-            const float fxChipW = hasEffects ? 22.0f : 0.0f;
-            const float nameX0    = origin.x + twirlW + visW + 6.0f;
-            const float parentX0  = origin.x + (trackX0 - origin.x) - parentW - fxChipW - 6.0f;
-            const float nameX1    = showParentCol ? (parentX0 - 4.0f)
-                                                  : (trackX0 - fxChipW - 6.0f);
-
-            // --- Vis checkbox --------------------------------------------
-            {
-                ImGui::PushID((int)(0x7B000000 | layer.id));
-                ImGui::SetCursorScreenPos(ImVec2(origin.x + twirlW, absY0 + 2.0f));
-                bool vis = layer.isVisible;
-                if (ImGui::Checkbox("##vis", &vis)) {
-                    MarkForSnapshot();
-                    layer.isVisible = vis;
+            // --- Blend Mode combo (replaces old Parent combo) -----------
+            if (showBlendCol) {
+                static const char* kBlendNames[6] = {
+                    "Normal", "Add", "Multiply", "Screen", "Overlay", "Dodge"
+                };
+                const int bi = std::clamp((int)layer.blend, 0, 5);
+                ImGui::PushID((int)(0x7C000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(blendX, absY0 + 1.0f));
+                ImGui::SetNextItemWidth(blendW);
+                if (ImGui::BeginCombo("##blend", kBlendNames[bi],
+                                       ImGuiComboFlags_HeightSmall |
+                                       ImGuiComboFlags_NoArrowButton)) {
+                    for (int b = 0; b < 6; ++b) {
+                        const bool selb = (bi == b);
+                        if (ImGui::Selectable(kBlendNames[b], selb)) {
+                            MarkForSnapshot();
+                            layer.blend = (BlendMode)b;
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
                 ImGui::PopID();
             }
@@ -1303,37 +1448,6 @@ void RenderEngine::DrawTimelineStrip() {
                 }
                 dl->AddText(ImVec2(nameX0, absY0 + 2.0f),
                             IM_COL32(220, 220, 230, 255), buf);
-            }
-            // --- Parent combo --------------------------------------------
-            if (showParentCol) {
-                ImGui::PushID((int)(0x7C000000 | layer.id));
-                ImGui::SetCursorScreenPos(ImVec2(parentX0, absY0 + 1.0f));
-                ImGui::SetNextItemWidth(parentW);
-                const Layer* parent = layerManager.GetLayerById(layer.parentId);
-                const char* preview = parent ? parent->name.c_str() : "(none)";
-                if (ImGui::BeginCombo("##parent", preview,
-                                       ImGuiComboFlags_HeightSmall |
-                                       ImGuiComboFlags_NoArrowButton)) {
-                    const float ct = animEngine.currentTime;
-                    if (ImGui::Selectable("(none)", layer.parentId == -1)) {
-                        MarkForSnapshot();
-                        layerManager.SetParentPreservingWorld(layer.id, -1, ct);
-                    }
-                    for (const auto& candidate : layers) {
-                        if (candidate.id == layer.id) continue;
-                        const bool wouldCycle =
-                            layerManager.WouldCreateCycle(layer.id, candidate.id);
-                        const ImGuiSelectableFlags flags =
-                            wouldCycle ? ImGuiSelectableFlags_Disabled : 0;
-                        const bool selc = (layer.parentId == candidate.id);
-                        if (ImGui::Selectable(candidate.name.c_str(), selc, flags)) {
-                            MarkForSnapshot();
-                            layerManager.SetParentPreservingWorld(layer.id, candidate.id, ct);
-                        }
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::PopID();
             }
             // --- fx chip (only when effects exist) -----------------------
             if (hasEffects) {
@@ -1528,13 +1642,47 @@ void RenderEngine::DrawTimelineStrip() {
                 ImGui::InvisibleButton("##sw", ImVec2(14.0f, row.rowH - 2.0f));
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                     MarkForSnapshot();
+                    // Task 5.15: also refresh the reveal flag so the
+                    // sub-row stays visible after toggling. If OFF,
+                    // Animated bit clears via auto-hide next frame
+                    // (unless Modified/Explicit also present).
+                    const char* pathForP = nullptr;
+                    bool onNow = false;
                     switch ((DiamondProperty)p) {
-                        case DiamondProperty::Position:  layer.transform.position   .ToggleStopwatch(t); break;
-                        case DiamondProperty::Rotation:  layer.transform.rotation   .ToggleStopwatch(t); break;
-                        case DiamondProperty::Scale:     layer.transform.scale      .ToggleStopwatch(t); break;
-                        case DiamondProperty::Opacity:   layer.transform.opacity    .ToggleStopwatch(t); break;
-                        case DiamondProperty::Anchor:    layer.transform.anchorPoint.ToggleStopwatch(t); break;
-                        case DiamondProperty::Size:      layer.transform.sizePixels .ToggleStopwatch(t); break;
+                        case DiamondProperty::Position:
+                            layer.transform.position.ToggleStopwatch(t);
+                            onNow = layer.transform.position.HasStopwatch();
+                            pathForP = "transform.position"; break;
+                        case DiamondProperty::Rotation:
+                            layer.transform.rotation.ToggleStopwatch(t);
+                            onNow = layer.transform.rotation.HasStopwatch();
+                            pathForP = "transform.rotation"; break;
+                        case DiamondProperty::Scale:
+                            layer.transform.scale.ToggleStopwatch(t);
+                            onNow = layer.transform.scale.HasStopwatch();
+                            pathForP = "transform.scale"; break;
+                        case DiamondProperty::Opacity:
+                            layer.transform.opacity.ToggleStopwatch(t);
+                            onNow = layer.transform.opacity.HasStopwatch();
+                            pathForP = "transform.opacity"; break;
+                        case DiamondProperty::Anchor:
+                            layer.transform.anchorPoint.ToggleStopwatch(t);
+                            onNow = layer.transform.anchorPoint.HasStopwatch();
+                            pathForP = "transform.anchor"; break;
+                        case DiamondProperty::Size:
+                            layer.transform.sizePixels.ToggleStopwatch(t);
+                            onNow = layer.transform.sizePixels.HasStopwatch();
+                            pathForP = "transform.size"; break;
+                    }
+                    if (pathForP && onNow) {
+                        layer.RevealProperty(std::string_view(pathForP),
+                                             (uint8_t)Layer::Reveal_Animated);
+                    } else if (pathForP && !onNow) {
+                        // Stopwatch off — clear only the Animated bit.
+                        // Modified/Explicit stay to keep the row visible
+                        // if they justified the reveal too.
+                        layer.ClearRevealFlag(std::string_view(pathForP),
+                                              (uint8_t)Layer::Reveal_Animated);
                     }
                 }
                 if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -1543,12 +1691,193 @@ void RenderEngine::DrawTimelineStrip() {
             // Property name label
             dl->AddText(ImVec2(labelX, absY0 + 0.0f),
                         IM_COL32(200, 200, 210, 255), propName);
-            // Value readout (right-aligned within labelW, read-only in v1)
+            // Task 5.15: inline drag-float value editor. Replaces the
+            // read-only text readout with a scrubbable widget scoped
+            // to the property's type (Vec3 -> DragFloat3, etc).
+            // Freeze the anim clock while any of these are being
+            // edited (see anyDragActive check in BeginFrame).
+            //
+            // Widget hit region sits at [valueX .. valueX+80] within
+            // the label column. Clicking + dragging modifies value
+            // in-place; the drag flag `inspectorValueDragActive`
+            // suspends playback so we don't spam keyframes across
+            // multiple frames.
             {
-                const ImVec2 vsz = ImGui::CalcTextSize(valueBuf);
-                dl->AddText(ImVec2(std::max(labelX + 60.0f, valueX + (80.0f - vsz.x) * 0.5f),
-                                   absY0 + 0.0f),
-                            IM_COL32(150, 155, 170, 255), valueBuf);
+                ImGui::PushID((int)(0x78000000 | (layer.id << 8) | p));
+                ImGui::SetCursorScreenPos(ImVec2(valueX, absY0 + 0.0f));
+                ImGui::SetNextItemWidth(80.0f);
+                // Small style tweaks so the widget matches the strip
+                // aesthetic (dim text, no visible frame until hover).
+                ImGui::PushStyleColor(ImGuiCol_FrameBg,        IM_COL32(0, 0, 0, 0));
+                ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(60, 65, 80, 200));
+                ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  IM_COL32(80, 90, 110, 220));
+                bool changed = false;
+                switch ((DiamondProperty)p) {
+                    case DiamondProperty::Position: {
+                        Vec3 v = layer.transform.position.Evaluate(t);
+                        changed = ImGui::DragFloat2("##v", &v.x, 0.5f);
+                        if (changed) {
+                            layer.transform.position.SetValue(t, v);
+                            layer.RevealProperty(std::string_view("transform.position"),
+                                layer.transform.position.HasStopwatch()
+                                    ? (uint8_t)Layer::Reveal_Animated
+                                    : (uint8_t)Layer::Reveal_Modified);
+                        }
+                    } break;
+                    case DiamondProperty::Rotation: {
+                        Vec3 v = layer.transform.rotation.Evaluate(t);
+                        changed = ImGui::DragFloat("##v", &v.z, 0.5f);
+                        if (changed) {
+                            layer.transform.rotation.SetValue(t, v);
+                            layer.RevealProperty(std::string_view("transform.rotation"),
+                                layer.transform.rotation.HasStopwatch()
+                                    ? (uint8_t)Layer::Reveal_Animated
+                                    : (uint8_t)Layer::Reveal_Modified);
+                        }
+                    } break;
+                    case DiamondProperty::Scale: {
+                        Vec3 v = layer.transform.scale.Evaluate(t);
+                        changed = ImGui::DragFloat2("##v", &v.x, 0.01f, -10.0f, 10.0f);
+                        if (changed) {
+                            layer.transform.scale.SetValue(t, v);
+                            layer.RevealProperty(std::string_view("transform.scale"),
+                                layer.transform.scale.HasStopwatch()
+                                    ? (uint8_t)Layer::Reveal_Animated
+                                    : (uint8_t)Layer::Reveal_Modified);
+                        }
+                    } break;
+                    case DiamondProperty::Opacity: {
+                        float v = layer.transform.opacity.Evaluate(t);
+                        changed = ImGui::DragFloat("##v", &v, 0.005f, 0.0f, 1.0f);
+                        if (changed) {
+                            layer.transform.opacity.SetValue(t, v);
+                            layer.RevealProperty(std::string_view("transform.opacity"),
+                                layer.transform.opacity.HasStopwatch()
+                                    ? (uint8_t)Layer::Reveal_Animated
+                                    : (uint8_t)Layer::Reveal_Modified);
+                        }
+                    } break;
+                    case DiamondProperty::Anchor: {
+                        Vec2 v = layer.transform.anchorPoint.Evaluate(t);
+                        changed = ImGui::DragFloat2("##v", &v.x, 0.01f, 0.0f, 1.0f);
+                        if (changed) {
+                            layer.transform.anchorPoint.SetValue(t, v);
+                            layer.RevealProperty(std::string_view("transform.anchor"),
+                                layer.transform.anchorPoint.HasStopwatch()
+                                    ? (uint8_t)Layer::Reveal_Animated
+                                    : (uint8_t)Layer::Reveal_Modified);
+                        }
+                    } break;
+                    case DiamondProperty::Size: {
+                        Vec2 v = layer.transform.sizePixels.Evaluate(t);
+                        changed = ImGui::DragFloat2("##v", &v.x, 1.0f, 1.0f, 4096.0f);
+                        if (changed) {
+                            layer.transform.sizePixels.SetValue(t, v);
+                            layer.RevealProperty(std::string_view("transform.size"),
+                                layer.transform.sizePixels.HasStopwatch()
+                                    ? (uint8_t)Layer::Reveal_Animated
+                                    : (uint8_t)Layer::Reveal_Modified);
+                        }
+                    } break;
+                }
+                if (ImGui::IsItemActivated())            MarkForSnapshot();
+                if (ImGui::IsItemActive())               inspectorValueDragActive = true;
+                if (ImGui::IsItemDeactivatedAfterEdit()) inspectorValueDragActive = false;
+                ImGui::PopStyleColor(3);
+                ImGui::PopID();
+            }
+            // Task 5.15: right-click on the property name / value opens
+            // a small context menu to Hide the row (removes from
+            // revealedProperties) or Reset to Default (clears static +
+            // stopwatch + keys). Uses labelX region as the hit area.
+            {
+                ImGui::PushID((int)(0x7E000000 | (layer.id << 8) | p));
+                ImGui::SetCursorScreenPos(ImVec2(labelX, absY0 + 1.0f));
+                ImGui::InvisibleButton("##proprc", ImVec2(80.0f, row.rowH - 2.0f));
+                if (ImGui::BeginPopupContextItem("##propMenu")) {
+                    static const char* kPaths[6] = {
+                        "transform.position", "transform.rotation",
+                        "transform.scale",    "transform.opacity",
+                        "transform.anchor",   "transform.size"
+                    };
+                    if (ImGui::MenuItem("Hide Property")) {
+                        MarkForSnapshot();
+                        layer.HideProperty(std::string_view(kPaths[p]));
+                    }
+                    if (ImGui::MenuItem("Reset to Default")) {
+                        MarkForSnapshot();
+                        // Reset staticValue to constructionDefault +
+                        // clear keys + turn stopwatch off. Cleanest way:
+                        // build a fresh AnimatedProperty from the
+                        // existing constructionDefault, keep the field
+                        // typed.
+                        switch ((DiamondProperty)p) {
+                            case DiamondProperty::Position:
+                                layer.transform.position.keyframes.clear();
+                                layer.transform.position.stopwatchEnabled = false;
+                                layer.transform.position.staticValue =
+                                    layer.transform.position.constructionDefault; break;
+                            case DiamondProperty::Rotation:
+                                layer.transform.rotation.keyframes.clear();
+                                layer.transform.rotation.stopwatchEnabled = false;
+                                layer.transform.rotation.staticValue =
+                                    layer.transform.rotation.constructionDefault; break;
+                            case DiamondProperty::Scale:
+                                layer.transform.scale.keyframes.clear();
+                                layer.transform.scale.stopwatchEnabled = false;
+                                layer.transform.scale.staticValue =
+                                    layer.transform.scale.constructionDefault; break;
+                            case DiamondProperty::Opacity:
+                                layer.transform.opacity.keyframes.clear();
+                                layer.transform.opacity.stopwatchEnabled = false;
+                                layer.transform.opacity.staticValue =
+                                    layer.transform.opacity.constructionDefault; break;
+                            case DiamondProperty::Anchor:
+                                layer.transform.anchorPoint.keyframes.clear();
+                                layer.transform.anchorPoint.stopwatchEnabled = false;
+                                layer.transform.anchorPoint.staticValue =
+                                    layer.transform.anchorPoint.constructionDefault; break;
+                            case DiamondProperty::Size:
+                                layer.transform.sizePixels.keyframes.clear();
+                                layer.transform.sizePixels.stopwatchEnabled = false;
+                                layer.transform.sizePixels.staticValue =
+                                    layer.transform.sizePixels.constructionDefault; break;
+                        }
+                        layer.HideProperty(std::string_view(kPaths[p]));
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+            }
+            // Task 5.15: per-property "open in graph" icon at the right
+            // edge of the label column. Small line-chart glyph drawn via
+            // ImDrawList. Click switches to Graph or SideBySide mode and
+            // sets graphFocusedProperty so the editor opens on THIS
+            // property, not whatever the global dropdown was on.
+            {
+                const float giX = origin.x + labelW - 16.0f;
+                const float giY = absYc;
+                // Chart glyph: 3 short line segments forming an arc.
+                const ImU32 iconCol = swOn ? IM_COL32(180, 200, 255, 255)
+                                           : IM_COL32(120, 125, 140, 180);
+                dl->AddLine(ImVec2(giX - 4.0f, giY + 3.0f),
+                            ImVec2(giX - 1.0f, giY - 1.0f), iconCol, 1.2f);
+                dl->AddLine(ImVec2(giX - 1.0f, giY - 1.0f),
+                            ImVec2(giX + 2.0f, giY + 1.0f), iconCol, 1.2f);
+                dl->AddLine(ImVec2(giX + 2.0f, giY + 1.0f),
+                            ImVec2(giX + 5.0f, giY - 4.0f), iconCol, 1.2f);
+                ImGui::PushID((int)(0x79000000 | (layer.id << 8) | p));
+                ImGui::SetCursorScreenPos(ImVec2(giX - 5.0f, absY0 + 1.0f));
+                ImGui::InvisibleButton("##gicon", ImVec2(12.0f, row.rowH - 2.0f));
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    graphFocusedLayerId  = layer.id;
+                    graphFocusedProperty = (DiamondProperty)p;
+                    if (bottomPaneMode == BottomPaneMode::Bars) {
+                        bottomPaneMode = BottomPaneMode::SideBySide;
+                    }
+                }
+                ImGui::PopID();
             }
             // Diamonds — only this property's, in this row.
             switch ((DiamondProperty)p) {
@@ -1931,22 +2260,47 @@ void RenderEngine::DrawInspectorPanel() {
         if (stopwatch("pos", sel->transform.position.HasStopwatch())) {
             MarkForSnapshot();
             sel->transform.position.ToggleStopwatch(t);
+            // Task 5.15: reveal on stopwatch ON. Toggle OFF does NOT
+            // clear the reveal — Modified bit persists so the row stays
+            // visible until value returns to default (or user hides it).
+            if (sel->transform.position.HasStopwatch()) {
+                sel->RevealProperty(std::string_view("transform.position"),
+                                    (uint8_t)Layer::Reveal_Animated);
+            }
         }
         ImGui::SameLine();
         Vec3 pos = sel->transform.position.Evaluate(t);
-        if (ImGui::DragFloat3("Position (x,y,z)", &pos.x, 1.0f))
+        if (ImGui::DragFloat3("Position (x,y,z)", &pos.x, 1.0f)) {
             sel->transform.position.SetValue(t, pos);
+            // Task 5.15: auto-reveal on Inspector edit. Adds Modified
+            // flag (or Animated if stopwatch is on — auto-hide handles
+            // the actual condition check next frame).
+            sel->RevealProperty(std::string_view("transform.position"),
+                sel->transform.position.HasStopwatch()
+                    ? (uint8_t)Layer::Reveal_Animated
+                    : (uint8_t)Layer::Reveal_Modified);
+        }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // ROTATION (Vec3, degrees)
         if (stopwatch("rot", sel->transform.rotation.HasStopwatch())) {
             MarkForSnapshot();
             sel->transform.rotation.ToggleStopwatch(t);
+            // Task 5.15: turning stopwatch ON reveals with Animated flag.
+            if (sel->transform.rotation.HasStopwatch()) {
+                sel->RevealProperty(std::string_view("transform.rotation"),
+                                    (uint8_t)Layer::Reveal_Animated);
+            }
         }
         ImGui::SameLine();
         Vec3 rot = sel->transform.rotation.Evaluate(t);
-        if (ImGui::DragFloat3("Rotation (deg)", &rot.x, 0.5f))
+        if (ImGui::DragFloat3("Rotation (deg)", &rot.x, 0.5f)) {
             sel->transform.rotation.SetValue(t, rot);
+            sel->RevealProperty(std::string_view("transform.rotation"),
+                sel->transform.rotation.HasStopwatch()
+                    ? (uint8_t)Layer::Reveal_Animated
+                    : (uint8_t)Layer::Reveal_Modified);
+        }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // SCALE (Vec3) + linked-scale chain button (Task 5.3-fix-3).
@@ -1957,6 +2311,10 @@ void RenderEngine::DrawInspectorPanel() {
         if (stopwatch("scl", sel->transform.scale.HasStopwatch())) {
             MarkForSnapshot();
             sel->transform.scale.ToggleStopwatch(t);
+            if (sel->transform.scale.HasStopwatch()) {
+                sel->RevealProperty(std::string_view("transform.scale"),
+                                    (uint8_t)Layer::Reveal_Animated);
+            }
         }
         ImGui::SameLine();
         // Chain-link button. Lit orange when linked, dim gray when unlinked.
@@ -2011,19 +2369,33 @@ void RenderEngine::DrawInspectorPanel() {
                 }
             }
             sel->transform.scale.SetValue(t, scl);
+            sel->RevealProperty(std::string_view("transform.scale"),
+                sel->transform.scale.HasStopwatch()
+                    ? (uint8_t)Layer::Reveal_Animated
+                    : (uint8_t)Layer::Reveal_Modified);
         }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // ANCHOR (Vec2) — animatable but no stopwatch UI for it in Task 5.1
         Vec2 anchor = sel->transform.anchorPoint.Evaluate(t);
-        if (ImGui::DragFloat2("Anchor (0..1)", &anchor.x, 0.01f, 0.0f, 1.0f))
+        if (ImGui::DragFloat2("Anchor (0..1)", &anchor.x, 0.01f, 0.0f, 1.0f)) {
             sel->transform.anchorPoint.SetValue(t, anchor);
+            sel->RevealProperty(std::string_view("transform.anchor"),
+                sel->transform.anchorPoint.HasStopwatch()
+                    ? (uint8_t)Layer::Reveal_Animated
+                    : (uint8_t)Layer::Reveal_Modified);
+        }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // SIZE (Vec2)
         Vec2 size = sel->transform.sizePixels.Evaluate(t);
-        if (ImGui::DragFloat2("Size (px)", &size.x, 1.0f, 1.0f, 4096.0f))
+        if (ImGui::DragFloat2("Size (px)", &size.x, 1.0f, 1.0f, 4096.0f)) {
             sel->transform.sizePixels.SetValue(t, size);
+            sel->RevealProperty(std::string_view("transform.size"),
+                sel->transform.sizePixels.HasStopwatch()
+                    ? (uint8_t)Layer::Reveal_Animated
+                    : (uint8_t)Layer::Reveal_Modified);
+        }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
         ImGui::TextDisabled("Size = base authoring pixels. Scale = animation multiplier.");
 
@@ -2031,11 +2403,20 @@ void RenderEngine::DrawInspectorPanel() {
         if (stopwatch("op", sel->transform.opacity.HasStopwatch())) {
             MarkForSnapshot();
             sel->transform.opacity.ToggleStopwatch(t);
+            if (sel->transform.opacity.HasStopwatch()) {
+                sel->RevealProperty(std::string_view("transform.opacity"),
+                                    (uint8_t)Layer::Reveal_Animated);
+            }
         }
         ImGui::SameLine();
         float op = sel->transform.opacity.Evaluate(t);
-        if (ImGui::SliderFloat("Opacity", &op, 0.0f, 1.0f))
+        if (ImGui::SliderFloat("Opacity", &op, 0.0f, 1.0f)) {
             sel->transform.opacity.SetValue(t, op);
+            sel->RevealProperty(std::string_view("transform.opacity"),
+                sel->transform.opacity.HasStopwatch()
+                    ? (uint8_t)Layer::Reveal_Animated
+                    : (uint8_t)Layer::Reveal_Modified);
+        }
         if (ImGui::IsItemActivated()) MarkForSnapshot();
 
         // Task 5.0: help hint so users don't need to guess the workflow.

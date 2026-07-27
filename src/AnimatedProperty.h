@@ -216,6 +216,21 @@ inline T EvaluateBezierSegment(const Keyframe<T>& A, const Keyframe<T>& B, float
     return EvalBezierValueAtU(s, u);
 }
 
+// Task 5.15: per-type equality with a small epsilon for float. Kept
+// out-of-class + non-template overloads so ADL picks the right one
+// without needing operator== on Vec2/Vec3 (which we don't want to add
+// globally — risks affecting unrelated code paths).
+inline bool AP_ValuesEqual(float a, float b) {
+    return std::fabs(a - b) < 1e-6f;
+}
+inline bool AP_ValuesEqual(const Vec2& a, const Vec2& b) {
+    return std::fabs(a.x - b.x) < 1e-6f && std::fabs(a.y - b.y) < 1e-6f;
+}
+inline bool AP_ValuesEqual(const Vec3& a, const Vec3& b) {
+    return std::fabs(a.x - b.x) < 1e-6f && std::fabs(a.y - b.y) < 1e-6f
+        && std::fabs(a.z - b.z) < 1e-6f;
+}
+
 // -----------------------------------------------------------------------------
 // AnimatedProperty<T>.
 // -----------------------------------------------------------------------------
@@ -224,9 +239,22 @@ struct AnimatedProperty {
     T                        staticValue{};
     std::vector<Keyframe<T>> keyframes;
     bool                     stopwatchEnabled = false;
+    // Task 5.15: seeded from the constructor's initial value; NEVER
+    // mutated after that. Used by IsAtConstructionDefault() so the
+    // lazy-reveal auto-hide check knows when a property has been
+    // "returned to its factory state" and should drop from the
+    // timeline sub-row list.
+    //
+    // CRITICAL: per DeepSeek review, each Transform property has its
+    // OWN non-identity default (Scale=1, Anchor=0.5, Size=200/120,
+    // Opacity=1). Storing the construction value here — rather than
+    // hardcoding per-T defaults elsewhere — means IsAtConstructionDefault
+    // works correctly for ALL properties without special-casing.
+    T                        constructionDefault{};
 
     AnimatedProperty() = default;
-    AnimatedProperty(const T& initial) : staticValue(initial) {}
+    AnimatedProperty(const T& initial)
+        : staticValue(initial), constructionDefault(initial) {}
 
     // -------------------------------------------------------------------------
     // Read path. Returns the value at composition time t.
@@ -305,6 +333,16 @@ struct AnimatedProperty {
 
     bool IsAnimated() const  { return stopwatchEnabled && !keyframes.empty(); }
     bool HasStopwatch() const { return stopwatchEnabled; }
+
+    // Task 5.15: lazy-reveal auto-hide helper. Returns true when the
+    // property's staticValue is still (approximately) what the caller
+    // passed to the constructor. Combined with keyframes.empty() and
+    // !stopwatchEnabled, this signals the property has "returned to
+    // factory state" and the timeline sub-row can auto-hide.
+    // Per-T equality via a tiny non-template helper below.
+    bool IsAtConstructionDefault() const {
+        return AP_ValuesEqual(staticValue, constructionDefault);
+    }
 
     // Remove a keyframe close to t. Returns true if one was removed.
     bool RemoveKeyAt(float t) {
