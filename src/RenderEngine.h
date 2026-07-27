@@ -191,7 +191,13 @@ private:
 
     // Task 5.3: keyframe diamond interaction state for the timeline strip.
     // Not a public type; scoped to timeline drawing.
-    enum class DiamondProperty : int { Position = 0, Rotation = 1, Scale = 2, Opacity = 3 };
+    // Task 5.14: Anchor + Size added — they were AnimatedProperty already,
+    // just not drawn as diamonds. With per-property sub-rows there's now a
+    // place to show them.
+    enum class DiamondProperty : int {
+        Position = 0, Rotation = 1, Scale = 2, Opacity = 3,
+        Anchor   = 4, Size     = 5,
+    };
     struct DiamondHit {
         int             layerId  = -1;
         DiamondProperty which    = DiamondProperty::Position;
@@ -202,6 +208,26 @@ private:
     };
     DiamondHit  draggedDiamond;
     bool        diamondDragActive = false;
+
+    // Task 5.14: pre-allocated row layout scratch for the twirl-down
+    // timeline. Populated fresh each frame (clear + push, never resized),
+    // reserved to 2048 rows in Initialize() so the frame loop never
+    // heap-allocates. See DESIGN_COMMIT17_AE_TIMELINE_TWIRL.md §Row
+    // iteration for the rationale.
+    struct TimelineRow {
+        int      layerId  = -1;
+        enum Kind : uint8_t {
+            LayerHeader   = 0,
+            TransformProp = 1,   // subIndex = DiamondProperty
+            EffectHeader  = 2,   // subIndex = effect vector index at layout time
+            EffectParam   = 3,   // subIndex = param idx within its effect (0..3)
+        } kind = LayerHeader;
+        uint8_t  subIndex = 0;
+        int      effectId = -1;  // populated for EffectHeader/EffectParam only
+        uint8_t  rowH     = 18;  // 18 for headers, 14 for sub-rows
+        float    y0       = 0.0f;
+    };
+    std::vector<TimelineRow> timelineRows_;
 
     // Task 5.11: drag-to-reorder state for the timeline label column.
     // Left-click-and-hold on a layer name and drag up/down; when the

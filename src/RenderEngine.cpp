@@ -93,6 +93,12 @@ bool RenderEngine::Initialize(const char* title, int width, int height) {
         std::cerr << "[RenderEngine] CompositionRenderer init failed" << std::endl;
     }
 
+    // Task 5.14: reserve the twirl-down row-layout scratch so the frame
+    // loop never heap-allocates. 2048 rows accommodates ~100 layers with
+    // everything expanded — well beyond realistic use. `.clear()` at
+    // frame top preserves capacity, per PROJECT_BRIEFING §7.
+    timelineRows_.reserve(2048);
+
     // Task 5.9: DirectWrite text sprite renderer. Non-fatal on failure —
     // Text layers just won't render, but everything else still works.
     textRenderer = new TextRenderer();
@@ -921,12 +927,104 @@ void RenderEngine::DrawTimelineStrip() {
     if (labelW > stripW * 0.60f)  labelW = stripW * 0.60f;
     if (labelW < 100.0f)          labelW = 100.0f;
     const float rulerH = 22.0f;
-    const float rowH   = 18.0f;
+    // Task 5.14: rowH removed — row heights are now per-row (18 px for
+    // layer-header rows, 14 px for sub-rows). See timelineRows_ below.
     // Task 5.10: mutable ref so trim-bar drag can mutate in/out points
     // directly. Diamond drag path already relies on mutation via
     // property accessors, so this doesn't regress anything.
     auto& layers = layerManager.Layers();
-    const float bodyH  = rowH * std::max<int>(1, (int)layers.size());
+
+    // -----------------------------------------------------------------
+    // Task 5.14: row-list layout pass. Build timelineRows_ in AE-order
+    // (top row = last vector index = front-most). Each layer contributes
+    // 1 header row plus 0..N sub-rows depending on its expand state.
+    // Zero heap alloc — vector was reserved(2048) in Initialize; we
+    // only .clear() (preserves capacity) + .push_back() within cap.
+    // -----------------------------------------------------------------
+    const float kHeaderRowH = 18.0f;
+    const float kSubRowH    = 14.0f;
+    timelineRows_.clear();
+    // Helper: how many params does an EffectType expose in the sub-rows.
+    // Kept local (tiny switch) so we don't spread this knowledge across
+    // files — matches the labels used in DrawEffectParamRow below.
+    auto effectParamCount = [](EffectType t) -> int {
+        switch (t) {
+            case EffectType::MotionTile:            return 3; // TileCount/Phase/MirrorEdges
+            case EffectType::DirectionalMotionBlur: return 3; // Angle/Intensity/Samples
+            case EffectType::ChromaticAberration:   return 3; // Amount/Angle/Radial
+            case EffectType::BlendMode:             return 1; // mode
+            case EffectType::DropShadow:            return 5; // Distance/Angle/Softness/Opacity/Color
+            default:                                return 0;
+        }
+    };
+
+    {
+        float yCursor = rulerH;
+        const size_t nLayersForLayout = layers.size();
+        for (size_t rowI = 0; rowI < nLayersForLayout; ++rowI) {
+            const size_t i = nLayersForLayout - 1 - rowI;
+            const Layer& L = layers[i];
+            // Header row for the layer group.
+            TimelineRow r{};
+            r.layerId  = L.id;
+            r.kind     = TimelineRow::LayerHeader;
+            r.subIndex = 0;
+            r.effectId = -1;
+            r.rowH     = (uint8_t)kHeaderRowH;
+            r.y0       = yCursor;
+            timelineRows_.push_back(r);
+            yCursor += kHeaderRowH;
+
+            // Transform sub-rows (6 properties).
+            if (L.timelineExpandMask & Layer::Expand_Transform) {
+                for (int p = 0; p < 6; ++p) {
+                    TimelineRow sr{};
+                    sr.layerId  = L.id;
+                    sr.kind     = TimelineRow::TransformProp;
+                    sr.subIndex = (uint8_t)p;
+                    sr.effectId = -1;
+                    sr.rowH     = (uint8_t)kSubRowH;
+                    sr.y0       = yCursor;
+                    timelineRows_.push_back(sr);
+                    yCursor += kSubRowH;
+                }
+            }
+
+            // Effect header rows + optional per-effect param sub-rows.
+            if ((L.timelineExpandMask & Layer::Expand_Effects) && !L.effects.empty()) {
+                for (int ei = 0; ei < (int)L.effects.size(); ++ei) {
+                    const Effect& e = L.effects[ei];
+                    TimelineRow er{};
+                    er.layerId  = L.id;
+                    er.kind     = TimelineRow::EffectHeader;
+                    er.subIndex = (uint8_t)ei;
+                    er.effectId = e.id;
+                    er.rowH     = (uint8_t)kSubRowH;
+                    er.y0       = yCursor;
+                    timelineRows_.push_back(er);
+                    yCursor += kSubRowH;
+
+                    if (L.IsEffectExpanded(e.id)) {
+                        const int nParams = effectParamCount(e.type);
+                        for (int pi = 0; pi < nParams; ++pi) {
+                            TimelineRow pr{};
+                            pr.layerId  = L.id;
+                            pr.kind     = TimelineRow::EffectParam;
+                            pr.subIndex = (uint8_t)pi;
+                            pr.effectId = e.id;
+                            pr.rowH     = (uint8_t)kSubRowH;
+                            pr.y0       = yCursor;
+                            timelineRows_.push_back(pr);
+                            yCursor += kSubRowH;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const float bodyH  = std::max(kHeaderRowH,
+                                  timelineRows_.empty() ? kHeaderRowH
+                                                        : (timelineRows_.back().y0 + timelineRows_.back().rowH - rulerH));
     const float totalH = rulerH + bodyH + 4.0f;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -997,328 +1095,569 @@ void RenderEngine::DrawTimelineStrip() {
         }
     }
 
-    // Per-layer rows with keyframe diamonds.
-    // Task 5.11 (AE-order): row 0 (top of strip) maps to the LAST layer in
-    // the vector — matches AE where the top row is the front-most layer.
-    // CompositionRenderer keeps its forward-vector iteration (later index =
-    // drawn last = on top), which is what makes the front-most layer
-    // visually on top of the canvas AND at the top of the timeline strip.
+    // Task 5.14: single-pass row draw dispatching on TimelineRow::kind.
+    // Row Y is already computed in the layout pass above (timelineRows_).
+    // Compares to today's pre-5.14 code, this loop no longer computes Y
+    // from the row index — it reads row.y0 which respects variable
+    // heights (18 px header + 14 px sub-rows).
+    //
+    // Task 5.11 (AE-order): top row = last vector index = front-most
+    // layer. The layout pass already walked layers in reverse order, so
+    // timelineRows_ is in draw order.
     const int selectedId = layerManager.GetSelectedId();
-    // Task 5.3-fix: precompute playhead X once so per-diamond render code can
+    // Task 5.3-fix: precompute playhead X once so per-diamond render can
     // highlight keys that are near the playhead.
     const float playheadX = TimeToX(animEngine.currentTime);
     constexpr float kNearPlayheadPixels = 10.0f;
     const size_t nLayers = layers.size();
-    for (size_t rowI = 0; rowI < nLayers; ++rowI) {
-        // Vector index that this row displays (top row = last vector element).
-        const size_t i = nLayers - 1 - rowI;
-        Layer& layer = layers[i];    // Task 5.10: mutable for trim-bar drag
-        const float rowY0 = origin.y + rulerH + rowH * (float)rowI;
-        const float rowYc = rowY0 + rowH * 0.5f;
+    const ImVec2 mp = ImGui::GetIO().MousePos;
 
-        // Row background: highlight selected. Slightly brighter tint when
-        // this row is the drag-in-flight source so the user sees what's
-        // being moved.
-        if (layer.id == selectedId) {
-            dl->AddRectFilled(ImVec2(origin.x, rowY0),
-                              ImVec2(origin.x + stripW, rowY0 + rowH),
+    // Twirl icon helper: filled triangle drawn via ImDrawList. No font
+    // dependency (avoids the eye/chain glyph headaches from Task 5.12b).
+    // ptr = ImDrawList*; pos = center point of the icon square; open = ▼.
+    auto drawTwirl = [](ImDrawList* d, ImVec2 pos, bool open) {
+        const float r = 4.0f;
+        const ImU32 col = IM_COL32(180, 180, 200, 255);
+        if (open) {
+            // ▼ down-pointing
+            d->AddTriangleFilled(ImVec2(pos.x - r, pos.y - r*0.5f),
+                                 ImVec2(pos.x + r, pos.y - r*0.5f),
+                                 ImVec2(pos.x,     pos.y + r*0.8f), col);
+        } else {
+            // ▶ right-pointing
+            d->AddTriangleFilled(ImVec2(pos.x - r*0.5f, pos.y - r),
+                                 ImVec2(pos.x - r*0.5f, pos.y + r),
+                                 ImVec2(pos.x + r*0.8f, pos.y),      col);
+        }
+    };
+
+    // Stopwatch icon: small filled circle + tick hand indicating whether
+    // the property's stopwatch is armed (=> writes create keyframes).
+    // Blue when on, dim gray when off. Purely visual — click handling
+    // uses an InvisibleButton at the same rect.
+    auto drawStopwatch = [](ImDrawList* d, ImVec2 pos, bool on) {
+        const float r = 5.0f;
+        const ImU32 body = on ? IM_COL32(80, 160, 240, 255)
+                              : IM_COL32(80, 80, 90, 255);
+        const ImU32 rim  = on ? IM_COL32(200, 220, 255, 255)
+                              : IM_COL32(140, 140, 150, 255);
+        d->AddCircleFilled(pos, r, body);
+        d->AddCircle(pos, r, rim, 12, 1.0f);
+        // Little hand pointing up-right
+        d->AddLine(pos, ImVec2(pos.x + r*0.6f, pos.y - r*0.6f), rim, 1.2f);
+        // Top stem to signal it's a stopwatch, not just a dot
+        d->AddLine(ImVec2(pos.x, pos.y - r - 1.0f),
+                   ImVec2(pos.x, pos.y - r + 1.0f), rim, 1.5f);
+    };
+
+    // Draw + hit-test a single property's keyframe diamonds on a given
+    // row (rowYc = row center Y). Templated so it handles Vec2/Vec3/float.
+    auto drawAndHitKeys = [&](int rowLayerId, auto& prop, DiamondProperty which,
+                              ImU32 col, float rowYc) {
+        const float r = 5.0f;
+        for (size_t ki = 0; ki < prop.keyframes.size(); ++ki) {
+            const auto& k = prop.keyframes[ki];
+            const float x = TimeToX(k.time);
+            const ImVec2 p(x, rowYc);
+            const ImVec2 tri[4] = {
+                ImVec2(p.x,     p.y - r),
+                ImVec2(p.x + r, p.y),
+                ImVec2(p.x,     p.y + r),
+                ImVec2(p.x - r, p.y),
+            };
+            const bool isTarget =
+                ((draggedDiamond.layerId == rowLayerId &&
+                  (int)draggedDiamond.which == (int)which &&
+                  draggedDiamond.keyIndex == (int)ki) ||
+                 (contextDiamond.layerId == rowLayerId &&
+                  (int)contextDiamond.which == (int)which &&
+                  contextDiamond.keyIndex == (int)ki));
+            const bool nearPlayhead = std::fabs(p.x - playheadX) < kNearPlayheadPixels;
+            ImU32 diamondCol = col;
+            if (isTarget)          diamondCol = IM_COL32(255, 255, 255, 255);
+            else if (nearPlayhead) diamondCol = IM_COL32(255, 220, 100, 255);
+            dl->AddConvexPolyFilled(tri, 4, diamondCol);
+            if (nearPlayhead) {
+                dl->AddCircle(p, r + 3.0f, IM_COL32(255, 220, 100, 180), 12, 1.2f);
+            }
+            if (std::fabs(mp.x - p.x) <= r + 1.0f &&
+                std::fabs(mp.y - p.y) <= r + 1.0f) {
+                if (!diamondDragActive &&
+                    ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    MarkForSnapshot();
+                    diamondDragActive = true;
+                    draggedDiamond.layerId  = rowLayerId;
+                    draggedDiamond.which    = which;
+                    draggedDiamond.keyIndex = (int)ki;
+                    draggedDiamond.origTime = k.time;
+                }
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    contextDiamond.layerId  = rowLayerId;
+                    contextDiamond.which    = which;
+                    contextDiamond.keyIndex = (int)ki;
+                    contextDiamond.origTime = k.time;
+                    ImGui::OpenPopup("##kfContext");
+                }
+            }
+        }
+    };
+
+    // -----------------------------------------------------------------
+    // Row draw loop. One switch on row.kind per row.
+    // -----------------------------------------------------------------
+    for (size_t rowIdx = 0; rowIdx < timelineRows_.size(); ++rowIdx) {
+        const TimelineRow& row = timelineRows_[rowIdx];
+        Layer* layerPtr = layerManager.GetLayerById(row.layerId);
+        if (!layerPtr) continue;
+        Layer& layer = *layerPtr;
+        const float rowY0 = row.y0 + origin.y - rulerH + rulerH; // origin.y + row.y0's offset
+        // Simplify — row.y0 is relative to origin.y (was seeded with rulerH),
+        // so absolute Y = origin.y + row.y0.
+        const float absY0 = origin.y + row.y0;
+        const float absYc = absY0 + row.rowH * 0.5f;
+
+        // Row background: selection tint + reorder-drag tint (header only).
+        if (row.kind == TimelineRow::LayerHeader && layer.id == selectedId) {
+            dl->AddRectFilled(ImVec2(origin.x, absY0),
+                              ImVec2(origin.x + stripW, absY0 + row.rowH),
                               IM_COL32(50, 50, 80, 200));
         }
-        if (layer.id == layerReorderDragId) {
-            dl->AddRectFilled(ImVec2(origin.x, rowY0),
-                              ImVec2(origin.x + stripW, rowY0 + rowH),
+        if (row.kind == TimelineRow::LayerHeader && layer.id == layerReorderDragId) {
+            dl->AddRectFilled(ImVec2(origin.x, absY0),
+                              ImVec2(origin.x + stripW, absY0 + row.rowH),
                               IM_COL32(90, 90, 140, 180));
         }
-        // Task 5.12b: label column now hosts the Vis toggle + Name + Parent
-        // combo directly, so the redundant ImGui table below can go away.
-        // Widget order matters for click routing: the interactive widgets
-        // (Vis checkbox, Parent combo) are drawn BEFORE the reorder
-        // InvisibleButton so they win the hit-test where they overlap.
-        //
-        // Layout inside labelW:
-        //   [Vis 18px] [padding 4px] [Name flex] [Parent 90px if room]
-        const float visW    = 18.0f;
-        const float parentW = 90.0f;
-        // Skip parent combo when the label column is too tight — user can
-        // still parent via the Inspector.
-        const bool  showParentCol = (trackX0 - origin.x) > 260.0f;
-        const float nameX0    = origin.x + visW + 6.0f;
-        const float parentX0  = origin.x + (trackX0 - origin.x) - parentW - 6.0f;
-        const float nameX1    = showParentCol ? parentX0 - 4.0f
-                                              : (trackX0 - 4.0f);
-
-        // --- Vis toggle (eye checkbox, small) --------------------------
-        {
-            ImGui::PushID((int)(0x7B000000 | layer.id));
-            ImGui::SetCursorScreenPos(ImVec2(origin.x + 2.0f, rowY0 + 2.0f));
-            bool vis = layer.isVisible;
-            if (ImGui::Checkbox("##vis", &vis)) {
-                MarkForSnapshot();
-                layer.isVisible = vis;
-            }
-            ImGui::PopID();
+        // Sub-rows get a slight darker tint so it's visually clear they
+        // group under their header.
+        if (row.kind != TimelineRow::LayerHeader) {
+            const ImU32 subBg = (row.kind == TimelineRow::EffectHeader ||
+                                 row.kind == TimelineRow::EffectParam)
+                                    ? IM_COL32(28, 26, 40, 200)
+                                    : IM_COL32(20, 22, 30, 200);
+            dl->AddRectFilled(ImVec2(origin.x, absY0),
+                              ImVec2(origin.x + stripW, absY0 + row.rowH),
+                              subBg);
         }
 
-        // --- Layer name text -------------------------------------------
-        // Clip to available width so long names don't spill over the parent
-        // combo or the track area. Cheap manual clip: measure and truncate.
-        {
-            const float nameMaxW = std::max(20.0f, nameX1 - nameX0);
-            const char* nm = layer.name.c_str();
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "%s", nm);
-            ImVec2 sz = ImGui::CalcTextSize(buf);
-            if (sz.x > nameMaxW) {
-                // Truncate with ellipsis. Cheap loop; label lengths are
-                // ~20 chars typical so this is O(N) per row per frame.
-                size_t len = std::strlen(buf);
-                while (len > 1 && sz.x > nameMaxW - 12.0f) {
-                    buf[--len] = '\0';
-                    if (len < sizeof(buf) - 3) {
-                        buf[len] = '\0';
-                    }
-                    sz = ImGui::CalcTextSize(buf);
-                }
-                // Append "..." if we actually truncated.
-                if (len < std::strlen(nm)) {
-                    if (len + 3 < sizeof(buf)) std::strcat(buf, "...");
-                }
-            }
-            dl->AddText(ImVec2(nameX0, rowY0 + 2.0f),
-                        IM_COL32(220, 220, 230, 255), buf);
-        }
-
-        // --- Parent combo (only when there's room) ---------------------
-        if (showParentCol) {
-            ImGui::PushID((int)(0x7C000000 | layer.id));
-            ImGui::SetCursorScreenPos(ImVec2(parentX0, rowY0 + 1.0f));
-            ImGui::SetNextItemWidth(parentW);
-            const Layer* parent = layerManager.GetLayerById(layer.parentId);
-            const char* preview = parent ? parent->name.c_str() : "(none)";
-            if (ImGui::BeginCombo("##parent", preview,
-                                   ImGuiComboFlags_HeightSmall |
-                                   ImGuiComboFlags_NoArrowButton)) {
-                const float ct = animEngine.currentTime;
-                if (ImGui::Selectable("(none)", layer.parentId == -1)) {
-                    MarkForSnapshot();
-                    layerManager.SetParentPreservingWorld(layer.id, -1, ct);
-                }
-                for (const auto& candidate : layers) {
-                    if (candidate.id == layer.id) continue;
-                    const bool wouldCycle =
-                        layerManager.WouldCreateCycle(layer.id, candidate.id);
-                    const ImGuiSelectableFlags flags =
-                        wouldCycle ? ImGuiSelectableFlags_Disabled : 0;
-                    const bool sel = (layer.parentId == candidate.id);
-                    if (ImGui::Selectable(candidate.name.c_str(), sel, flags)) {
-                        MarkForSnapshot();
-                        layerManager.SetParentPreservingWorld(layer.id, candidate.id, ct);
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::PopID();
-        }
-
-        // Task 5.11: drag-to-reorder hit-region.
-        // Task 5.12b: EXTENDED to the full row width (not just the label
-        // column) so users can grab any part of the row — matching AE.
-        // Sits AFTER the Vis + Parent widgets so those claim their hit-
-        // rects first; the trim-bar handles + keyframe diamonds draw
-        // later in the loop and win on their sub-rects too.
-        //
-        // Task 5.11-fix: we CAN'T rely on ImGui::IsItemActive() to keep
-        // the drag alive across frames — MoveLayerToIndex reorders the
-        // vector mid-drag, moving this row's InvisibleButton to a
-        // different screen Y. ImGui interprets 'widget moved' = drag
-        // lost. Detect mouse-down via IsItemHovered + IsMouseClicked,
-        // then track lifetime via the global IsMouseDown check in the
-        // post-loop block.
-        if (!diamondDragActive) {
-            ImGui::PushID((int)(0x7A000000 | layer.id));
-            ImGui::SetCursorScreenPos(ImVec2(origin.x, rowY0));
-            ImGui::InvisibleButton("##layerReorder", ImVec2(stripW, rowH));
-            const bool hovered = ImGui::IsItemHovered();
-            if (hovered || layer.id == layerReorderDragId) {
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-            }
-            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-                (layerReorderDragId < 0)) {
-                MarkForSnapshot();
-                layerReorderDragId       = layer.id;
-                layerReorderSnapshotDone = true;
-                layerManager.SetSelectedId(layer.id);
-            }
-            ImGui::PopID();
-        }
-
-        // Track baseline
-        dl->AddLine(ImVec2(trackX0, rowYc), ImVec2(trackX1, rowYc),
+        // Track baseline (below the ruler on every row).
+        dl->AddLine(ImVec2(trackX0, absYc), ImVec2(trackX1, absYc),
                     IM_COL32(60, 60, 70, 255), 1.0f);
 
-        // Task 5.10: trim bar. Sits BEHIND the keyframe diamonds so a
-        // diamond click-drag still wins the hit-test. Three interaction
-        // zones: left 6px = trim inPoint, right 6px = trim outPoint,
-        // middle = slip both (drag whole bar without changing length).
-        {
-            const float durSafe = (animEngine.duration > 0.001f) ? animEngine.duration : 1.0f;
-            const float outResolved = (layer.outPoint < 0.0f) ? durSafe : layer.outPoint;
-            const float barX0 = TimeToX(std::clamp(layer.inPoint,  0.0f, durSafe));
-            const float barX1 = TimeToX(std::clamp(outResolved,    0.0f, durSafe));
-            const float barY0 = rowYc - rowH * 0.35f;
-            const float barY1 = rowYc + rowH * 0.35f;
+        // ===============================================================
+        // Row-kind dispatch
+        // ===============================================================
+        if (row.kind == TimelineRow::LayerHeader) {
+            // --- Twirl icon (Transform) at very left --------------------
+            const float twirlSize = 14.0f;
+            const ImVec2 twirlPos(origin.x + 7.0f, absYc);
+            drawTwirl(dl, twirlPos, (layer.timelineExpandMask & Layer::Expand_Transform) != 0);
+            {
+                ImGui::PushID((int)(0x71000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(origin.x + 0.0f, absY0 + 2.0f));
+                ImGui::InvisibleButton("##twirlXform", ImVec2(twirlSize, row.rowH - 4.0f));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    MarkForSnapshot();
+                    layer.timelineExpandMask ^= Layer::Expand_Transform;
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::PopID();
+            }
+            // Layout inside labelW (after the twirl icon):
+            //   [twirl 14px] [Vis 18px] [Name flex] [Parent combo] [fx chip]
+            const float twirlW  = 14.0f;
+            const float visW    = 18.0f;
+            const float parentW = 90.0f;
+            const bool  showParentCol = (trackX0 - origin.x) > 260.0f;
+            const bool  hasEffects    = !layer.effects.empty();
+            const float fxChipW = hasEffects ? 22.0f : 0.0f;
+            const float nameX0    = origin.x + twirlW + visW + 6.0f;
+            const float parentX0  = origin.x + (trackX0 - origin.x) - parentW - fxChipW - 6.0f;
+            const float nameX1    = showParentCol ? (parentX0 - 4.0f)
+                                                  : (trackX0 - fxChipW - 6.0f);
 
-            // Bar body (layer's fillColor at 40% alpha) + selection border.
-            const unsigned int fc = layer.fillColor;
-            const ImU32 barCol = ((unsigned int)std::clamp((int)(((fc >> 24) & 0xFFu) * 0.4f), 0, 255) << 24)
-                                 | (fc & 0x00FFFFFFu);
-            dl->AddRectFilled(ImVec2(barX0, barY0), ImVec2(barX1, barY1), barCol, 3.0f);
-            if (layer.id == selectedId) {
-                dl->AddRect(ImVec2(barX0, barY0), ImVec2(barX1, barY1),
-                            IM_COL32(255, 255, 255, 200), 3.0f, 0, 1.0f);
+            // --- Vis checkbox --------------------------------------------
+            {
+                ImGui::PushID((int)(0x7B000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(origin.x + twirlW, absY0 + 2.0f));
+                bool vis = layer.isVisible;
+                if (ImGui::Checkbox("##vis", &vis)) {
+                    MarkForSnapshot();
+                    layer.isVisible = vis;
+                }
+                ImGui::PopID();
+            }
+            // --- Layer name (truncate w/ ellipsis) -----------------------
+            {
+                const float nameMaxW = std::max(20.0f, nameX1 - nameX0);
+                const char* nm = layer.name.c_str();
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "%s", nm);
+                ImVec2 sz = ImGui::CalcTextSize(buf);
+                if (sz.x > nameMaxW) {
+                    size_t len = std::strlen(buf);
+                    while (len > 1 && sz.x > nameMaxW - 12.0f) {
+                        buf[--len] = '\0';
+                        sz = ImGui::CalcTextSize(buf);
+                    }
+                    if (len < std::strlen(nm) && len + 3 < sizeof(buf)) std::strcat(buf, "...");
+                }
+                dl->AddText(ImVec2(nameX0, absY0 + 2.0f),
+                            IM_COL32(220, 220, 230, 255), buf);
+            }
+            // --- Parent combo --------------------------------------------
+            if (showParentCol) {
+                ImGui::PushID((int)(0x7C000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(parentX0, absY0 + 1.0f));
+                ImGui::SetNextItemWidth(parentW);
+                const Layer* parent = layerManager.GetLayerById(layer.parentId);
+                const char* preview = parent ? parent->name.c_str() : "(none)";
+                if (ImGui::BeginCombo("##parent", preview,
+                                       ImGuiComboFlags_HeightSmall |
+                                       ImGuiComboFlags_NoArrowButton)) {
+                    const float ct = animEngine.currentTime;
+                    if (ImGui::Selectable("(none)", layer.parentId == -1)) {
+                        MarkForSnapshot();
+                        layerManager.SetParentPreservingWorld(layer.id, -1, ct);
+                    }
+                    for (const auto& candidate : layers) {
+                        if (candidate.id == layer.id) continue;
+                        const bool wouldCycle =
+                            layerManager.WouldCreateCycle(layer.id, candidate.id);
+                        const ImGuiSelectableFlags flags =
+                            wouldCycle ? ImGuiSelectableFlags_Disabled : 0;
+                        const bool selc = (layer.parentId == candidate.id);
+                        if (ImGui::Selectable(candidate.name.c_str(), selc, flags)) {
+                            MarkForSnapshot();
+                            layerManager.SetParentPreservingWorld(layer.id, candidate.id, ct);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::PopID();
+            }
+            // --- fx chip (only when effects exist) -----------------------
+            if (hasEffects) {
+                const float chipX0 = trackX0 - fxChipW - 2.0f;
+                const bool effectsOpen = (layer.timelineExpandMask & Layer::Expand_Effects) != 0;
+                dl->AddRectFilled(ImVec2(chipX0, absY0 + 3.0f),
+                                  ImVec2(chipX0 + fxChipW - 4.0f, absY0 + row.rowH - 3.0f),
+                                  effectsOpen ? IM_COL32(120, 100, 200, 255)
+                                              : IM_COL32(60, 55, 80, 255),
+                                  3.0f);
+                dl->AddText(ImVec2(chipX0 + 3.0f, absY0 + 2.0f),
+                            IM_COL32(230, 220, 255, 255), "fx");
+                ImGui::PushID((int)(0x7D000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(chipX0, absY0 + 2.0f));
+                ImGui::InvisibleButton("##fxChip", ImVec2(fxChipW, row.rowH - 4.0f));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    MarkForSnapshot();
+                    layer.timelineExpandMask ^= Layer::Expand_Effects;
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::PopID();
             }
 
-            // Interaction zones (invisible buttons). Suppressed while a
-            // keyframe diamond drag is in flight so trim doesn't hijack it.
+            // --- Task 5.11 reorder-drag hit region -----------------------
+            // ONLY installed on header rows so sub-row grabs don't reorder
+            // layers. Sits BEHIND the widgets above (drawn last) but its
+            // ImGui z-order is later — need to gate on !diamondDragActive
+            // and check IsItemHovered explicitly rather than trusting the
+            // click to reach us.
             if (!diamondDragActive) {
-                const float handleW = 6.0f;
-                // Unique ID per layer + zone via ImGui id stack.
-                ImGui::PushID(layer.id * 100 + 91);
-                // Left handle (trim inPoint)
-                {
-                    ImGui::SetCursorScreenPos(ImVec2(barX0 - handleW*0.5f, barY0));
-                    ImGui::InvisibleButton("##trimL", ImVec2(handleW, barY1 - barY0));
-                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                    }
-                    if (ImGui::IsItemActivated()) MarkForSnapshot();
-                    if (ImGui::IsItemActive()) {
-                        const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
-                        float nv = layer.inPoint + dt;
-                        if (nv < 0.0f) nv = 0.0f;
-                        if (nv > outResolved - 0.01f) nv = outResolved - 0.01f;
-                        layer.inPoint = nv;
-                    }
+                ImGui::PushID((int)(0x7A000000 | layer.id));
+                ImGui::SetCursorScreenPos(ImVec2(origin.x, absY0));
+                ImGui::InvisibleButton("##layerReorder", ImVec2(stripW, row.rowH));
+                const bool hoveredR = ImGui::IsItemHovered();
+                if (hoveredR || layer.id == layerReorderDragId) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
                 }
-                // Right handle (trim outPoint) — materializes -1 sentinel
-                // to the resolved comp end so drag has a start value.
-                {
-                    ImGui::SetCursorScreenPos(ImVec2(barX1 - handleW*0.5f, barY0));
-                    ImGui::InvisibleButton("##trimR", ImVec2(handleW, barY1 - barY0));
-                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                    }
-                    if (ImGui::IsItemActivated()) {
-                        MarkForSnapshot();
-                        if (layer.outPoint < 0.0f) layer.outPoint = outResolved;
-                    }
-                    if (ImGui::IsItemActive()) {
-                        const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
-                        float nv = layer.outPoint + dt;
-                        if (nv < layer.inPoint + 0.01f) nv = layer.inPoint + 0.01f;
-                        if (nv > durSafe)               nv = durSafe;
-                        layer.outPoint = nv;
-                    }
+                if (hoveredR && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                    (layerReorderDragId < 0)) {
+                    MarkForSnapshot();
+                    layerReorderDragId       = layer.id;
+                    layerReorderSnapshotDone = true;
+                    layerManager.SetSelectedId(layer.id);
                 }
-                // Middle (slip both together, preserving bar length).
-                {
-                    const float midW = std::max(0.0f, (barX1 - handleW) - (barX0 + handleW));
-                    if (midW > 0.0f) {
-                        ImGui::SetCursorScreenPos(ImVec2(barX0 + handleW*0.5f, barY0));
-                        ImGui::InvisibleButton("##trimMid", ImVec2(midW, barY1 - barY0));
+                ImGui::PopID();
+            }
+
+            // --- Trim bar (behind diamonds) ------------------------------
+            {
+                const float durSafe = (animEngine.duration > 0.001f) ? animEngine.duration : 1.0f;
+                const float outResolved = (layer.outPoint < 0.0f) ? durSafe : layer.outPoint;
+                const float barX0 = TimeToX(std::clamp(layer.inPoint,  0.0f, durSafe));
+                const float barX1 = TimeToX(std::clamp(outResolved,    0.0f, durSafe));
+                const float barY0 = absYc - row.rowH * 0.35f;
+                const float barY1 = absYc + row.rowH * 0.35f;
+                const unsigned int fc = layer.fillColor;
+                const ImU32 barCol = ((unsigned int)std::clamp((int)(((fc >> 24) & 0xFFu) * 0.4f), 0, 255) << 24)
+                                     | (fc & 0x00FFFFFFu);
+                dl->AddRectFilled(ImVec2(barX0, barY0), ImVec2(barX1, barY1), barCol, 3.0f);
+                if (layer.id == selectedId) {
+                    dl->AddRect(ImVec2(barX0, barY0), ImVec2(barX1, barY1),
+                                IM_COL32(255, 255, 255, 200), 3.0f, 0, 1.0f);
+                }
+                if (!diamondDragActive) {
+                    const float handleW = 6.0f;
+                    ImGui::PushID(layer.id * 100 + 91);
+                    // Left handle
+                    {
+                        ImGui::SetCursorScreenPos(ImVec2(barX0 - handleW*0.5f, barY0));
+                        ImGui::InvisibleButton("##trimL", ImVec2(handleW, barY1 - barY0));
                         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
                         }
-                        if (ImGui::IsItemActivated()) {
-                            MarkForSnapshot();
-                            if (layer.outPoint < 0.0f) layer.outPoint = outResolved;
-                        }
+                        if (ImGui::IsItemActivated()) MarkForSnapshot();
                         if (ImGui::IsItemActive()) {
                             const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
-                            const float span = layer.outPoint - layer.inPoint;
-                            float ni = layer.inPoint + dt;
-                            // Clamp so the whole span stays in [0, durSafe].
-                            if (ni < 0.0f)                ni = 0.0f;
-                            if (ni + span > durSafe)      ni = durSafe - span;
-                            layer.inPoint  = ni;
-                            layer.outPoint = ni + span;
+                            float nv = layer.inPoint + dt;
+                            if (nv < 0.0f) nv = 0.0f;
+                            if (nv > outResolved - 0.01f) nv = outResolved - 0.01f;
+                            layer.inPoint = nv;
                         }
                     }
+                    // Right handle
+                    {
+                        ImGui::SetCursorScreenPos(ImVec2(barX1 - handleW*0.5f, barY0));
+                        ImGui::InvisibleButton("##trimR", ImVec2(handleW, barY1 - barY0));
+                        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                        }
+                        if (ImGui::IsItemActivated()) MarkForSnapshot();
+                        if (ImGui::IsItemActive()) {
+                            const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
+                            float nv = outResolved + dt;
+                            if (nv < layer.inPoint + 0.01f) nv = layer.inPoint + 0.01f;
+                            if (nv > durSafe)               nv = durSafe;
+                            layer.outPoint = nv;
+                        }
+                    }
+                    // Middle handle (slip both simultaneously)
+                    {
+                        ImGui::SetCursorScreenPos(ImVec2(barX0 + handleW*0.5f, barY0));
+                        const float midW = std::max(1.0f, (barX1 - handleW*0.5f) - (barX0 + handleW*0.5f));
+                        ImGui::InvisibleButton("##trimM", ImVec2(midW, barY1 - barY0));
+                        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                        }
+                        if (ImGui::IsItemActivated()) MarkForSnapshot();
+                        if (ImGui::IsItemActive()) {
+                            const float dt = ImGui::GetIO().MouseDelta.x / trackW * durSafe;
+                            float niv = layer.inPoint  + dt;
+                            float nov = outResolved    + dt;
+                            if (niv < 0.0f)     { const float shift = -niv; niv += shift; nov += shift; }
+                            if (nov > durSafe)  { const float shift = durSafe - nov; niv += shift; nov += shift; }
+                            layer.inPoint  = niv;
+                            layer.outPoint = nov;
+                        }
+                    }
+                    ImGui::PopID();
+                }
+            }
+
+            // --- Merged keyframe diamonds (unchanged behavior for header
+            //     rows when Transform is COLLAPSED — this is the "combined
+            //     diamond soup" that Task 5.14's whole reason for existing
+            //     is to let the user split apart). When Transform is
+            //     EXPANDED, we skip this and let the sub-rows render
+            //     each property's diamonds separately.
+            if (!(layer.timelineExpandMask & Layer::Expand_Transform)) {
+                drawAndHitKeys(layer.id, layer.transform.position, DiamondProperty::Position, IM_COL32(120, 200, 255, 255), absYc);
+                drawAndHitKeys(layer.id, layer.transform.scale,    DiamondProperty::Scale,    IM_COL32(255, 200, 120, 255), absYc);
+                drawAndHitKeys(layer.id, layer.transform.rotation, DiamondProperty::Rotation, IM_COL32(200, 255, 120, 255), absYc);
+                drawAndHitKeys(layer.id, layer.transform.opacity,  DiamondProperty::Opacity,  IM_COL32(255, 120, 200, 255), absYc);
+            }
+        }
+        else if (row.kind == TimelineRow::TransformProp) {
+            // Sub-row: property name, stopwatch icon, value readout, diamonds.
+            const int p = (int)row.subIndex;
+            const float indentX = origin.x + 24.0f;   // twirl + vis width
+            const float swX     = indentX;
+            const float labelX  = indentX + 16.0f;    // after stopwatch
+            const float valueX  = origin.x + labelW - 80.0f;
+
+            // Property name + color + accessor helpers.
+            const char* propName = "Position";
+            ImU32       propCol  = IM_COL32(120, 200, 255, 255);
+            bool        swOn     = false;
+            char        valueBuf[48] = "";
+            const float t = animEngine.currentTime;
+            switch ((DiamondProperty)p) {
+                case DiamondProperty::Position: {
+                    propName = "Position"; propCol = IM_COL32(120,200,255,255);
+                    swOn = layer.transform.position.HasStopwatch();
+                    Vec3 v = layer.transform.position.Evaluate(t);
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%.1f, %.1f", v.x, v.y);
+                } break;
+                case DiamondProperty::Rotation: {
+                    propName = "Rotation"; propCol = IM_COL32(200,255,120,255);
+                    swOn = layer.transform.rotation.HasStopwatch();
+                    Vec3 v = layer.transform.rotation.Evaluate(t);
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%.1f\xC2\xB0", v.z);
+                } break;
+                case DiamondProperty::Scale: {
+                    propName = "Scale";    propCol = IM_COL32(255,200,120,255);
+                    swOn = layer.transform.scale.HasStopwatch();
+                    Vec3 v = layer.transform.scale.Evaluate(t);
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%.2f, %.2f", v.x, v.y);
+                } break;
+                case DiamondProperty::Opacity: {
+                    propName = "Opacity";  propCol = IM_COL32(255,120,200,255);
+                    swOn = layer.transform.opacity.HasStopwatch();
+                    float v = layer.transform.opacity.Evaluate(t);
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%.0f%%", v * 100.0f);
+                } break;
+                case DiamondProperty::Anchor: {
+                    propName = "Anchor";   propCol = IM_COL32(180,220,200,255);
+                    swOn = layer.transform.anchorPoint.HasStopwatch();
+                    Vec2 v = layer.transform.anchorPoint.Evaluate(t);
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%.2f, %.2f", v.x, v.y);
+                } break;
+                case DiamondProperty::Size: {
+                    propName = "Size";     propCol = IM_COL32(220,180,220,255);
+                    swOn = layer.transform.sizePixels.HasStopwatch();
+                    Vec2 v = layer.transform.sizePixels.Evaluate(t);
+                    std::snprintf(valueBuf, sizeof(valueBuf), "%.0f, %.0f", v.x, v.y);
+                } break;
+            }
+            // Stopwatch icon + click handler
+            drawStopwatch(dl, ImVec2(swX + 5.0f, absYc), swOn);
+            {
+                ImGui::PushID((int)(0x74000000 | (layer.id << 8) | p));
+                ImGui::SetCursorScreenPos(ImVec2(swX, absY0 + 1.0f));
+                ImGui::InvisibleButton("##sw", ImVec2(14.0f, row.rowH - 2.0f));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    MarkForSnapshot();
+                    switch ((DiamondProperty)p) {
+                        case DiamondProperty::Position:  layer.transform.position   .ToggleStopwatch(t); break;
+                        case DiamondProperty::Rotation:  layer.transform.rotation   .ToggleStopwatch(t); break;
+                        case DiamondProperty::Scale:     layer.transform.scale      .ToggleStopwatch(t); break;
+                        case DiamondProperty::Opacity:   layer.transform.opacity    .ToggleStopwatch(t); break;
+                        case DiamondProperty::Anchor:    layer.transform.anchorPoint.ToggleStopwatch(t); break;
+                        case DiamondProperty::Size:      layer.transform.sizePixels .ToggleStopwatch(t); break;
+                    }
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::PopID();
+            }
+            // Property name label
+            dl->AddText(ImVec2(labelX, absY0 + 0.0f),
+                        IM_COL32(200, 200, 210, 255), propName);
+            // Value readout (right-aligned within labelW, read-only in v1)
+            {
+                const ImVec2 vsz = ImGui::CalcTextSize(valueBuf);
+                dl->AddText(ImVec2(std::max(labelX + 60.0f, valueX + (80.0f - vsz.x) * 0.5f),
+                                   absY0 + 0.0f),
+                            IM_COL32(150, 155, 170, 255), valueBuf);
+            }
+            // Diamonds — only this property's, in this row.
+            switch ((DiamondProperty)p) {
+                case DiamondProperty::Position:  drawAndHitKeys(layer.id, layer.transform.position,    DiamondProperty::Position, propCol, absYc); break;
+                case DiamondProperty::Rotation:  drawAndHitKeys(layer.id, layer.transform.rotation,    DiamondProperty::Rotation, propCol, absYc); break;
+                case DiamondProperty::Scale:     drawAndHitKeys(layer.id, layer.transform.scale,       DiamondProperty::Scale,    propCol, absYc); break;
+                case DiamondProperty::Opacity:   drawAndHitKeys(layer.id, layer.transform.opacity,     DiamondProperty::Opacity,  propCol, absYc); break;
+                case DiamondProperty::Anchor:    drawAndHitKeys(layer.id, layer.transform.anchorPoint, DiamondProperty::Anchor,   propCol, absYc); break;
+                case DiamondProperty::Size:      drawAndHitKeys(layer.id, layer.transform.sizePixels,  DiamondProperty::Size,     propCol, absYc); break;
+            }
+        }
+        else if (row.kind == TimelineRow::EffectHeader) {
+            // Effect row: [twirl] [enable ✓] [effect name]     [X remove]
+            const int ei = (int)row.subIndex;
+            if (ei < 0 || ei >= (int)layer.effects.size()) continue; // stale row
+            Effect& eff = layer.effects[ei];
+            const float indentX = origin.x + 24.0f;
+            const bool  isOpen  = layer.IsEffectExpanded(eff.id);
+            // Twirl icon (per-effect param expand)
+            drawTwirl(dl, ImVec2(indentX + 5.0f, absYc), isOpen);
+            {
+                ImGui::PushID((int)(0x75000000 | (layer.id << 8) | (eff.id & 0xFF)));
+                ImGui::SetCursorScreenPos(ImVec2(indentX, absY0 + 1.0f));
+                ImGui::InvisibleButton("##fxTwirl", ImVec2(14.0f, row.rowH - 2.0f));
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+                    MarkForSnapshot();
+                    layer.ToggleEffectExpand(eff.id);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::PopID();
+            }
+            // Enable checkbox
+            {
+                ImGui::PushID((int)(0x76000000 | (layer.id << 8) | (eff.id & 0xFF)));
+                ImGui::SetCursorScreenPos(ImVec2(indentX + 16.0f, absY0 - 1.0f));
+                bool en = eff.enabled;
+                if (ImGui::Checkbox("##fxEn", &en)) {
+                    MarkForSnapshot();
+                    eff.enabled = en;
+                }
+                ImGui::PopID();
+            }
+            // Effect name
+            dl->AddText(ImVec2(indentX + 36.0f, absY0 + 0.0f),
+                        IM_COL32(210, 200, 230, 255), eff.displayName.c_str());
+            // Remove X at right of label column
+            {
+                ImGui::PushID((int)(0x77000000 | (layer.id << 8) | (eff.id & 0xFF)));
+                ImGui::SetCursorScreenPos(ImVec2(origin.x + labelW - 18.0f, absY0 - 1.0f));
+                if (ImGui::SmallButton("X##fxRm")) {
+                    MarkForSnapshot();
+                    layer.RemoveEffectById(eff.id);
                 }
                 ImGui::PopID();
             }
         }
-
-        // Draw + hit-test each AnimatedProperty's keyframe diamonds.
-        // Task 5.3: diamonds are now interactive — left-click to start drag,
-        // right-click to open a context menu, drag to slide along the ruler.
-        // A drag in flight suppresses the strip's scrub button below.
-        //
-        // Templated lambda so one body handles Vec2/Vec3/float property types.
-        const ImVec2 mp = ImGui::GetIO().MousePos;
-        auto drawAndHitKeys = [&](auto& prop, DiamondProperty which, ImU32 col) {
-            const float r = 5.0f;
-            for (size_t ki = 0; ki < prop.keyframes.size(); ++ki) {
-                const auto& k = prop.keyframes[ki];
-                const float x = TimeToX(k.time);
-                const ImVec2 p(x, rowYc);
-                const ImVec2 tri[4] = {
-                    ImVec2(p.x,     p.y - r),
-                    ImVec2(p.x + r, p.y),
-                    ImVec2(p.x,     p.y + r),
-                    ImVec2(p.x - r, p.y),
-                };
-                // Highlight the diamond being dragged or opened in a menu.
-                const bool isTarget =
-                    ((draggedDiamond.layerId == layer.id &&
-                      (int)draggedDiamond.which == (int)which &&
-                      draggedDiamond.keyIndex == (int)ki) ||
-                     (contextDiamond.layerId == layer.id &&
-                      (int)contextDiamond.which == (int)which &&
-                      contextDiamond.keyIndex == (int)ki));
-                // Task 5.3-fix: also highlight when the playhead is within
-                // ~10px. Combined with the scrub-snap below, this makes it
-                // obvious which key you'd be editing if you scrubbed to here.
-                const bool nearPlayhead = std::fabs(p.x - playheadX) < kNearPlayheadPixels;
-                ImU32 diamondCol = col;
-                if (isTarget)          diamondCol = IM_COL32(255, 255, 255, 255);
-                else if (nearPlayhead) diamondCol = IM_COL32(255, 220, 100, 255);   // warm yellow-glow
-                dl->AddConvexPolyFilled(tri, 4, diamondCol);
-                if (nearPlayhead) {
-                    // Small halo ring around the near-playhead diamond so it
-                    // stands out even against a busy row.
-                    dl->AddCircle(p, r + 3.0f, IM_COL32(255, 220, 100, 180), 12, 1.2f);
-                }
-
-                // Hit-test: 6px square around the diamond center.
-                if (std::fabs(mp.x - p.x) <= r + 1.0f &&
-                    std::fabs(mp.y - p.y) <= r + 1.0f) {
-                    // Left-click begins a drag. Task 5.3-fix: snapshot BEFORE
-                    // the drag starts so Ctrl+Z rewinds to the pre-drag time.
-                    if (!diamondDragActive &&
-                        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                        MarkForSnapshot();
-                        diamondDragActive = true;
-                        draggedDiamond.layerId  = layer.id;
-                        draggedDiamond.which    = which;
-                        draggedDiamond.keyIndex = (int)ki;
-                        draggedDiamond.origTime = k.time;
-                    }
-                    // Right-click stages a context menu (opened below).
-                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-                        contextDiamond.layerId  = layer.id;
-                        contextDiamond.which    = which;
-                        contextDiamond.keyIndex = (int)ki;
-                        contextDiamond.origTime = k.time;
-                        ImGui::OpenPopup("##kfContext");
-                    }
-                }
+        else if (row.kind == TimelineRow::EffectParam) {
+            // Param sub-row: [stopwatch (disabled look)] [param name] [value]
+            const int pi = (int)row.subIndex;
+            Effect* efp = layer.FindEffectById(row.effectId);
+            if (!efp) continue;
+            const float indentX = origin.x + 48.0f;
+            drawStopwatch(dl, ImVec2(indentX + 5.0f, absYc), false /* not-armed */);
+            // Effect param label + value string. Same source of truth as
+            // the Inspector's effect controls but read-only here in v1.
+            const char* pname = "";
+            char valBuf[48] = "";
+            const auto& pp = efp->params;
+            switch (efp->type) {
+                case EffectType::MotionTile:
+                    if      (pi == 0) { pname = "Tile Count";   std::snprintf(valBuf, sizeof(valBuf), "%.1f",  pp.p0[0]); }
+                    else if (pi == 1) { pname = "Phase";        std::snprintf(valBuf, sizeof(valBuf), "%.2f",  pp.p0[1]); }
+                    else if (pi == 2) { pname = "Mirror Edges"; std::snprintf(valBuf, sizeof(valBuf), "%s",    pp.p0[2] > 0.5f ? "on" : "off"); }
+                    break;
+                case EffectType::DirectionalMotionBlur:
+                    if      (pi == 0) { pname = "Angle";     std::snprintf(valBuf, sizeof(valBuf), "%.0f\xC2\xB0", pp.p0[0]); }
+                    else if (pi == 1) { pname = "Intensity"; std::snprintf(valBuf, sizeof(valBuf), "%.1f", pp.p0[1]); }
+                    else if (pi == 2) { pname = "Samples";   std::snprintf(valBuf, sizeof(valBuf), "%.0f", pp.p0[2]); }
+                    break;
+                case EffectType::ChromaticAberration:
+                    if      (pi == 0) { pname = "Amount"; std::snprintf(valBuf, sizeof(valBuf), "%.1f", pp.p0[0]); }
+                    else if (pi == 1) { pname = "Angle";  std::snprintf(valBuf, sizeof(valBuf), "%.0f\xC2\xB0", pp.p0[1]); }
+                    else if (pi == 2) { pname = "Radial"; std::snprintf(valBuf, sizeof(valBuf), "%s", pp.p0[2] > 0.5f ? "on" : "off"); }
+                    break;
+                case EffectType::BlendMode:
+                    pname = "Mode";
+                    std::snprintf(valBuf, sizeof(valBuf), "%d", (int)pp.p0[0]);
+                    break;
+                case EffectType::DropShadow:
+                    if      (pi == 0) { pname = "Distance"; std::snprintf(valBuf, sizeof(valBuf), "%.0f px", pp.p0[0]); }
+                    else if (pi == 1) { pname = "Angle";    std::snprintf(valBuf, sizeof(valBuf), "%.0f\xC2\xB0", pp.p0[1]); }
+                    else if (pi == 2) { pname = "Softness"; std::snprintf(valBuf, sizeof(valBuf), "%.0f px", pp.p0[2]); }
+                    else if (pi == 3) { pname = "Opacity";  std::snprintf(valBuf, sizeof(valBuf), "%.0f%%",  pp.p1[0] * 100.0f); }
+                    else if (pi == 4) { pname = "Color";    std::snprintf(valBuf, sizeof(valBuf), "%.2f,%.2f,%.2f", pp.p2[0], pp.p2[1], pp.p2[2]); }
+                    break;
+                default: break;
             }
-        };
-        drawAndHitKeys(layer.transform.position, DiamondProperty::Position, IM_COL32(120, 200, 255, 255));
-        drawAndHitKeys(layer.transform.scale,    DiamondProperty::Scale,    IM_COL32(255, 200, 120, 255));
-        drawAndHitKeys(layer.transform.rotation, DiamondProperty::Rotation, IM_COL32(200, 255, 120, 255));
-        drawAndHitKeys(layer.transform.opacity,  DiamondProperty::Opacity,  IM_COL32(255, 120, 200, 255));
+            dl->AddText(ImVec2(indentX + 16.0f, absY0 + 0.0f),
+                        IM_COL32(180, 180, 195, 255), pname);
+            {
+                const ImVec2 vsz = ImGui::CalcTextSize(valBuf);
+                const float valueX = origin.x + labelW - 8.0f - vsz.x;
+                dl->AddText(ImVec2(valueX, absY0 + 0.0f),
+                            IM_COL32(130, 135, 150, 255), valBuf);
+            }
+            // No diamond track yet — effect param animation ships in
+            // Commit 20 per the roadmap. This row is drawn just for the
+            // stopwatch/name/value display.
+        }
     }
 
     // Task 5.11: reorder-drag position tracking. Runs AFTER the per-row
@@ -1328,28 +1667,54 @@ void RenderEngine::DrawTimelineStrip() {
     // MoveLayerToIndex. Ends cleanly on mouse-up.
     if (layerReorderDragId >= 0) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            const float mY   = ImGui::GetIO().MousePos.y;
-            const float body0 = origin.y + rulerH;
-            // Task 5.11-fix-2: CLAMP dragFromRow into the valid strip range
-            // instead of early-returning when the mouse leaves the strip.
-            // Old behavior: dragging above the strip did nothing (bug — user
-            // wanted "move to top"). Clamp semantics: mouse above strip =
-            // row 0 (top / front-most), below strip = last row (back-most).
-            int dragFromRow = (int)((mY - body0) / rowH);
-            if (dragFromRow < 0)               dragFromRow = 0;
-            if (dragFromRow > (int)nLayers - 1) dragFromRow = (int)nLayers - 1;
-            // Row -> FINAL vector index (reverse mapping: top row = last vec).
-            const int targetVecIdx = (int)nLayers - 1 - dragFromRow;
+            const float mY = ImGui::GetIO().MousePos.y;
+            // Task 5.14: row heights are now variable (18 px headers, 14 px
+            // sub-rows) so we can't compute row from a fixed rowH divide.
+            // Walk timelineRows_ and find which LAYER HEADER row the mouse
+            // Y falls under. When the mouse is between headers (over a
+            // sub-row belonging to layer L), snap to L's header. When
+            // above the strip, snap to first header; below, last header.
+            int targetVecIdx = -1;
+            int firstLayerId = -1, lastLayerId = -1;
+            for (const auto& r : timelineRows_) {
+                if (r.kind != TimelineRow::LayerHeader) continue;
+                if (firstLayerId < 0) firstLayerId = r.layerId;
+                lastLayerId = r.layerId;
+                const float absY0 = origin.y + r.y0;
+                if (mY >= absY0 && mY < absY0 + r.rowH + 0.001f) {
+                    // Exact hover on this layer's header — target = its
+                    // vector index.
+                    for (size_t k = 0; k < nLayers; ++k) {
+                        if (layers[k].id == r.layerId) { targetVecIdx = (int)k; break; }
+                    }
+                    break;
+                }
+            }
+            // Fallback: walk again, look for the LAST header whose absY0 is
+            // above mY (handles mouse in a sub-row region between headers).
+            if (targetVecIdx < 0) {
+                int candidateLayerId = firstLayerId;
+                for (const auto& r : timelineRows_) {
+                    if (r.kind != TimelineRow::LayerHeader) continue;
+                    const float absY0 = origin.y + r.y0;
+                    if (absY0 <= mY) candidateLayerId = r.layerId;
+                    else break;
+                }
+                if (mY < origin.y + rulerH) candidateLayerId = firstLayerId;
+                if (candidateLayerId >= 0) {
+                    for (size_t k = 0; k < nLayers; ++k) {
+                        if (layers[k].id == candidateLayerId) { targetVecIdx = (int)k; break; }
+                    }
+                }
+            }
             int curVecIdx = -1;
             for (size_t k = 0; k < nLayers; ++k) {
                 if (layers[k].id == layerReorderDragId) { curVecIdx = (int)k; break; }
             }
-            if (curVecIdx >= 0 && curVecIdx != targetVecIdx) {
+            if (targetVecIdx >= 0 && curVecIdx >= 0 && curVecIdx != targetVecIdx) {
                 layerManager.MoveLayerToIndex(layerReorderDragId, targetVecIdx);
             }
         } else {
-            // Mouse-up: end the drag. Snapshot was already fired on
-            // activation so no post-drag snapshot needed.
             layerReorderDragId       = -1;
             layerReorderSnapshotDone = false;
         }
@@ -1367,10 +1732,14 @@ void RenderEngine::DrawTimelineStrip() {
                 if (ImGui::MenuItem("Delete Keyframe")) {
                     MarkForSnapshot();
                     switch (contextDiamond.which) {
-                    case DiamondProperty::Position: cl->transform.position.RemoveKeyAt(contextDiamond.origTime); break;
-                    case DiamondProperty::Rotation: cl->transform.rotation.RemoveKeyAt(contextDiamond.origTime); break;
-                    case DiamondProperty::Scale:    cl->transform.scale   .RemoveKeyAt(contextDiamond.origTime); break;
-                    case DiamondProperty::Opacity:  cl->transform.opacity .RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Position: cl->transform.position   .RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Rotation: cl->transform.rotation   .RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Scale:    cl->transform.scale      .RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Opacity:  cl->transform.opacity    .RemoveKeyAt(contextDiamond.origTime); break;
+                    // Task 5.14: Anchor + Size now have their own sub-rows in
+                    // the timeline strip so the context menu needs them too.
+                    case DiamondProperty::Anchor:   cl->transform.anchorPoint.RemoveKeyAt(contextDiamond.origTime); break;
+                    case DiamondProperty::Size:     cl->transform.sizePixels .RemoveKeyAt(contextDiamond.origTime); break;
                     }
                     contextDiamond.clear();
                 }
@@ -1415,10 +1784,13 @@ void RenderEngine::DrawTimelineStrip() {
                 }
             };
             switch (draggedDiamond.which) {
-            case DiamondProperty::Position: moveKey(dl_layer->transform.position); break;
-            case DiamondProperty::Rotation: moveKey(dl_layer->transform.rotation); break;
-            case DiamondProperty::Scale:    moveKey(dl_layer->transform.scale);    break;
-            case DiamondProperty::Opacity:  moveKey(dl_layer->transform.opacity);  break;
+            case DiamondProperty::Position: moveKey(dl_layer->transform.position);    break;
+            case DiamondProperty::Rotation: moveKey(dl_layer->transform.rotation);    break;
+            case DiamondProperty::Scale:    moveKey(dl_layer->transform.scale);       break;
+            case DiamondProperty::Opacity:  moveKey(dl_layer->transform.opacity);     break;
+            // Task 5.14: Anchor + Size draggable when their sub-rows are open.
+            case DiamondProperty::Anchor:   moveKey(dl_layer->transform.anchorPoint); break;
+            case DiamondProperty::Size:     moveKey(dl_layer->transform.sizePixels);  break;
             }
         } else {
             // Mouse released -> end drag. No snapshot here — we already
@@ -1469,6 +1841,10 @@ void RenderEngine::DrawTimelineStrip() {
                 scan(L.transform.rotation);
                 scan(L.transform.scale);
                 scan(L.transform.opacity);
+                // Task 5.14: Anchor + Size in scrub-snap for symmetry with
+                // their new sub-rows.
+                scan(L.transform.anchorPoint);
+                scan(L.transform.sizePixels);
             }
             animEngine.currentTime = snappedTime;
             animEngine.isPlaying   = false; // scrubbing pauses playback

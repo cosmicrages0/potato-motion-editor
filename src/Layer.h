@@ -186,6 +186,34 @@ struct Layer {
     std::vector<Effect> effects;
     int nextEffectId = 1;
 
+    // Task 5.14: timeline strip twirl-down state. Which top-level sub-sections
+    // (Transform / Effects) are expanded in the timeline for THIS layer.
+    // In-memory only; not serialised. Resets to collapsed on project reload.
+    enum ExpandFlag : uint32_t {
+        Expand_Transform = 1u << 0,
+        Expand_Effects   = 1u << 1,
+        // Expand_Text (Text layers) reserved for later; TextProps has no
+        // AnimatedProperty wrappers yet so nothing to animate.
+    };
+    mutable uint32_t timelineExpandMask = 0;
+
+    // Task 5.14: which effect entries have their parameter sub-rows
+    // expanded. Stored as a list of effect IDs (NOT vector indices) so
+    // Effects-panel reorder keeps expand state pinned to each effect.
+    // In-memory only. O(n) lookup on IsEffectExpanded but n <= 32.
+    mutable std::vector<int> expandedEffectIds;
+
+    bool IsEffectExpanded(int effectId) const {
+        for (int id : expandedEffectIds) if (id == effectId) return true;
+        return false;
+    }
+    void ToggleEffectExpand(int effectId) const {
+        for (auto it = expandedEffectIds.begin(); it != expandedEffectIds.end(); ++it) {
+            if (*it == effectId) { expandedEffectIds.erase(it); return; }
+        }
+        expandedEffectIds.push_back(effectId);
+    }
+
     Effect* AddEffect(const Effect& proto) {
         Effect e   = proto;
         e.id       = nextEffectId++;
@@ -197,6 +225,11 @@ struct Layer {
             [&](const Effect& x){ return x.id == effectId; });
         if (it == effects.end()) return false;
         effects.erase(it);
+        // Task 5.14: also drop from the timeline expand-set so we don't
+        // leak stale IDs across effect add/remove cycles.
+        for (auto eit = expandedEffectIds.begin(); eit != expandedEffectIds.end(); ) {
+            if (*eit == effectId) eit = expandedEffectIds.erase(eit); else ++eit;
+        }
         return true;
     }
     Effect* FindEffectById(int effectId) {

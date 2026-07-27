@@ -441,6 +441,24 @@ Layer ReadLayer(const json& j) {
         for (const auto& ej : j["effects"]) L.effects.push_back(ReadEffect(ej));
     }
     L.nextEffectId = j.value("nextEffectId", (int)(L.effects.size() + 1));
+
+    // Task 5.14 migration: any effect with id <= 0 (missing / very old
+    // saves) or a duplicate ID gets a fresh unique ID. Keeps the
+    // timeline expand-state map (keyed by effectId) collision-free.
+    // O(n^2) but n <= 32.
+    for (size_t i = 0; i < L.effects.size(); ++i) {
+        bool needsFresh = (L.effects[i].id <= 0);
+        if (!needsFresh) {
+            for (size_t k = 0; k < i; ++k) {
+                if (L.effects[k].id == L.effects[i].id) { needsFresh = true; break; }
+            }
+        }
+        if (needsFresh) L.effects[i].id = L.nextEffectId++;
+    }
+    // Bump nextEffectId past the max, defensive against stale counter.
+    for (const auto& e : L.effects) {
+        if (e.id >= L.nextEffectId) L.nextEffectId = e.id + 1;
+    }
     return L;
 }
 
